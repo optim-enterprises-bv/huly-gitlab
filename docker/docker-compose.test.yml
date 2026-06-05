@@ -1,0 +1,66 @@
+# huly-gitlab CI / test compose
+# Lightweight: mongo only + pod-gitlab built locally.
+# Huly services and GitLab CE are mocked in jest tests via nock + mongodb-memory-server.
+# Used for /health smoke check and docker-network integration tests.
+
+name: huly-gitlab-test
+
+networks:
+  huly-gitlab-test-net:
+    driver: bridge
+
+volumes:
+  mongo-test-data:
+
+services:
+
+  mongo:
+    image: mongo:7-jammy
+    restart: unless-stopped
+    volumes:
+      - mongo-test-data:/data/db
+    networks:
+      - huly-gitlab-test-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pod-gitlab:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      - PORT=3600
+      - PUBLIC_BASE_URL=http://localhost:3600
+      - ACCOUNTS_URL=http://localhost:3000
+      - SERVER_SECRET=test-secret
+      - SERVICE_ID=gitlab-service-test
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB=huly-gitlab-test
+      - GITLAB_BASE_URL=http://localhost:8929
+      - GITLAB_CLIENT_ID=test-client-id
+      - GITLAB_CLIENT_SECRET=test-client-secret
+      # 32-byte base64 key for test environment
+      - CREDENTIAL_ENCRYPTION_KEY=dGVzdC1jcmVkZW50aWFsLWVuY3J5cHRpb24ta2V5LTMY
+      - WEBHOOK_SECRET_SEED=test-webhook-seed
+      - ALLOWED_WORKSPACES=*
+      - BACKFILL_INTERVAL_MS=3600000
+      - RATE_LIMIT=100
+      - LOG_LEVEL=warn
+      - BRANDING_PATH=
+    ports:
+      - "3600:3600"
+    networks:
+      - huly-gitlab-test-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3600/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
