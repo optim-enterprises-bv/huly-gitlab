@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
+      - run: npm run lint
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
+      - run: npm run build
+
+  unit:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  integration:
+    name: Docker Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
+
+      - name: Start test stack
+        run: docker compose -f docker/docker-compose.test.yml up -d --build
+
+      - name: Wait for pod-gitlab /health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3600/health; then
+              echo "pod-gitlab healthy"
+              break
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 5
+          done
+          curl -sf http://localhost:3600/health
+
+      - name: Run integration subset
+        run: npx jest --testPathPattern="tests/integration" --passWithNoTests
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker/docker-compose.test.yml down -v
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'e2e'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: npm-
+
+      - run: npm ci
+
+      - name: Start full dev stack
+        run: docker compose -f docker/docker-compose.dev.yml up -d
+
+      - name: Run E2E tests
+        env:
+          E2E_REAL_STACK: "1"
+        run: npm run test:e2e
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker/docker-compose.dev.yml down -v

@@ -1,0 +1,5 @@
+export { createPlatformClient, closePlatformClient } from './client'
+export { ProjectNotFoundError, IdentityError } from './errors'
+export { getTrackerProject } from './projects'
+export { UserIdentity } from './users'
+export type { IdMapStore, SyncUser } from './users'
