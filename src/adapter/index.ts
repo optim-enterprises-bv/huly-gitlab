@@ -1,0 +1,8 @@
+export * from './types'
+export * from './errors'
+export * from './rate-limit'
+export { GitLabClient } from './gitlab-client'
+export type { GitLabClientOptions } from './gitlab-client'
+export { detectCapabilities, clearCapabilityCache } from './capabilities'
+export { registerProjectWebhook, deregisterProjectWebhook } from './webhooks'
+export type { RegisterWebhookOptions, WebhookEventFlags } from './webhooks'

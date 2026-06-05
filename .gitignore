@@ -1,0 +1,11 @@
+node_modules/
+lib/
+types/
+dist/
+.env
+.env.local
+*.log
+.omc/state/
+.DS_Store
+coverage/
+*.tsbuildinfo

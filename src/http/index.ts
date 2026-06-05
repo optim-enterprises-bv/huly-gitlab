@@ -1,0 +1,85 @@
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import bodyParser from 'body-parser'
+import type { Config } from '../config'
+import type { Store } from '../state/store'
+import type { SyncEngine } from '../sync/engine'
+import type { Logger } from '../logging'
+import type { CredentialResolver } from '../auth'
+import type { BindingLifecycleService } from '../sync/binding-lifecycle'
+import { createHealthRouter } from './health'
+import { createWebhookRouter } from './webhook'
+import { createBindingRouter } from './binding'
+import { createOAuthRouter } from './oauth'
+import { createCredentialsRouter } from '../auth'
+
+export interface AppDependencies {
+  config: Config
+  store: Store
+  syncEngine: SyncEngine
+  logger: Logger
+  credentialResolver?: CredentialResolver
+  bindingLifecycle?: BindingLifecycleService
+}
+
+export function createApp (deps: AppDependencies): express.Express {
+  const { config, store, syncEngine, logger } = deps
+  const app = express()
+
+  // Parse encryption key once
+  const encryptionKey = Buffer.from(config.CredentialEncryptionKey, 'base64')
+
+  // Security headers — must come before any route mount.
+  app.use(helmet())
+
+  // CORS: locked down to the explicit allow-list from CORS_ALLOWED_ORIGINS.
+  // Empty list disables CORS (no Access-Control-Allow-Origin emitted).
+  const allowedOrigins = config.CorsAllowedOrigins
+  if (allowedOrigins.length > 0) {
+    app.use(cors({ origin: allowedOrigins, credentials: false }))
+  } else {
+    app.use(cors({ origin: false, credentials: false }))
+  }
+
+  app.use(bodyParser.json({ limit: '5mb' }))
+
+  // Request logger middleware
+  app.use((req, _res, next) => {
+    logger.debug('http: incoming request', { method: req.method, path: req.path })
+    next()
+  })
+
+  // Health route
+  app.use(createHealthRouter(store, logger))
+
+  // Webhook route
+  app.use(createWebhookRouter(store, syncEngine, encryptionKey, logger))
+
+  // Binding admin routes
+  app.use(createBindingRouter(
+    store,
+    encryptionKey,
+    config.ServerSecret,
+    logger,
+    deps.bindingLifecycle,
+    config.PublicBaseUrl
+  ))
+
+  // OAuth routes
+  app.use('/oauth', createOAuthRouter({ config, store, logger }))
+
+  // Credentials admin routes (access-token + list)
+  app.use('/api/v1/credentials', createCredentialsRouter({ config, store, logger }))
+
+  // Error handler middleware — log full err with stack; never leak details to clients.
+  app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const errObj = err instanceof Error
+      ? { message: err.message, stack: err.stack }
+      : { message: String(err) }
+    logger.error('http: unhandled error', { path: req.path, ...errObj })
+    res.status(500).json({ error: 'Internal server error' })
+  })
+
+  return app
+}
