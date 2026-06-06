@@ -439,3 +439,163 @@ If you encounter issues during migration:
 4. Refer to [Architecture](docs/architecture.md) for Phase 5 feature details
 
 For unrecoverable issues, restore from backup and contact support with error logs.
+## SLO Alert Expressions
+
+The metrics below are emitted by the pod and scraped by your Prometheus instance. Each alert expression is written in PromQL. Severity levels follow the `warning` / `info` convention from Phase 2–4 runbooks.
+
+For all alerts: the runbook link column points to the anchor in this document where remediation steps are documented.
+
+---
+
+### `tx.subscription.echo.dropped` — TxSubscriber echo-drop rate
+
+Path D routes events through TxSubscriber, which drops self-originated echoes (events the pod itself wrote). Under a healthy Path D deployment this counter advances at a non-zero rate proportional to write traffic. A sustained zero means TxSubscriber is not receiving events at all — either the subscription is broken or no writes are reaching the transactor.
+
+**Alert expression:**
+
+```promql
+sum(rate(tx_subscription_echo_dropped[10m])) == 0
+```
+
+**For duration:** 30 minutes
+
+**Severity:** `warning`
+
+**Runbook anchor:** [#echo-drop-rate-zero](#echo-drop-rate-zero)
+
+**Remediation:** Verify the TxSubscriber WebSocket connection is established (`tx.subscription.connected` gauge should be 1). Check pod logs for `tx.subscription` events. If the pod has no write traffic (e.g. no active bindings), this alert is a false positive — suppress with a `unless on() sum(rate(huly_gitlab_writes_total[10m])) == 0` guard.
+
+---
+
+### `SERVICE_ACCOUNT_RESOLVED` — service-account resolution gauge
+
+Under Path D, no service-account resolution occurs. This counter should remain 0 permanently. A non-zero value indicates Path A, B, C, or E has activated — which is expected only during a staged rollout or after a regression.
+
+**Alert expression:**
+
+```promql
+SERVICE_ACCOUNT_RESOLVED != 0
+```
+
+**For duration:** 5 minutes
+
+**Severity:** `info`
+
+**Runbook anchor:** [#service-account-resolved-nonzero](#service-account-resolved-nonzero)
+
+**Remediation:** Informational only. Confirm whether Path D is configured as the default. If a deliberate upgrade from an earlier path is in progress, suppress this alert for the migration window. If unexpected, check the routing decision logic and verify `SYNC_PATH=D` is set in the pod environment.
+
+---
+
+### `MR_COMPOSITE_REST_FALLBACK` — MR composite REST fallback rate
+
+The MR composite fetch strategy tries GraphQL first and falls back to REST when the GitLab instance does not support the required GraphQL fields (tracked in the capability cache). A chronic fallback rate above 50% means the GraphQL adapter is not engaging — likely because the capability cache is stuck in a negative state or the GitLab instance version is below the required minimum.
+
+**Alert expression:**
+
+```promql
+rate(mr_composite_rest_fallback[5m]) / rate(mr_composite_total[5m]) > 0.5
+```
+
+**For duration:** 30 minutes
+
+**Severity:** `warning`
+
+**Runbook anchor:** [#composite-rest-fallback](#composite-rest-fallback)
+
+**Remediation:** Check the GraphQL capability cache status via pod logs (`graphql.capability` events). If the cache shows a persistent negative entry for the GitLab instance, inspect whether the instance version supports the required GraphQL fields. Force a cache flush by restarting the pod (the cache is in-memory). If the GitLab instance genuinely lacks GraphQL support, the REST fallback is correct behavior and this alert threshold should be adjusted or suppressed.
+
+---
+
+### `EPICS_LIST_REST_FALLBACK` — epics list REST fallback rate
+
+Same shape as `MR_COMPOSITE_REST_FALLBACK`. The epics list strategy prefers GraphQL (which supports group-level epic queries) and falls back to REST. Chronic fallback indicates the GraphQL capability cache is negative for epic queries.
+
+**Alert expression:**
+
+```promql
+rate(epics_list_rest_fallback[5m]) / rate(epics_list_total[5m]) > 0.5
+```
+
+**For duration:** 30 minutes
+
+**Severity:** `warning`
+
+**Runbook anchor:** [#composite-rest-fallback](#composite-rest-fallback)
+
+**Remediation:** Same as `MR_COMPOSITE_REST_FALLBACK` above. Additionally verify that the GitLab instance has the Epics feature enabled (requires GitLab EE or GitLab.com). If the instance is GitLab CE, epics are unavailable and the REST fallback returning empty is correct — suppress this alert for CE deployments.
+
+---
+
+### `MR_LIST_REST_FALLBACK` — MR list REST fallback rate
+
+Same shape. The MR list strategy uses GraphQL to fetch MR fields in a single round-trip and falls back to REST pagination. Chronic fallback rate above 50% degrades backfill performance (REST pagination is slower and more rate-limit-sensitive than GraphQL).
+
+**Alert expression:**
+
+```promql
+rate(mr_list_rest_fallback[5m]) / rate(mr_list_total[5m]) > 0.5
+```
+
+**For duration:** 30 minutes
+
+**Severity:** `warning`
+
+**Runbook anchor:** [#composite-rest-fallback](#composite-rest-fallback)
+
+**Remediation:** Same as `MR_COMPOSITE_REST_FALLBACK` above.
+
+---
+
+### `GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT` — GraphQL capability negative cache hit rate
+
+The GraphQL capability cache records whether a given GitLab instance supports a specific GraphQL operation. A negative cache hit means a previous probe failed and the cache is short-circuiting the GraphQL attempt, returning immediately to REST. A high negative-hit rate (above 1 req/s sustained) indicates many operations are being short-circuited — either because the instance genuinely lacks support, or because a transient probe error was cached and has not been re-evaluated.
+
+**Alert expression:**
+
+```promql
+rate(graphql_capability_negative_cache_hit[10m]) > 1.0
+```
+
+**For duration:** 30 minutes
+
+**Severity:** `warning`
+
+**Runbook anchor:** [#graphql-capability-negative-cache](#graphql-capability-negative-cache)
+
+**Remediation:** Check pod logs for `graphql.capability.probe.failed` events to identify which operation(s) triggered the negative cache entries. If the failure was transient (e.g. a GitLab upgrade in progress), restart the pod to flush the in-memory cache. If the probe failures are persistent, verify the GitLab instance version and that the GraphQL endpoint is reachable from the pod (`curl ${GITLAB_URL}/api/graphql`).
+
+---
+
+## Runbook Anchors
+
+### echo-drop-rate-zero
+
+TxSubscriber echo-drop rate is zero for 30+ minutes. Either the subscription is broken or there is no write traffic.
+
+1. Check `tx.subscription.connected` metric — should be `1`.
+2. Check pod logs: `docker logs pod-gitlab 2>&1 | grep tx.subscription`.
+3. If disconnected, the pod auto-reconnects; check for repeated `tx.subscription.reconnect` events indicating a loop.
+4. If connected but no drops, verify there is active binding traffic by checking `GET /api/v1/bindings` for enabled bindings and recent GitLab webhook deliveries.
+
+### service-account-resolved-nonzero
+
+Path D should have retired service-account resolution. A non-zero value is informational — review current `SYNC_PATH` configuration and whether a migration is in progress.
+
+### composite-rest-fallback
+
+GraphQL adapter not engaging for MR composite, epics list, or MR list fetches.
+
+1. Inspect capability cache: grep pod logs for `graphql.capability`.
+2. Restart the pod to flush the in-memory capability cache.
+3. After restart, watch for `graphql.capability.probe.ok` to confirm re-evaluation.
+4. If probes continue to fail, check GitLab version requirements in `docs/architecture.md`.
+
+### graphql-capability-negative-cache
+
+High rate of negative cache hits short-circuiting GraphQL attempts.
+
+1. Identify affected operations: `grep 'graphql.capability.negative_cache_hit' <pod-logs>`.
+2. Check whether the GitLab instance was recently upgraded or temporarily unreachable.
+3. Restart the pod to flush the cache if the underlying condition has been resolved.
+4. If the GitLab instance genuinely does not support the operation, the REST fallback is correct and the alert threshold should be raised or the metric suppressed for that instance.
