@@ -211,6 +211,111 @@ curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/re-register-we
 
 ---
 
+### PATCH /api/v1/bindings/:id
+
+Update binding configuration (currently supports the `disabled` toggle). Used to pause a binding before running the reviewer-label migration.
+
+**Request:**
+```bash
+curl -X PATCH http://localhost:3600/api/v1/bindings/binding-id-123 \
+  -H "Authorization: Bearer ${SERVER_SECRET}" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": true}'
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- `disabled` (boolean, required) — Set to `true` to pause sync; `false` to resume.
+
+**Response:**
+```json
+{
+  "bindingId": "binding-id-123",
+  "disabled": true,
+  "updatedAt": "2026-06-05T10:30:00Z"
+}
+```
+
+**Response fields:**
+- `bindingId` (string) — The updated binding
+- `disabled` (boolean) — Current disabled state
+- `updatedAt` (ISO 8601 string) — Timestamp of the update
+
+**Status Codes:**
+- `200` — Binding updated successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId) or invalid request body
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+
+**Notes:**
+- **Pause before migration:** The reviewer-label migration endpoint (`POST /api/v1/bindings/:id/migrate-reviewer-labels`) requires the binding to be disabled (`disabled: true`) before migration runs to prevent sync writes during label conversion.
+- **Idempotent:** Setting `disabled: true` when already disabled (or `disabled: false` when already enabled) is safe and returns `200`.
+- **See also:** [Phase 3 Migration Runbook](../docs/phase3-runbook.md) for the full operator workflow.
+
+---
+
+### POST /api/v1/bindings/:id/migrate-reviewer-labels
+
+Migrate Phase 2 synthetic reviewer labels to Phase 3 typed `reviewers` field. **Requires the binding to be paused (`disabled: true`) before execution.** This is a one-shot operation per binding; running on an already-migrated binding is safe (idempotent).
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/migrate-reviewer-labels \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- Empty (POST with no body)
+
+**Response (success):**
+```json
+{
+  "migratedAt": "2026-06-05T10:35:00Z",
+  "mrsScanned": 42,
+  "labelsStripped": 87,
+  "reviewersResolved": 87,
+  "unresolvedCount": 0
+}
+```
+
+**Response fields:**
+- `migratedAt` (ISO 8601 string) — Timestamp of the migration
+- `mrsScanned` (integer) — Number of mirrored MR Issues examined
+- `labelsStripped` (integer) — Number of `gitlab:reviewer:*` labels removed
+- `reviewersResolved` (integer) — Number of labels successfully mapped to PersonUuids
+- `unresolvedCount` (integer) — Number of labels that could not be resolved to Huly persons (best-effort migration; these reviewers are dropped)
+
+**Response (conflict):**
+```json
+{
+  "error": "binding_active",
+  "message": "Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running migration; re-enable after.",
+  "timestamp": "2026-06-05T10:35:00Z"
+}
+```
+
+**Status Codes:**
+- `200` — Migration completed successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId)
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+- `409` — Binding is active (`disabled !== true`); pause before retrying
+
+**Notes:**
+- **Idempotent and safe:** Re-running migration on an already-migrated binding is safe. Labels already converted will be re-stripped; `reviewersResolved` will be lower on second run (labels already gone).
+- **Unresolved reviewers:** If a `gitlab:reviewer:*` label maps to a GitLab user who has no Huly identity, the label is still stripped but the reviewer is not added to the typed `reviewers` field. Check `unresolvedCount` in the response; manual cleanup via GitLab may be needed for those cases.
+- **Operator workflow:** See [Phase 3 Migration Runbook](../docs/phase3-runbook.md) for the recommended sequence:
+  1. Pause: `PATCH /api/v1/bindings/:id {disabled: true}`
+  2. Migrate: `POST /api/v1/bindings/:id/migrate-reviewer-labels`
+  3. Resume: `PATCH /api/v1/bindings/:id {disabled: false}`
+
+---
+
 ## OAuth Flow
 
 ### GET /oauth/start

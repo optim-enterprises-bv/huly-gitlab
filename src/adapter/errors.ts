@@ -47,3 +47,31 @@ export class ConfidentialMergeRequestError extends Error {
     this.name = 'ConfidentialMergeRequestError'
   }
 }
+
+export class ApprovalActionError extends Error {
+  readonly kind: 'approve' | 'unapprove'
+  /**
+   * GitLab numeric project id (stringified) — the request target. Renamed from
+   * the original `bindingId` (B5): the value passed at the throw site is
+   * `String(projectId)` from gitlab-client.ts, NOT the binding Mongo
+   * ObjectId. Keep the name consistent with the value for honest debugging.
+   */
+  readonly projectId: string
+  readonly mrIid: number
+  readonly actorUuid: string | undefined
+
+  constructor (
+    kind: 'approve' | 'unapprove',
+    projectId: string,
+    mrIid: number,
+    message: string,
+    actorUuid?: string
+  ) {
+    super(message)
+    this.name = 'ApprovalActionError'
+    this.kind = kind
+    this.projectId = projectId
+    this.mrIid = mrIid
+    this.actorUuid = actorUuid
+  }
+}

@@ -137,7 +137,17 @@ function makeHulyClient (): FakeHulyClient {
     getMixin: (issueRef: string): Record<string, unknown> | undefined =>
       mixinByIssue.get(issueRef),
     findOne: async (_cls: unknown, q: Partial<Issue>): Promise<Issue | undefined> => {
-      if (q._id !== undefined) return issues.get(q._id)
+      if (q._id !== undefined) {
+        const issue = issues.get(q._id)
+        if (issue === undefined) return undefined
+        // Mirror the platform behavior: mixin attributes are accessible under
+        // the mixin Ref key on the Doc. Tests rely on this for readMixin().
+        const mixinAttrs = mixinByIssue.get(String(q._id))
+        if (mixinAttrs !== undefined) {
+          return { ...issue, ['gitlab-mr']: mixinAttrs } as unknown as Issue
+        }
+        return issue
+      }
       return undefined
     },
     findAll: async () => [],
@@ -222,6 +232,11 @@ interface FakeGitLab {
   createLabel: jest.Mock
   listMilestones: jest.Mock
   createMilestone: jest.Mock
+  // Phase 3 (P3-T-07): two-way approval + composite enrichment.
+  approveMR: jest.Mock
+  unapproveMR: jest.Mock
+  getMRApprovals: jest.Mock
+  getMRChanges: jest.Mock
 }
 
 function makeGitLab (overrides: Partial<FakeGitLab> = {}): FakeGitLab {
@@ -238,6 +253,10 @@ function makeGitLab (overrides: Partial<FakeGitLab> = {}): FakeGitLab {
       description: null
     })),
     listMilestones: jest.fn().mockResolvedValue([]),
+    approveMR: jest.fn().mockResolvedValue(undefined),
+    unapproveMR: jest.fn().mockResolvedValue(undefined),
+    getMRApprovals: jest.fn().mockResolvedValue({ approvedBy: [], approvalsRequired: 0 }),
+    getMRChanges: jest.fn().mockResolvedValue({ diffWebUrl: '', changedFiles: [] }),
     createMilestone: jest.fn().mockImplementation(async (_pid, body) => ({
       id: 88,
       iid: 1,
@@ -354,6 +373,10 @@ interface Harness {
 function buildHarness (opts: {
   gitlab?: Partial<FakeGitLab>
   knownUsers?: Map<string, PersonUuid>
+  resolveActorToken?: (
+    workspaceUuid: WorkspaceUuid,
+    person: PersonUuid
+  ) => Promise<string | undefined>
 } = {}): Harness {
   const idmap = makeIdMap()
   const cursors = makeCursors()
@@ -387,7 +410,10 @@ function buildHarness (opts: {
     labelCache,
     milestoneCache,
     defaultTaskType: 'task:taskType:default' as unknown as Ref<TaskType>,
-    gitlabBaseUrl: 'https://gitlab.example'
+    gitlabBaseUrl: 'https://gitlab.example',
+    credentials: {
+      resolveActorToken: opts.resolveActorToken ?? (async () => undefined)
+    }
   }
 
   const enqueued: Array<{ binding: string, kind: string, record: Record<string, unknown> }> = []
@@ -515,16 +541,17 @@ test('7. assignee mapped via UserIdentity → PersonUuid attached', async () => 
   expect(h.huly.issues.get(ref)?.assignee).toBe('person-uuid-aaa')
 })
 
-test('8. reviewer mapping → synthetic gitlab:reviewer:<u> label created (critic C4)', async () => {
+test('8. Phase 3 regression: no synthetic gitlab:reviewer:* labels created on new MR', async () => {
   const h = buildHarness()
   const ensureSpy = jest.spyOn(h.bctx.labelCache, 'ensureLocalTag')
   await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
     reviewers: [makeUser(101), makeUser(102)]
   }))
-  // Reviewer labels must be created with the synthetic prefix.
   const calledNames = ensureSpy.mock.calls.map((c) => c[1])
-  expect(calledNames).toContain('gitlab:reviewer:user101')
-  expect(calledNames).toContain('gitlab:reviewer:user102')
+  // Phase 3 (P3-T-07): synthetic labels are GONE. Migration helper (P3-T-09)
+  // strips legacy labels separately; applyRemote must NOT recreate them.
+  expect(calledNames).not.toContain('gitlab:reviewer:user101')
+  expect(calledNames).not.toContain('gitlab:reviewer:user102')
 })
 
 test('9. locked state: status unchanged, mergeStatus mixin field = "locked"', async () => {
@@ -654,15 +681,15 @@ test('15. applyRemote does NOT write pipelineStatus on the mixin (critic C2)', a
   expect(h.huly.getMixin(issueRef as unknown as string)?.pipelineStatus).toBe('success')
 })
 
-test('16. two reviewers → two synthetic labels via LabelCache.ensureLocalTag', async () => {
+test('16. Phase 3 regression: two reviewers do NOT create labels (typed field used instead)', async () => {
   const h = buildHarness()
   const ensureSpy = jest.spyOn(h.bctx.labelCache, 'ensureLocalTag')
   await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
     reviewers: [makeUser(11), makeUser(12)]
   }))
   const calledNames = ensureSpy.mock.calls.map((c) => c[1])
-  expect(calledNames).toContain('gitlab:reviewer:user11')
-  expect(calledNames).toContain('gitlab:reviewer:user12')
+  expect(calledNames).not.toContain('gitlab:reviewer:user11')
+  expect(calledNames).not.toContain('gitlab:reviewer:user12')
 })
 
 test('17. empty description coalesces to "" without throwing', async () => {
@@ -718,4 +745,334 @@ test('backfill: passes since as updatedAfter Date to listMergeRequests', async (
   const since = new Date('2024-06-15T00:00:00Z')
   await h.manager.backfill(h.ctx, 'binding-1', since)
   expect(listMock).toHaveBeenCalledWith(42, { updatedAfter: since })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 3 (P3-T-07) — typed reviewers, approvals two-way, diff metadata
+// ---------------------------------------------------------------------------
+
+import {
+  getApprovalServiceAccountFallbackCount,
+  resetApprovalServiceAccountFallbackCount
+} from '../../src/sync/mr'
+import { ApprovalActionError } from '../../src/adapter/errors'
+
+beforeEach(() => {
+  resetApprovalServiceAccountFallbackCount()
+})
+
+test('P3-1. applyRemote populates typed reviewers from syncMR.reviewers', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:201', 'person-r1' as unknown as PersonUuid],
+    ['gitlab:202', 'person-r2' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    reviewers: [makeUser(201), makeUser(202)]
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.reviewers).toEqual(['person-r1', 'person-r2'])
+})
+
+test('P3-2. applyRemote populates approvedBy + approvalsRequired + approvalStatus=approved when threshold met', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:301', 'person-a1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    approvedBy: [makeUser(301)],
+    approvalsRequired: 1
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvedBy).toEqual(['person-a1'])
+  expect(mixin.approvalsRequired).toBe(1)
+  expect(mixin.approvalStatus).toBe('approved')
+})
+
+test('P3-3. applyRemote approvalStatus=pending when approvedBy < approvalsRequired', async () => {
+  const h = buildHarness()
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    approvedBy: [],
+    approvalsRequired: 2
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalStatus).toBe('pending')
+})
+
+test('P3-4. applyRemote approvalStatus=pending when approvalsRequired=0', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:401', 'person-x1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    approvedBy: [makeUser(401)],
+    approvalsRequired: 0
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalStatus).toBe('pending')
+})
+
+test('P3-5. applyRemote populates diffWebUrl + changedFiles from composite fetch', async () => {
+  const h = buildHarness()
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    diffWebUrl: 'https://gitlab.example/mr/1/diffs',
+    changedFiles: [
+      { path: 'a.ts', additions: 5, deletions: 1, status: 'modified' },
+      { path: 'b.ts', additions: 10, deletions: 0, status: 'added' }
+    ]
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.diffWebUrl).toBe('https://gitlab.example/mr/1/diffs')
+  expect((mixin.changedFiles as unknown[]).length).toBe(2)
+})
+
+test('P3-6. applyRemote with syncMR.reviewers=undefined preserves existing mixin reviewers (B2)', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:501', 'person-pre1' as unknown as PersonUuid],
+    ['gitlab:502', 'person-pre2' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  // 1st applyRemote with reviewers populated.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 50,
+    reviewers: [makeUser(501), makeUser(502)]
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  expect((h.huly.getMixin(issueRef as unknown as string) ?? {}).reviewers).toEqual(['person-pre1', 'person-pre2'])
+
+  // 2nd applyRemote with reviewers undefined (e.g. listMergeRequests intermediate state).
+  const mrNoReviewers = makeSyncMR({
+    iid: 50,
+    updatedAt: new Date('2024-05-01T10:00:00.000Z')
+  })
+  delete (mrNoReviewers as { reviewers?: unknown }).reviewers
+  await h.manager.applyRemote(h.ctx, 'binding-1', mrNoReviewers)
+
+  // Mixin retains the seeded reviewers.
+  expect((h.huly.getMixin(issueRef as unknown as string) ?? {}).reviewers).toEqual(['person-pre1', 'person-pre2'])
+})
+
+test('P3-7. applyLocal add to approvedBy → calls approveMR; no stored token → service-account fallback', async () => {
+  const h = buildHarness()
+  // First create the MR via applyRemote.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 70 }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  await h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    { approvedBy: ['person-new' as unknown as PersonUuid] as unknown }
+  )
+  expect(h.gitlab.approveMR).toHaveBeenCalledTimes(1)
+  expect(h.gitlab.approveMR).toHaveBeenCalledWith(42, 70, undefined)
+  expect(getApprovalServiceAccountFallbackCount()).toBe(1)
+  // Visibility comment posted: one createDoc call on ChatMessage class (counter on aux-ref-*).
+  // We just assert createMixin was still 1 (issue creation only — no extra mixins).
+  expect(h.huly.createMixinCalls.length).toBe(1)
+})
+
+test('P3-8. applyLocal add with stored OAuth token → calls approveMR with actorToken', async () => {
+  const tokenResolver = jest.fn(async () => 'oauth-token-abc')
+  const h = buildHarness({ resolveActorToken: tokenResolver })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 71 }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  await h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    { approvedBy: ['person-with-oauth' as unknown as PersonUuid] as unknown }
+  )
+  expect(h.gitlab.approveMR).toHaveBeenCalledTimes(1)
+  expect(h.gitlab.approveMR).toHaveBeenCalledWith(42, 71, 'oauth-token-abc')
+  expect(getApprovalServiceAccountFallbackCount()).toBe(0)
+})
+
+test('P3-9. applyLocal remove from approvedBy → calls unapproveMR', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:801', 'person-rm-1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  // Seed an MR with one approver.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 80,
+    approvedBy: [makeUser(801)],
+    approvalsRequired: 1
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  // Now Huly clears the approver list.
+  await h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    { approvedBy: [] as PersonUuid[] }
+  )
+  expect(h.gitlab.unapproveMR).toHaveBeenCalledTimes(1)
+  expect(h.gitlab.unapproveMR).toHaveBeenCalledWith(42, 80, undefined)
+  expect(h.gitlab.approveMR).not.toHaveBeenCalled()
+})
+
+test('P3-10. applyLocal mixed add+remove → both approve and unapprove called', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:901', 'person-keep' as unknown as PersonUuid],
+    ['gitlab:902', 'person-leave' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 90,
+    approvedBy: [makeUser(901), makeUser(902)],
+    approvalsRequired: 2
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  // Replace person-leave with a new approver person-new.
+  await h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    {
+      approvedBy: [
+        'person-keep' as unknown as PersonUuid,
+        'person-new' as unknown as PersonUuid
+      ] as unknown
+    }
+  )
+  expect(h.gitlab.approveMR).toHaveBeenCalledTimes(1)
+  expect(h.gitlab.unapproveMR).toHaveBeenCalledTimes(1)
+})
+
+test('P3-11. applyLocal ApprovalActionError is caught — no crash, no rethrow (best-effort)', async () => {
+  const failingGitlab: Partial<FakeGitLab> = {
+    approveMR: jest.fn().mockRejectedValue(
+      new ApprovalActionError('approve', '42', 99, 'GitLab 500')
+    )
+  }
+  const h = buildHarness({ gitlab: failingGitlab })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 99 }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  // The call should not throw — the manager swallows ApprovalActionError.
+  await expect(h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    { approvedBy: ['person-x' as unknown as PersonUuid] as unknown }
+  )).resolves.toBeUndefined()
+  expect(h.gitlab.approveMR).toHaveBeenCalledTimes(1)
+})
+
+test('P3-12. applyLocal change.reviewers set → warn logged, no GitLab call (Phase 3 deferred)', async () => {
+  const h = buildHarness()
+  const warnSpy = jest.spyOn(h.ctx.logger, 'warn')
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 120 }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  await h.manager.applyLocal(
+    h.ctx,
+    'binding-1',
+    `mr:${String(issueRef)}`,
+    { reviewers: ['person-new-rev' as unknown as PersonUuid] as unknown }
+  )
+  // No approve/unapprove and no MR update for reviewer-only change.
+  expect(h.gitlab.approveMR).not.toHaveBeenCalled()
+  expect(h.gitlab.unapproveMR).not.toHaveBeenCalled()
+  expect(h.gitlab.updateMergeRequest).not.toHaveBeenCalled()
+  // The "unsynced" warn must fire.
+  const reviewerWarn = warnSpy.mock.calls.find(
+    (c) => String(c[0]).includes('mr.reviewers.huly.unsynced')
+  )
+  expect(reviewerWarn).toBeDefined()
+})
+
+test('P3-13. C2 isolation regression: applyRemote NEVER writes pipelineStatus (Phase 3 extension)', async () => {
+  const h = buildHarness()
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 130,
+    approvedBy: [makeUser(1300)],
+    approvalsRequired: 1,
+    diffWebUrl: 'https://gitlab.example/mr/130/diffs',
+    changedFiles: [{ path: 'x.ts', additions: 1, deletions: 0, status: 'added' }],
+    reviewers: [makeUser(1301)]
+  }))
+  for (const call of h.huly.createMixinCalls) {
+    expect(Object.keys(call.attributes)).not.toContain('pipelineStatus')
+  }
+  for (const call of h.huly.updateMixinCalls) {
+    expect(Object.keys(call.attributes)).not.toContain('pipelineStatus')
+  }
+})
+
+test('P3-14. C10 race: local approvedBy=2, remote=1 within 30s → KEEP local 2', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:1401', 'person-r1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  // First seed: create the MR (no approvers; modifiedOn = remoteTs of initial).
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 140,
+    updatedAt: new Date('2024-01-01T10:00:00.000Z')
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  // Pre-seed mixin with 2 local approvers and bump Issue modifiedOn to "now"
+  // (simulating an in-flight approveMR round-trip).
+  h.huly.mixinByIssue.set(issueRef as unknown as string, {
+    ...(h.huly.getMixin(issueRef as unknown as string) ?? {}),
+    approvedBy: ['local-a', 'local-b']
+  })
+  const issue = h.huly.issues.get(issueRef)
+  if (issue !== undefined) {
+    h.huly.issues.set(issueRef, { ...issue, modifiedOn: Date.now() } as Issue)
+  }
+
+  // Remote arrives with only 1 approver and a stale timestamp (older than now).
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 140,
+    approvedBy: [makeUser(1401)],
+    approvalsRequired: 1,
+    updatedAt: new Date(Date.now() - 5_000) // 5s old
+  }))
+
+  // Mixin retains the locally-tracked 2 approvers.
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvedBy).toEqual(['local-a', 'local-b'])
+})
+
+test('P3-15. C10 race: local approvedBy=2 BUT older than 30s window → take remote 1', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:1501', 'person-remote1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 150,
+    updatedAt: new Date('2024-01-01T10:00:00.000Z')
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+
+  h.huly.mixinByIssue.set(issueRef as unknown as string, {
+    ...(h.huly.getMixin(issueRef as unknown as string) ?? {}),
+    approvedBy: ['local-a', 'local-b']
+  })
+  // Set Issue modifiedOn 10 minutes ago — OUTSIDE the 30s race window.
+  const issue = h.huly.issues.get(issueRef)
+  if (issue !== undefined) {
+    h.huly.issues.set(issueRef, { ...issue, modifiedOn: Date.now() - 10 * 60_000 } as Issue)
+  }
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 150,
+    approvedBy: [makeUser(1501)],
+    approvalsRequired: 1,
+    updatedAt: new Date()
+  }))
+
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvedBy).toEqual(['person-remote1'])
 })

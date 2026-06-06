@@ -18,7 +18,19 @@ import {
   seedGitLabMR,
   postSyntheticWebhook,
   setupStackForMR,
-  type HarnessDeps
+  buildSeedDiscussionBody,
+  seedGitLabDiscussion,
+  seedGitLabApprover,
+  getMRApprovalsFromGitLab,
+  getMRDiffFromGitLab,
+  postMigrateReviewerLabels,
+  patchBindingDisabled,
+  directMixinPatchOnChatMessage,
+  directMixinPatchOnIssue,
+  HARNESS_CHAT_MESSAGE_CLASS,
+  HARNESS_ISSUE_CLASS,
+  type HarnessDeps,
+  type MinimalTransactor
 } from './setup'
 import { makeDockerMock } from './fakes/docker-mock'
 import { makeFetchMock } from './fakes/http-mock'
@@ -300,6 +312,214 @@ describe('harness primitives', () => {
     expect(result.mrIid).toBe(3)
     expect(result.sourceBranch).toBe('feature/m')
     expect(result.targetBranch).toBe('main')
+  })
+
+  test('buildSeedDiscussionBody serializes position fields into snake_case', () => {
+    const minimal = buildSeedDiscussionBody({ body: 'hello' })
+    expect(minimal).toEqual({ body: 'hello' })
+
+    const withPos = buildSeedDiscussionBody({
+      body: 'line cmt',
+      position: {
+        baseSha: 'b'.repeat(40),
+        startSha: 's'.repeat(40),
+        headSha: 'h'.repeat(40),
+        oldPath: 'a.ts',
+        newPath: 'b.ts',
+        positionType: 'text',
+        newLine: 12
+      }
+    })
+    expect(withPos).toEqual({
+      body: 'line cmt',
+      position: {
+        base_sha: 'b'.repeat(40),
+        start_sha: 's'.repeat(40),
+        head_sha: 'h'.repeat(40),
+        old_path: 'a.ts',
+        new_path: 'b.ts',
+        position_type: 'text',
+        new_line: 12
+      }
+    })
+  })
+
+  test('seedGitLabDiscussion POSTs to /discussions with PRIVATE-TOKEN and parses note id', async () => {
+    const http = makeFetchMock()
+    http.on('/discussions', {
+      status: 201,
+      body: { id: 'disc-abc', notes: [{ id: 901 }] }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await seedGitLabDiscussion(deps, 'http://gitlab.test:8929', 'tok-x', 5, 9, {
+      body: 'review note'
+    })
+    expect(result).toEqual({ discussionId: 'disc-abc', noteId: 901 })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/projects/5/merge_requests/9/discussions')
+    expect(call.init?.method).toBe('POST')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers['PRIVATE-TOKEN']).toBe('tok-x')
+    expect(headers['Content-Type']).toBe('application/json')
+    const body = JSON.parse(call.init?.body as string)
+    expect(body).toEqual({ body: 'review note' })
+  })
+
+  test('seedGitLabApprover uses PRIVATE-TOKEN header from approverToken (not root)', async () => {
+    const http = makeFetchMock()
+    http.on('/approve', { status: 201, body: { state: 'approved' } })
+    const deps = buildDeps({ fetch: http.fetch })
+    await seedGitLabApprover(deps, 'http://gitlab.test:8929', 12, 4, 'reviewer-token')
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/projects/12/merge_requests/4/approve')
+    expect(call.init?.method).toBe('POST')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers['PRIVATE-TOKEN']).toBe('reviewer-token')
+  })
+
+  test('getMRApprovalsFromGitLab builds correct URL and shapes response', async () => {
+    const http = makeFetchMock()
+    http.on('/approvals', {
+      status: 200,
+      body: {
+        approvals_required: 2,
+        approved_by: [{ user: { username: 'alice' } }, { user: { username: 'bob' } }]
+      }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await getMRApprovalsFromGitLab(deps, 'http://gitlab.test:8929', 'root-tok', 3, 8)
+    expect(result).toEqual({ approvalsRequired: 2, approvedBy: ['alice', 'bob'] })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/projects/3/merge_requests/8/approvals')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers['PRIVATE-TOKEN']).toBe('root-tok')
+  })
+
+  test('getMRDiffFromGitLab GETs /changes and projects change records', async () => {
+    const http = makeFetchMock()
+    http.on('/changes', {
+      status: 200,
+      body: {
+        web_url: 'http://gitlab.test/proj/-/merge_requests/3',
+        changes: [
+          { old_path: 'a.ts', new_path: 'a.ts', new_file: false, renamed_file: false, deleted_file: false },
+          { old_path: 'old.ts', new_path: 'new.ts', new_file: false, renamed_file: true, deleted_file: false }
+        ]
+      }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await getMRDiffFromGitLab(deps, 'http://gitlab.test:8929', 'tok', 1, 3)
+    expect(result.webUrl).toBe('http://gitlab.test/proj/-/merge_requests/3')
+    expect(result.files).toHaveLength(2)
+    expect(result.files[1]).toEqual({
+      oldPath: 'old.ts',
+      newPath: 'new.ts',
+      newFile: false,
+      renamedFile: true,
+      deletedFile: false
+    })
+  })
+
+  test('postMigrateReviewerLabels parses JSON body and surfaces 409 status', async () => {
+    const http = makeFetchMock()
+    http.on('/migrate-reviewer-labels', {
+      status: 409,
+      body: { error: 'binding is active; pause before migrating' }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await postMigrateReviewerLabels(deps, {
+      podBaseUrl: 'http://pod.test:3600',
+      serverSecret: 'sec',
+      bindingId: 'b-1'
+    })
+    expect(result.status).toBe(409)
+    expect(result.body).toEqual({ error: 'binding is active; pause before migrating' })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/api/v1/bindings/b-1/migrate-reviewer-labels')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer sec')
+  })
+
+  test('patchBindingDisabled PATCHes the binding with disabled flag in JSON body', async () => {
+    const http = makeFetchMock()
+    http.on('/api/v1/bindings/b-2', { status: 200, body: { ok: true } })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await patchBindingDisabled(deps, {
+      podBaseUrl: 'http://pod.test:3600',
+      serverSecret: 'sec',
+      bindingId: 'b-2',
+      disabled: true
+    })
+    expect(result.status).toBe(200)
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/api/v1/bindings/b-2')
+    expect(call.init?.method).toBe('PATCH')
+    const body = JSON.parse(call.init?.body as string)
+    expect(body).toEqual({ disabled: true })
+  })
+
+  test('directMixinPatchOnChatMessage forwards to transactor.updateMixin with ChatMessage class', async () => {
+    const calls: Array<{ method: string, args: unknown[] }> = []
+    const mockTransactor: MinimalTransactor = {
+      createMixin: async (...args) => {
+        calls.push({ method: 'createMixin', args })
+      },
+      updateMixin: async (...args) => {
+        calls.push({ method: 'updateMixin', args })
+      }
+    }
+    await directMixinPatchOnChatMessage(mockTransactor, {
+      targetRef: 'msg-1',
+      space: 'space-1',
+      mixin: 'gitlab-review',
+      attrs: { resolved: true, threadId: 'd1' }
+    })
+    expect(calls).toEqual([
+      {
+        method: 'updateMixin',
+        args: ['msg-1', HARNESS_CHAT_MESSAGE_CLASS, 'space-1', 'gitlab-review', { resolved: true, threadId: 'd1' }]
+      }
+    ])
+  })
+
+  test('directMixinPatchOnChatMessage create mode calls createMixin (C18)', async () => {
+    const calls: Array<{ method: string, args: unknown[] }> = []
+    const mockTransactor: MinimalTransactor = {
+      createMixin: async (...args) => {
+        calls.push({ method: 'createMixin', args })
+      },
+      updateMixin: async (...args) => {
+        calls.push({ method: 'updateMixin', args })
+      }
+    }
+    await directMixinPatchOnChatMessage(mockTransactor, {
+      targetRef: 'msg-2',
+      space: 'space-2',
+      mixin: 'gitlab-review',
+      attrs: { threadId: 'd-new', resolved: false },
+      mode: 'create'
+    })
+    expect(calls[0]?.method).toBe('createMixin')
+    expect(calls[0]?.args[1]).toBe(HARNESS_CHAT_MESSAGE_CLASS)
+  })
+
+  test('directMixinPatchOnIssue still targets Issue class (no regression from C18)', async () => {
+    const calls: Array<{ method: string, args: unknown[] }> = []
+    const mockTransactor: MinimalTransactor = {
+      createMixin: async (...args) => {
+        calls.push({ method: 'createMixin', args })
+      },
+      updateMixin: async (...args) => {
+        calls.push({ method: 'updateMixin', args })
+      }
+    }
+    await directMixinPatchOnIssue(mockTransactor, {
+      targetRef: 'issue-1',
+      space: 'space-1',
+      mixin: 'gitlab-mr',
+      attrs: { draft: true }
+    })
+    expect(calls[0]?.args[1]).toBe(HARNESS_ISSUE_CLASS)
   })
 
   test('isRealStackEnabled and isSoakEnabled honor env vars', () => {

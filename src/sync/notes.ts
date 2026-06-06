@@ -1,10 +1,12 @@
 import type { Ref, Space, TxOperations, WorkspaceUuid } from '@hcengineering/core'
 import chunter, { type ChatMessage } from '@hcengineering/chunter'
 import tracker, { type Issue } from '@hcengineering/tracker'
-import type { SyncNote, SyncUser as AdapterUser } from '../adapter/types'
+import type { SyncNote, SyncReviewPosition, SyncReviewThread, SyncUser as AdapterUser } from '../adapter/types'
 import { gfmMarkdownToMarkup, markupToGfmMarkdown } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { getCursor, setCursor } from '../state/cursors'
+import * as metrics from '../metrics'
+import { METRIC_NAMES } from '../metrics'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import { resolveIssueRef, type BindingResolverInput } from './issues'
@@ -22,10 +24,27 @@ import { resolveIssueRef, type BindingResolverInput } from './issues'
  *   or for MR notes:
  *   { object_kind: 'note', object_attributes: { id, body, system, noteable_type: 'MergeRequest', ... },
  *     merge_request: { iid: <parent iid>, ... } }
+ *
+ * Phase 3 — line-comment routing:
+ *   When isReview === true, applyRemote re-enqueues with kind 'review' for
+ *   ReviewThreadsSyncManager to handle. position and discussionId carry the
+ *   line-anchor context. The notes path does NOT write a ChatMessage in this case.
+ *
+ * NOTE (C9): unit tests assert the enqueue CALL SHAPE only; live engine wiring
+ * (kind 'review' registration) lands in P3-T-10.
+ *
+ * Suggestion blocks (C3): <<<<<<< SUGGEST content in note body passes through
+ * verbatim as raw markdown. No interpretation is applied.
  */
 export interface SyncNoteRecord {
   noteableIid: number
   note: SyncNote
+  /** Phase 3: true when note has a text-position line anchor → re-route to review path */
+  isReview?: boolean
+  /** Phase 3: SyncReviewPosition extracted from the webhook position object */
+  position?: SyncReviewPosition
+  /** Phase 3: GitLab discussion_id for threading */
+  discussionId?: string
 }
 
 /**
@@ -97,6 +116,50 @@ function parseWebhookPayload (record: Record<string, unknown>): SyncNoteRecord |
     system: a.system === true,
     confidential: a.confidential === true,
     noteableType
+  }
+
+  // Phase 3 — line-comment detection.
+  // Only MR notes with position_type === 'text' are routed to the review path.
+  // Notes without position, or non-MR noteables, continue through the existing path.
+  if (
+    noteableType === 'MergeRequest' &&
+    a.position !== null &&
+    typeof a.position === 'object'
+  ) {
+    const pos = a.position as Record<string, unknown>
+    if (pos.position_type === 'text') {
+      // Validate required SHA fields are present (spec §Error Handling):
+      // "Line comment with malformed position: log warn, drop the note, do NOT create the thread"
+      // Caller receives undefined and logs the warning.
+      if (
+        typeof pos.head_sha !== 'string' ||
+        typeof pos.base_sha !== 'string' ||
+        typeof pos.start_sha !== 'string'
+      ) {
+        const malformed: SyncNoteRecord & { _malformedPosition: boolean } = { noteableIid, note, isReview: false, _malformedPosition: true }
+        return malformed
+      }
+
+      const position: SyncReviewPosition = {
+        filePath: typeof pos.new_path === 'string' ? pos.new_path : (typeof pos.old_path === 'string' ? pos.old_path : ''),
+        oldLine: typeof pos.old_line === 'number' ? pos.old_line : null,
+        newLine: typeof pos.new_line === 'number' ? pos.new_line : null,
+        baseSha: pos.base_sha,
+        headSha: pos.head_sha,
+        startSha: pos.start_sha,
+        positionType: 'text'
+      }
+
+      const discussionId = typeof a.discussion_id === 'string' ? a.discussion_id : undefined
+
+      // Attach position to the note for downstream consumers.
+      note.position = position
+
+      return { noteableIid, note, isReview: true, position, discussionId }
+    }
+    // position_type !== 'text' (e.g. 'image', 'file') — fall through to the notes path.
+    // These are filtered at the adapter layer (P3-T-06) but we also handle them here as
+    // defense-in-depth: they route via the existing non-review path.
   }
 
   return { noteableIid, note }
@@ -276,6 +339,100 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
         ctx.logger.warn('NotesSyncManager: could not parse note record', { binding })
         return
       }
+
+      // Phase 3 — drop malformed position notes before further processing.
+      if ((parsed as SyncNoteRecord & { _malformedPosition?: boolean })._malformedPosition === true) {
+        metrics.increment(METRIC_NAMES.REVIEW_POSITION_MALFORMED)
+        ctx.logger.warn('NotesSyncManager: line comment with malformed position — dropping', {
+          binding,
+          metric: 'review.position.malformed',
+          noteId: parsed.note.id
+        })
+        return
+      }
+
+      // Phase 3 — line-comment routing: re-enqueue with kind 'review' for ReviewThreadsSyncManager.
+      // NOTE (C9): unit tests assert the enqueue CALL SHAPE only; live engine wiring
+      // (kind 'review' registration) lands in P3-T-10.
+      if (parsed.isReview === true) {
+        const bctx = await this.deps.loadBinding(binding)
+
+        // Resolve parent MR to check if it is mirrored yet.
+        // Defense-in-depth for confidential MR notes (critic B3).
+        const parentGitlabId = `${bctx.gitlabProjectId}:${parsed.noteableIid}`
+        const parentMapping = await findByGitlab(
+          ctx.store.idmap(),
+          bctx.workspaceUuid,
+          'merge_request',
+          parentGitlabId
+        )
+
+        if (parentMapping === null) {
+          // C14 — _reviewRetried flag: survive deferred re-enqueue cycle.
+          const retryFlag = rawRecord._reviewRetried === true || rawRecord._noteRetried === true
+          if (!retryFlag) {
+            ctx.logger.debug('NotesSyncManager: review note parent MR not yet synced — deferring', {
+              binding,
+              noteableIid: parsed.noteableIid,
+              noteId: parsed.note.id
+            })
+            await this.enqueueRecord(
+              binding,
+              'note',
+              { ...rawRecord, _reviewRetried: true },
+              `deferred:review:${bctx.gitlabProjectId}:${parsed.noteableIid}:${parsed.note.id}`,
+              parsed.note.updatedAt
+            )
+          } else {
+            metrics.increment(METRIC_NAMES.REVIEW_PARENT_MISSING)
+            ctx.logger.warn('NotesSyncManager: review note parent MR still missing after retry — dropping', {
+              binding,
+              metric: 'review.parent.missing',
+              noteableIid: parsed.noteableIid,
+              noteId: parsed.note.id
+            })
+          }
+          return
+        }
+
+        // Build a SyncReviewThread-shaped envelope for the ReviewThreadsSyncManager.
+        // Propagate _noteRetried as _reviewRetried so the review manager doesn't re-defer.
+        const reviewEnvelope: SyncReviewThread & Record<string, unknown> = {
+          discussionId: parsed.discussionId ?? `note:${parsed.note.id}`,
+          mergeRequestIid: parsed.noteableIid,
+          projectId: bctx.gitlabProjectId,
+          resolved: false,
+          resolvedBy: null,
+          resolvedAt: null,
+          updatedAt: new Date(parsed.note.updatedAt),
+          notes: [{
+            id: parsed.note.id,
+            body: parsed.note.body,
+            author: parsed.note.author,
+            createdAt: new Date(parsed.note.createdAt),
+            updatedAt: new Date(parsed.note.updatedAt),
+            system: parsed.note.system,
+            resolvable: true,
+            resolved: false,
+            position: parsed.position
+          }]
+        }
+
+        // Propagate retry flags so review manager won't re-defer (C14).
+        if (rawRecord._reviewRetried === true || rawRecord._noteRetried === true) {
+          (reviewEnvelope as Record<string, unknown>)._reviewRetried = true
+        }
+
+        await this.enqueueRecord(
+          binding,
+          'review',
+          reviewEnvelope as unknown as Record<string, unknown>,
+          `review:${bctx.gitlabProjectId}:${parsed.noteableIid}:${parsed.note.id}`,
+          parsed.note.updatedAt
+        )
+        return
+      }
+
       noteableIid = parsed.noteableIid
       note = parsed.note
     }
@@ -389,12 +546,27 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
     }
   }
 
+  /**
+   * NOTE (Phase 3 Path B gap): This method is reachable in production ONLY if a
+   * TxProcessor subscription is wired to call `engine.enqueueLocalEvent`.
+   * Currently no such wiring exists in `src/index.ts`. Calls from tests work
+   * fine; real Huly UI mutations do NOT trigger this path. Phase 4 work.
+   */
   async applyLocal (
     ctx: SyncContext,
     binding: BindingRef,
     doc: string,
     change: Record<string, unknown>
   ): Promise<void> {
+    // Phase 3 — review route guard (C13).
+    // When change.kind === 'review', this change belongs to ReviewThreadsSyncManager.
+    // Return here so the review manager's applyLocal handles resolution flips.
+    // Body edits (change.message) that arrive simultaneously with a resolved flip:
+    //   - The notes path handles the body update (mapping.gitlabKind === 'note').
+    //   - ReviewThreadsSyncManager handles the resolved flip independently.
+    // Both paths execute correctly when both deltas arrive in the same change event.
+    if (change.kind === 'review') return
+
     const bctx = await this.deps.loadBinding(binding)
 
     // doc format: note:<hulyRef>
@@ -406,6 +578,11 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
       HULY_CLASS_CHAT_MESSAGE,
       hulyRef
     )
+
+    // Additional route guard: if the idmap entry has gitlabKind === 'review_thread',
+    // the body edit will be handled by ReviewThreadsSyncManager via its own applyLocal
+    // invocation. Return here to avoid double-processing.
+    if (mapping !== null && mapping.gitlabKind === 'review_thread') return
 
     const deleted = change.deleted === true
     const messageMarkup = change.message as string | undefined

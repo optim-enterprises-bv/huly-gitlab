@@ -4,11 +4,13 @@ import { Router as createRouter } from 'express'
 import type { Store } from '../state/store'
 import type { Logger } from '../logging'
 import type { BindingLifecycleService } from '../sync/binding-lifecycle'
-import { createBinding, getBinding, listBindings, deleteBinding } from '../state/bindings'
+import { createBinding, getBinding, listBindings, deleteBinding, updateBinding } from '../state/bindings'
 import { putCredential, deleteCredential, rotateCredential } from '../state/credentials'
 import { requireBearer } from './auth-middleware'
 import { parseObjectId } from '../util/object-id'
 import { asyncHandler } from './async-handler'
+import { migrateReviewerLabels, type ReviewerMigrationResult } from '../sync/reviewer-migration'
+import type { BindingLoader } from '../sync/binding-loader'
 
 interface CreateBindingBody {
   workspaceUuid: string
@@ -33,7 +35,8 @@ export function createBindingRouter (
   serverSecret: string,
   logger: Logger,
   bindingLifecycle?: BindingLifecycleService,
-  publicBaseUrl?: string
+  publicBaseUrl?: string,
+  bindingLoader?: BindingLoader
 ): Router {
   const router = createRouter()
   const auth = requireBearer(serverSecret)
@@ -231,6 +234,98 @@ export function createBindingRouter (
 
     logger.info('binding: re-registered webhook', { id, webhookRegistered })
     res.status(200).json(responseBody)
+  }))
+
+  // PATCH /api/v1/bindings/:id — operator pause/resume toggle (Q3 convention)
+  router.patch('/api/v1/bindings/:id', auth, asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params
+
+    if (parseObjectId(id) === null) {
+      res.status(400).json({ error: 'invalid id format' })
+      return
+    }
+
+    const binding = await getBinding(store.bindings(), id)
+    if (binding === null) {
+      res.status(404).json({ error: 'Not found' })
+      return
+    }
+
+    const body = req.body as { disabled?: unknown }
+    const update: { disabled?: boolean } = {}
+    if (typeof body.disabled === 'boolean') {
+      update.disabled = body.disabled
+    }
+
+    if (update.disabled !== undefined) {
+      await updateBinding(store.bindings(), id, update)
+    }
+
+    const refreshed = await getBinding(store.bindings(), id)
+    if (refreshed === null) {
+      res.status(404).json({ error: 'Not found' })
+      return
+    }
+
+    const view: Record<string, unknown> = {
+      id: refreshed._id.toHexString(),
+      workspaceUuid: refreshed.workspaceUuid,
+      hulyProjectRef: refreshed.hulyProjectRef,
+      gitlabProjectId: refreshed.gitlabProjectId,
+      gitlabProjectPath: refreshed.gitlabProjectPath,
+      credentialRef: refreshed.credentialRef,
+      webhookRegistered: refreshed.webhookRegistered,
+      createdAt: refreshed.createdAt,
+      disabled: refreshed.disabled
+    }
+    if (refreshed.webhookId !== undefined) view.webhookId = refreshed.webhookId
+
+    logger.info('binding: patched binding', { id, disabled: refreshed.disabled })
+    res.status(200).json(view)
+  }))
+
+  // POST /api/v1/bindings/:id/migrate-reviewer-labels — Phase 3 reviewer migration (Q3)
+  router.post('/api/v1/bindings/:id/migrate-reviewer-labels', auth, asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params
+
+    if (parseObjectId(id) === null) {
+      res.status(400).json({ error: 'invalid id format' })
+      return
+    }
+
+    const binding = await getBinding(store.bindings(), id)
+    if (binding === null) {
+      res.status(404).json({ error: 'Not found' })
+      return
+    }
+
+    if (!binding.disabled) {
+      res.status(409).json({
+        error: 'binding active',
+        message: 'Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running migration; re-enable after.'
+      })
+      return
+    }
+
+    if (bindingLoader === undefined) {
+      logger.error('binding: migrate-reviewer-labels called without bindingLoader wired', { id })
+      res.status(500).json({ error: 'Internal server error' })
+      return
+    }
+
+    const bctx = await bindingLoader.loadForMergeRequests(id)
+    const result: ReviewerMigrationResult = await migrateReviewerLabels(
+      {
+        store,
+        hulyClient: bctx.hulyClient,
+        userIdentity: bctx.userIdentity,
+        logger
+      },
+      binding
+    )
+
+    logger.info('binding: reviewer label migration complete', { id, ...result })
+    res.status(200).json(result)
   }))
 
   return router

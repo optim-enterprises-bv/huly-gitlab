@@ -1,13 +1,26 @@
-import type { Mixin, Ref } from '@hcengineering/core'
+import type { Mixin, PersonUuid, Ref } from '@hcengineering/core'
 import type { Issue } from '@hcengineering/tracker'
-import type { MergeStatus } from '../adapter/types'
+import type { ApprovalStatus, MergeStatus, SyncChangedFile } from '../adapter/types'
 
 /**
  * Shape of the runtime `gitlab-mr` mixin written onto a tracker.Issue
  * that mirrors a GitLab merge request.
  *
- * Intentionally does NOT include `pipelineStatus` — that field is owned
- * exclusively by PipelineSyncManager (critic C2).
+ * Field-ownership partition (critic C2 + Phase 3 extension):
+ *
+ *   MergeRequestsSyncManager owns:
+ *     sourceBranch, targetBranch, draft, mergedAt, mergeStatus, webUrl,
+ *     gitlabIid, gitlabProjectId,
+ *     approvedBy, approvalsRequired, approvalStatus, diffWebUrl, changedFiles
+ *
+ *   MergeRequestsSyncManager AND reviewer-migration helper (P3-T-09) own:
+ *     reviewers  — MergeRequestsSyncManager writes it on applyRemote;
+ *                  the migration helper back-fills it from Phase 2 label data.
+ *
+ *   PipelineSyncManager owns EXCLUSIVELY (never written by MR manager):
+ *     pipelineStatus  — NOT a field on this interface by design.
+ *
+ * No manager may write a field owned by another manager.
  */
 export interface MRMixinDoc extends Issue {
   sourceBranch: string
@@ -18,6 +31,20 @@ export interface MRMixinDoc extends Issue {
   webUrl: string
   gitlabIid: number
   gitlabProjectId: number
+
+  // Phase 3 additions — all optional (not present on pre-Phase-3 documents)
+  /** Typed reviewer list. Written by MergeRequestsSyncManager.applyRemote and the reviewer-migration helper (P3-T-09). */
+  reviewers?: PersonUuid[]
+  /** Users who have approved this MR. Written exclusively by MergeRequestsSyncManager. */
+  approvedBy?: PersonUuid[]
+  /** Minimum approvals required. From GitLab approvals.approvals_required. */
+  approvalsRequired?: number
+  /** Derived approval state: 'pending' | 'approved' | 'changes_requested'. */
+  approvalStatus?: ApprovalStatus
+  /** Direct URL to the MR diff view on GitLab. */
+  diffWebUrl?: string
+  /** Files changed in this MR. From getMRChanges. */
+  changedFiles?: SyncChangedFile[]
 }
 
 /** Runtime mixin id used to carry GitLab MR fields on a tracker.Issue. */

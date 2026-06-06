@@ -18,6 +18,7 @@ import { MRCache } from './mr-cache'
 import type { BindingContext as IssuesBindingContext } from './issues'
 import type { NotesBindingContext } from './notes'
 import type { MRBindingContext } from './mr'
+import type { MRReviewBindingContext } from './mr-review'
 import type { PipelineBindingContext } from './pipeline'
 import type { BindingRef } from './types'
 
@@ -147,6 +148,31 @@ export class BindingLoader {
       labelCache: ctx.labelCache,
       milestoneCache: ctx.milestoneCache,
       defaultTaskType: ctx.defaultTaskType,
+      gitlabBaseUrl: ctx.gitlabBaseUrl,
+      // Phase 3 (P3-T-07): per-actor token resolver. Stub in Phase 3 —
+      // always returns undefined, triggering the service-account path with
+      // warn log + visibility comment. P3-T-10 wires the real lookup.
+      credentials: {
+        resolveActorToken: async () => undefined
+      }
+    }
+  }
+
+  /**
+   * ReviewThreadsSyncManager loader form — narrower than MR ctx; no caches,
+   * statuses, defaultTaskType, or per-actor credentials (B4: review manager
+   * uses service-account token only).
+   */
+  loadForReviews = async (binding: BindingRef): Promise<MRReviewBindingContext> => {
+    const ctx = await this.loadInternal(binding)
+    return {
+      workspaceUuid: ctx.workspaceUuid,
+      gitlabProjectId: ctx.gitlabProjectId,
+      gitlabProjectPath: ctx.gitlabProjectPath,
+      hulyProjectRef: ctx.hulyProjectRef,
+      hulyClient: ctx.hulyClient,
+      gitlabClient: ctx.gitlabClient as unknown as MRReviewBindingContext['gitlabClient'],
+      userIdentity: ctx.userIdentity,
       gitlabBaseUrl: ctx.gitlabBaseUrl
     }
   }

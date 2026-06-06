@@ -2,29 +2,22 @@ import type { Ref, Space, TxOperations } from '@hcengineering/core'
 import tracker, { type Issue } from '@hcengineering/tracker'
 import type { SyncPipeline, SyncPipelineStatus } from '../adapter/types'
 import { findByGitlab } from '../state/idmap'
+import * as metrics from '../metrics'
+import { METRIC_NAMES } from '../metrics'
 import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 
-/**
- * LRU eviction metric.
- *
- * Incremented if the engine's queue evicts a pipeline entry before processing.
- * Phase 2 limitation: queue.ts does not surface eviction events, so this
- * counter remains 0 at runtime. It is declared here so callers can increment
- * it if eviction notification is added in a future phase.
- */
-export let pipelineLruDropCount = 0
-
-export function incrementPipelineLruDrop (): void {
-  pipelineLruDropCount++
+export function getPipelineLruDropCount (): number {
+  return metrics.get(METRIC_NAMES.PIPELINE_LRU_DROP)
 }
 
-/**
- * Counter for pipelines dropped because they are not associated with any MR.
- * These should not reach this manager if the webhook layer filters correctly,
- * but this provides defense-in-depth.
- */
-export let unboundPipelineCount = 0
+export function incrementPipelineLruDrop (): void {
+  metrics.increment(METRIC_NAMES.PIPELINE_LRU_DROP)
+}
+
+export function getUnboundPipelineCount (): number {
+  return metrics.get(METRIC_NAMES.WEBHOOK_UNBOUND_PIPELINE)
+}
 
 /**
  * Context loaded per binding — everything PipelineSyncManager needs.
@@ -77,7 +70,7 @@ export class PipelineSyncManager implements SyncManager<SyncPipeline> {
     // Defense-in-depth: pipelines not tied to an MR are ignored.
     // The webhook layer should have filtered these already.
     if (syncPipeline.mergeRequestIid === null) {
-      unboundPipelineCount++
+      metrics.increment(METRIC_NAMES.WEBHOOK_UNBOUND_PIPELINE)
       ctx.logger.debug('PipelineSyncManager: dropping pipeline with no MR iid', {
         binding,
         pipelineId: syncPipeline.id

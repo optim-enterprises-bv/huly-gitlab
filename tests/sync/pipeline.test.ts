@@ -8,9 +8,11 @@ import type { SyncPipeline } from '../../src/adapter/types'
 import {
   PipelineSyncManager,
   type PipelineBindingContext,
-  unboundPipelineCount as _unboundPipelineCountImport,
-  incrementPipelineLruDrop
+  incrementPipelineLruDrop,
+  getUnboundPipelineCount,
+  getPipelineLruDropCount
 } from '../../src/sync/pipeline'
+import { reset as resetMetrics } from '../../src/metrics'
 import type { SyncContext } from '../../src/sync/types'
 
 // ---------------------------------------------------------------------------
@@ -210,15 +212,12 @@ describe('PipelineSyncManager', () => {
         loadBinding: async () => makeBindingContext(hulyClient)
       })
 
-      // Import the module to capture current count before
-      const mod = await import('../../src/sync/pipeline')
-      const before = mod.unboundPipelineCount
-
+      resetMetrics()
       const pipeline = makePipeline({ mergeRequestIid: null })
       await manager.applyRemote(ctx, 'binding-1', pipeline)
 
       expect(hulyClient.mixinUpdates).toHaveLength(0)
-      expect(mod.unboundPipelineCount).toBe(before + 1)
+      expect(getUnboundPipelineCount()).toBe(1)
     })
   })
 
@@ -319,11 +318,10 @@ describe('PipelineSyncManager', () => {
 
   // LRU eviction counter (Phase 2 limitation documented in pipeline.ts)
   describe('incrementPipelineLruDrop', () => {
-    it('increments pipelineLruDropCount', async () => {
-      const mod = await import('../../src/sync/pipeline')
-      const before = mod.pipelineLruDropCount
+    it('increments pipelineLruDropCount', () => {
+      resetMetrics()
       incrementPipelineLruDrop()
-      expect(mod.pipelineLruDropCount).toBe(before + 1)
+      expect(getPipelineLruDropCount()).toBe(1)
     })
   })
 })

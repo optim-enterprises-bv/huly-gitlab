@@ -185,4 +185,29 @@ describe('BindingLoader capabilities', () => {
     expect(ctx.hulyProjectRef).toBe('proj-1')
     expect(ctx.hulyClient).toBeDefined()
   })
+
+  // P3-T-10: loadForReviews returns review-narrow context
+  test('9. loadForReviews returns MRReviewBindingContext with expected fields', async () => {
+    // Re-prime getTrackerProject for this test (test 7's spyOn + mockRestore can
+    // leave the underlying jest.fn impl in an inconsistent state across order).
+    jest.spyOn(huluProjects, 'getTrackerProject').mockResolvedValueOnce({
+      statuses: [],
+      type: { tasks: ['tracker:tasktype:Issue'] }
+    } as unknown as Awaited<ReturnType<typeof huluProjects.getTrackerProject>>)
+
+    const loader = new BindingLoader(makeDeps())
+    const ctx = await loader.loadForReviews(BINDING_ID)
+    expect(ctx.workspaceUuid).toBe('ws-1')
+    expect(ctx.gitlabProjectId).toBe(42)
+    expect(ctx.gitlabProjectPath).toBe('group/project')
+    expect(ctx.hulyProjectRef).toBe('proj-1')
+    expect(ctx.hulyClient).toBeDefined()
+    expect(ctx.gitlabClient).toBeDefined()
+    expect(ctx.userIdentity).toBeDefined()
+    expect(ctx.gitlabBaseUrl).toBe(GITLAB_BASE)
+    // Review ctx must NOT include MR-only fields
+    expect((ctx as unknown as Record<string, unknown>).statuses).toBeUndefined()
+    expect((ctx as unknown as Record<string, unknown>).labelCache).toBeUndefined()
+    expect((ctx as unknown as Record<string, unknown>).credentials).toBeUndefined()
+  })
 })

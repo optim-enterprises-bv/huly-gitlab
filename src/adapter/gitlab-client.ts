@@ -1,22 +1,38 @@
 import { GraphQLClient } from 'graphql-request'
 import type { Logger } from '../logging'
-import { AuthError, ConfidentialIssueError, ConfidentialMergeRequestError, GitLabApiError, NotFoundError } from './errors'
+import { ApprovalActionError, AuthError, ConfidentialIssueError, ConfidentialMergeRequestError, GitLabApiError, NotFoundError } from './errors'
 import { withRateLimitRetry, type RateLimitHeaders } from './rate-limit'
 import { validateGitLabBaseUrl } from '../util/url-validation'
+import * as metrics from '../metrics'
+import { METRIC_NAMES } from '../metrics'
 import type {
+  ApprovalStatus,
   Capabilities,
   MergeStatus,
+  SyncChangedFile,
   SyncIssue,
   SyncLabel,
   SyncMergeRequest,
   SyncMilestone,
+  SyncMRApprovals,
+  SyncMRChanges,
   SyncNote,
   SyncPipeline,
   SyncPipelineStatus,
   SyncProject,
+  SyncReviewNote,
+  SyncReviewPosition,
+  SyncReviewThread,
   SyncUser,
   SyncWebhook
 } from './types'
+
+export function getMrCompositePartialCount (): number {
+  return metrics.get(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+}
+export function resetMrCompositePartialCount (): void {
+  metrics.reset(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+}
 
 export class InvalidGitLabBaseUrlError extends Error {
   constructor (reason: string) {
@@ -150,6 +166,55 @@ interface RawPipeline {
   merge_request?: { iid: number } | null
 }
 
+interface RawDiscussionPosition {
+  base_sha: string
+  start_sha: string
+  head_sha: string
+  position_type?: string
+  new_path?: string | null
+  old_path?: string | null
+  new_line?: number | null
+  old_line?: number | null
+}
+
+interface RawDiscussionNote {
+  id: number
+  body: string
+  author: RawUser
+  created_at: string
+  updated_at: string
+  system: boolean
+  resolvable?: boolean
+  resolved?: boolean
+  resolved_by?: RawUser | null
+  resolved_at?: string | null
+  position?: RawDiscussionPosition | null
+}
+
+interface RawDiscussion {
+  id: string
+  individual_note?: boolean
+  notes: RawDiscussionNote[]
+}
+
+interface RawApprovalResponse {
+  approvals_required?: number
+  approved_by?: Array<{ user: RawUser }>
+}
+
+interface RawChange {
+  old_path?: string
+  new_path?: string
+  new_file?: boolean
+  deleted_file?: boolean
+  renamed_file?: boolean
+}
+
+interface RawChangesResponse {
+  web_url?: string
+  changes?: RawChange[]
+}
+
 function mapMergeStatus (raw: string): MergeStatus {
   if (raw === 'can_be_merged' || raw === 'cannot_be_merged' || raw === 'unchecked' || raw === 'locked') {
     return raw
@@ -164,8 +229,19 @@ function mapPipelineStatus (raw: string): SyncPipelineStatus | null {
   return null
 }
 
-function mapMergeRequest (raw: RawMergeRequest): SyncMergeRequest {
-  return {
+/**
+ * Map a raw GitLab MR to SyncMergeRequest. The Phase 3 optional fields
+ * (`reviewers`, `approvedBy`, `approvalsRequired`, `approvalStatus`,
+ * `diffWebUrl`, `changedFiles`) are deliberately LEFT UNDEFINED here.
+ * - `listMergeRequests` callers receive minimal MR rows.
+ * - `getMergeRequest` (composite fetch) overlays the populated fields after
+ *   calling `getMRApprovals` + `getMRChanges` in parallel.
+ *
+ * `applyRemote` consumers MUST treat `undefined` as "not yet fetched"
+ * (NOT "clear field"); see B2 in the Phase 3 plan.
+ */
+function mapMergeRequest (raw: RawMergeRequest, includeReviewers: boolean = false): SyncMergeRequest {
+  const mr: SyncMergeRequest = {
     iid: raw.iid,
     projectId: raw.project_id,
     title: raw.title,
@@ -180,13 +256,16 @@ function mapMergeRequest (raw: RawMergeRequest): SyncMergeRequest {
     labels: raw.labels,
     milestone: raw.milestone ?? null,
     assignees: (raw.assignees ?? []).map(mapUser),
-    reviewers: (raw.reviewers ?? []).map(mapUser),
     author: mapUser(raw.author),
     createdAt: new Date(raw.created_at),
     updatedAt: new Date(raw.updated_at),
     webUrl: raw.web_url,
     confidential: raw.confidential
   }
+  if (includeReviewers) {
+    mr.reviewers = (raw.reviewers ?? []).map(mapUser)
+  }
+  return mr
 }
 
 function mapPipeline (raw: RawPipeline): SyncPipeline {
@@ -296,6 +375,108 @@ function mapWebhook (raw: RawWebhook): SyncWebhook {
   }
 }
 
+function mapReviewPosition (raw: RawDiscussionPosition): SyncReviewPosition {
+  return {
+    filePath: raw.new_path ?? raw.old_path ?? '',
+    oldLine: raw.old_line ?? null,
+    newLine: raw.new_line ?? null,
+    baseSha: raw.base_sha,
+    headSha: raw.head_sha,
+    startSha: raw.start_sha,
+    positionType: 'text'
+  }
+}
+
+function mapReviewNote (raw: RawDiscussionNote): SyncReviewNote {
+  const note: SyncReviewNote = {
+    id: raw.id,
+    body: raw.body,
+    author: mapUser(raw.author),
+    createdAt: new Date(raw.created_at),
+    updatedAt: new Date(raw.updated_at),
+    system: raw.system,
+    resolvable: raw.resolvable === true,
+    resolved: raw.resolved === true
+  }
+  if (raw.position != null && (raw.position.position_type === undefined || raw.position.position_type === 'text')) {
+    note.position = mapReviewPosition(raw.position)
+  }
+  return note
+}
+
+/**
+ * Map a GitLab discussion to SyncReviewThread. Returns null when the discussion's
+ * notes carry a non-text position type (e.g. 'image', 'file') — caller drops the row
+ * and increments the discussion.position.unsupported metric.
+ */
+function mapDiscussion (raw: RawDiscussion, projectId: number, mergeRequestIid: number): SyncReviewThread | null {
+  if (raw.notes.length === 0) return null
+  for (const n of raw.notes) {
+    if (n.position?.position_type !== undefined && n.position.position_type !== 'text') {
+      return null
+    }
+  }
+  const rootNote = raw.notes[0]
+  const resolvedBy = rootNote.resolved_by != null ? mapUser(rootNote.resolved_by) : null
+  const resolvedAt = rootNote.resolved_at != null ? new Date(rootNote.resolved_at) : null
+  const notes = raw.notes.map(mapReviewNote)
+  const updatedAtMs = notes.reduce((acc, n) => Math.max(acc, n.updatedAt.getTime()), 0)
+
+  return {
+    discussionId: raw.id,
+    mergeRequestIid,
+    projectId,
+    resolved: rootNote.resolved === true,
+    resolvedBy,
+    resolvedAt,
+    notes,
+    updatedAt: new Date(updatedAtMs)
+  }
+}
+
+function mapApproval (raw: RawApprovalResponse): SyncMRApprovals {
+  return {
+    approvedBy: (raw.approved_by ?? []).map((entry) => mapUser(entry.user)),
+    approvalsRequired: raw.approvals_required ?? 0
+  }
+}
+
+function mapChangedFileStatus (raw: RawChange): SyncChangedFile['status'] {
+  if (raw.new_file === true) return 'added'
+  if (raw.deleted_file === true) return 'deleted'
+  if (raw.renamed_file === true) return 'renamed'
+  return 'modified'
+}
+
+function mapChangedFile (raw: RawChange): SyncChangedFile {
+  const path = raw.new_path ?? raw.old_path ?? ''
+  const file: SyncChangedFile = {
+    path,
+    additions: 0,
+    deletions: 0,
+    status: mapChangedFileStatus(raw)
+  }
+  if (raw.renamed_file === true && raw.old_path !== undefined) {
+    file.oldPath = raw.old_path
+  }
+  return file
+}
+
+function mapChanges (raw: RawChangesResponse, fallbackWebUrl: string): SyncMRChanges {
+  const webUrl = raw.web_url ?? fallbackWebUrl
+  return {
+    diffWebUrl: `${webUrl}/diffs`,
+    changedFiles: (raw.changes ?? []).map(mapChangedFile)
+  }
+}
+
+function deriveApprovalStatus (approvals: SyncMRApprovals): ApprovalStatus {
+  if (approvals.approvalsRequired > 0 && approvals.approvedBy.length >= approvals.approvalsRequired) {
+    return 'approved'
+  }
+  return 'pending'
+}
+
 export class GitLabClient {
   private readonly baseUrl: string
   private readonly token: string
@@ -321,11 +502,29 @@ export class GitLabClient {
     this._capabilities = caps
   }
 
+  /**
+   * Generic JSON request helper for GitLab REST API v4.
+   *
+   * Phase 3 (C6): accepts an optional `tokenOverride` that — when provided —
+   * is used as the `PRIVATE-TOKEN` header instead of the instance token. This
+   * supports per-call actor attribution for approve/unapprove operations where
+   * the caller passes a user-specific OAuth token.
+   *
+   * When omitted, the helper falls back to the binding's stored service-account
+   * token. All existing callers continue to work without changes.
+   */
   async request<T>(
     method: string,
     path: string,
-    opts: RequestOptions = {}
+    opts: RequestOptions = {},
+    tokenOverride?: string
   ): Promise<T> {
+    // B8 / Security M1: when a caller supplies tokenOverride, validate it
+    // before placing it in the PRIVATE-TOKEN HTTP header. Reject empty,
+    // oversized, or CRLF/NUL-bearing values so a bad actor token cannot inject
+    // headers or be silently accepted.
+    validateActorTokenHeader(tokenOverride)
+
     const url = new URL(`${this.baseUrl}${path}`)
     if (opts.query !== undefined) {
       for (const [k, v] of Object.entries(opts.query)) {
@@ -336,7 +535,7 @@ export class GitLabClient {
     }
 
     const headers: Record<string, string> = {
-      'PRIVATE-TOKEN': this.token,
+      'PRIVATE-TOKEN': tokenOverride ?? this.token,
       'Content-Type': 'application/json'
     }
 
@@ -695,7 +894,7 @@ export class GitLabClient {
               throw new GitLabApiError(`GitLab API error ${res.status}: ${text}`, res.status, text)
             }
             const raw = await res.json() as RawMergeRequest[]
-            pageItems = raw.map(mapMergeRequest)
+            pageItems = raw.map((m) => mapMergeRequest(m))
             const nextHeader = res.headers.get('x-next-page')
             pageNext = (nextHeader !== null && nextHeader !== '') ? nextHeader : null
           }
@@ -709,12 +908,288 @@ export class GitLabClient {
     return results
   }
 
+  /**
+   * Fetch a single MR with Phase 3 composite enrichment.
+   *
+   * In Phase 3 this issues THREE HTTP requests instead of one:
+   *   1. GET /merge_requests/:iid       — base MR (mandatory; populates `reviewers`)
+   *   2. GET /merge_requests/:iid/approvals — populates approvedBy/approvalsRequired/approvalStatus
+   *   3. GET /merge_requests/:iid/changes    — populates diffWebUrl/changedFiles
+   *
+   * Calls 2 + 3 run in parallel via Promise.allSettled. If either auxiliary call
+   * rejects (5xx or network error), the corresponding fields are LEFT UNDEFINED
+   * (NOT defaulted to []) and the `mr.composite.partial` metric is incremented.
+   * The base MR fetch is mandatory — a non-2xx there throws normally.
+   *
+   * 404 inside getMRApprovals / getMRChanges is treated as "endpoint missing on
+   * legacy CE projects": those helpers return safe defaults (empty arrays, 0
+   * required, derived diffWebUrl) with the metric incremented; getMergeRequest
+   * still populates the fields with those defaults.
+   *
+   * Cost: 3 HTTP requests per call vs 1 in Phase 2. `listMergeRequests` does NOT
+   * fan out — it returns minimal MRs with Phase 3 fields left undefined to avoid
+   * an N+1 explosion.
+   */
   async getMergeRequest (projectId: number | string, mrIid: number): Promise<SyncMergeRequest> {
     const raw = await this.request<RawMergeRequest>('GET', `/api/v4/projects/${projectId}/merge_requests/${mrIid}`)
     if (raw.confidential) {
       throw new ConfidentialMergeRequestError(mrIid)
     }
-    return mapMergeRequest(raw)
+    const mr = mapMergeRequest(raw, true)
+
+    const [approvalsResult, changesResult] = await Promise.allSettled([
+      this.getMRApprovals(projectId, mrIid),
+      this.getMRChanges(projectId, mrIid, mr.webUrl)
+    ])
+
+    if (approvalsResult.status === 'fulfilled') {
+      mr.approvedBy = approvalsResult.value.approvedBy
+      mr.approvalsRequired = approvalsResult.value.approvalsRequired
+      mr.approvalStatus = deriveApprovalStatus(approvalsResult.value)
+    } else {
+      metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+      this.logger.warn('mr.composite.partial', { projectId, mrIid, source: 'approvals', error: String(approvalsResult.reason) })
+    }
+
+    if (changesResult.status === 'fulfilled') {
+      mr.diffWebUrl = changesResult.value.diffWebUrl
+      mr.changedFiles = changesResult.value.changedFiles
+    } else {
+      metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+      this.logger.warn('mr.composite.partial', { projectId, mrIid, source: 'changes', error: String(changesResult.reason) })
+    }
+
+    return mr
+  }
+
+  /**
+   * GET /api/v4/projects/:id/merge_requests/:mrIid/approvals.
+   *
+   * Q4 + C11: returns `{ approvedBy: [], approvalsRequired: 0 }` and increments
+   * `mr.composite.partial` on 404 (legacy CE projects without approval rules).
+   * 5xx still propagates as GitLabApiError.
+   */
+  async getMRApprovals (projectId: number | string, mrIid: number): Promise<SyncMRApprovals> {
+    try {
+      const raw = await this.request<RawApprovalResponse>(
+        'GET',
+        `/api/v4/projects/${projectId}/merge_requests/${mrIid}/approvals`
+      )
+      return mapApproval(raw)
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+        this.logger.info('mr.composite.partial', { projectId, mrIid, source: 'approvals', reason: '404' })
+        return { approvedBy: [], approvalsRequired: 0 }
+      }
+      throw err
+    }
+  }
+
+  /**
+   * GET /api/v4/projects/:id/merge_requests/:mrIid/changes.
+   *
+   * Q4: on 404 returns `{ changedFiles: [], diffWebUrl: '${webUrl}/diffs' }`
+   * (using `fallbackWebUrl` when provided, else empty base) and increments
+   * `mr.composite.partial`. 5xx propagates.
+   */
+  async getMRChanges (
+    projectId: number | string,
+    mrIid: number,
+    fallbackWebUrl: string = ''
+  ): Promise<SyncMRChanges> {
+    try {
+      const raw = await this.request<RawChangesResponse>(
+        'GET',
+        `/api/v4/projects/${projectId}/merge_requests/${mrIid}/changes`
+      )
+      return mapChanges(raw, fallbackWebUrl)
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+        this.logger.info('mr.composite.partial', { projectId, mrIid, source: 'changes', reason: '404' })
+        return { changedFiles: [], diffWebUrl: `${fallbackWebUrl}/diffs` }
+      }
+      throw err
+    }
+  }
+
+  /**
+   * List MR review threads (discussions).
+   *
+   * Paginated via the X-Next-Page header (same shape as listMergeRequests).
+   * Filters out discussions whose notes carry a non-text position (e.g.
+   * 'image' / 'file' diff positions) and emits a `discussion.position.unsupported`
+   * info log per dropped row.
+   *
+   * Resolvable general-MR review threads (no position) are included.
+   */
+  async listDiscussions (
+    projectId: number | string,
+    mrIid: number,
+    opts: { updatedAfter?: Date } = {}
+  ): Promise<SyncReviewThread[]> {
+    const projectIdNum = typeof projectId === 'number' ? projectId : parseInt(projectId, 10)
+    const results: SyncReviewThread[] = []
+    let nextPage: string | null = '1'
+
+    while (nextPage !== null && nextPage !== '') {
+      const rawUrl = new URL(`${this.baseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions`)
+      rawUrl.searchParams.set('per_page', '100')
+      rawUrl.searchParams.set('page', nextPage)
+      if (opts.updatedAfter !== undefined) {
+        rawUrl.searchParams.set('updated_after', opts.updatedAfter.toISOString())
+      }
+
+      const urlStr = rawUrl.toString()
+      const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token }
+
+      let pageItems: SyncReviewThread[] = []
+      let pageNext: string | null = null
+
+      await withRateLimitRetry(async () => {
+        const res = await fetch(urlStr, { headers })
+        const rlHeaders: RateLimitHeaders = {
+          'retry-after': res.headers.get('retry-after') ?? undefined,
+          'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+          'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+        }
+        return {
+          status: res.status,
+          headers: rlHeaders,
+          body: async () => {
+            if (res.status >= 400) {
+              const text = await res.text()
+              throw new GitLabApiError(`GitLab API error ${res.status}: ${text}`, res.status, text)
+            }
+            const raw = await res.json() as RawDiscussion[]
+            const mapped: SyncReviewThread[] = []
+            for (const d of raw) {
+              const t = mapDiscussion(d, projectIdNum, mrIid)
+              if (t === null) {
+                this.logger.info('discussion.position.unsupported', { projectId, mrIid, discussionId: d.id })
+                continue
+              }
+              mapped.push(t)
+            }
+            pageItems = mapped
+            const nextHeader = res.headers.get('x-next-page')
+            pageNext = (nextHeader !== null && nextHeader !== '') ? nextHeader : null
+          }
+        }
+      })
+
+      results.push(...pageItems)
+      nextPage = pageNext
+    }
+
+    return results
+  }
+
+  /**
+   * POST a new discussion to an MR.
+   *
+   * Phase 3 callers do not yet POST line-anchored discussions from Huly;
+   * the method lands and is exercised by tests. Body shape is `{ body: string }`
+   * (NOT a bare string), mirroring `createMRNote`.
+   */
+  async createDiscussion (
+    projectId: number | string,
+    mrIid: number,
+    body: { body: string, position?: SyncReviewPosition },
+    actorToken?: string
+  ): Promise<SyncReviewThread> {
+    const projectIdNum = typeof projectId === 'number' ? projectId : parseInt(projectId, 10)
+    const raw = await this.request<RawDiscussion>(
+      'POST',
+      `/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions`,
+      { body },
+      actorToken
+    )
+    const mapped = mapDiscussion(raw, projectIdNum, mrIid)
+    if (mapped === null) {
+      throw new GitLabApiError('createDiscussion returned a discussion with unsupported position', 0)
+    }
+    return mapped
+  }
+
+  /**
+   * Resolve or unresolve a discussion.
+   * PUT /api/v4/projects/:id/merge_requests/:mrIid/discussions/:discId?resolved=<bool>
+   */
+  async resolveDiscussion (
+    projectId: number | string,
+    mrIid: number,
+    discussionId: string,
+    resolved: boolean,
+    actorToken?: string
+  ): Promise<void> {
+    await this.request<RawDiscussion>(
+      'PUT',
+      `/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions/${discussionId}`,
+      { query: { resolved } },
+      actorToken
+    )
+  }
+
+  /**
+   * POST /api/v4/projects/:id/merge_requests/:mrIid/approve.
+   *
+   * Q2 attribution (C6): when `actorToken` is provided, the request uses that
+   * token in the PRIVATE-TOKEN header (per-user OAuth attribution). When omitted,
+   * the binding's service-account token is used and a warn log is emitted.
+   *
+   * Throws ApprovalActionError on any non-2xx response.
+   */
+  async approveMR (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ): Promise<void> {
+    // B8 / Security M1: validate the actor token BEFORE the wrapping try/catch
+    // so a bad header value surfaces as GitLabApiError (no fetch attempted),
+    // not as ApprovalActionError. Identical guard lives in `request()`.
+    validateActorTokenHeader(actorToken)
+    if (actorToken === undefined) {
+      this.logger.warn('approval.action.fallback.service_account', { projectId, mrIid, kind: 'approve' })
+    }
+    try {
+      await this.request<unknown>(
+        'POST',
+        `/api/v4/projects/${projectId}/merge_requests/${mrIid}/approve`,
+        {},
+        actorToken
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new ApprovalActionError('approve', String(projectId), mrIid, message)
+    }
+  }
+
+  /**
+   * POST /api/v4/projects/:id/merge_requests/:mrIid/unapprove. Same attribution
+   * and error-wrapping contract as approveMR.
+   */
+  async unapproveMR (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ): Promise<void> {
+    validateActorTokenHeader(actorToken)
+    if (actorToken === undefined) {
+      this.logger.warn('approval.action.fallback.service_account', { projectId, mrIid, kind: 'unapprove' })
+    }
+    try {
+      await this.request<unknown>(
+        'POST',
+        `/api/v4/projects/${projectId}/merge_requests/${mrIid}/unapprove`,
+        {},
+        actorToken
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new ApprovalActionError('unapprove', String(projectId), mrIid, message)
+    }
   }
 
   async createMergeRequest (projectId: number | string, body: {
@@ -845,5 +1320,18 @@ export class GitLabClient {
 
   async getVersion (): Promise<{ version: string, revision: string }> {
     return await this.request<{ version: string, revision: string }>('GET', '/api/v4/version')
+  }
+}
+
+/**
+ * B8 / Security M1 — guard PRIVATE-TOKEN header value before use.
+ * Rejects undefined-vs-string mismatch, empty, oversize (>4096), or
+ * values that contain CR/LF/NUL (header-injection).
+ */
+function validateActorTokenHeader (tokenOverride: string | undefined): void {
+  if (tokenOverride === undefined) return
+  if (typeof tokenOverride !== 'string' || tokenOverride.length === 0 ||
+      tokenOverride.length > 4096 || /[\r\n\0]/.test(tokenOverride)) {
+    throw new GitLabApiError('invalid actor token', 0)
   }
 }
