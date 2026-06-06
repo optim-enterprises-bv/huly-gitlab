@@ -75,7 +75,7 @@ export const MR_MIXIN = 'gitlab-mr' as unknown as Ref<Mixin<MRMixinDoc>>
  * `Hierarchy` class satisfies this; tests pass a small fake.
  */
 export interface MRMixinHierarchy {
-  as<T extends Doc>(doc: Doc, mixinId: Ref<Mixin<T>>): T
+  as: <T extends Doc>(doc: Doc, mixinId: Ref<Mixin<T>>) => T
 }
 
 /**
@@ -105,7 +105,8 @@ export function readMRMixinAttributes (
     try { core = hierarchy.as<MRCoreMixinDoc>(issue, MR_CORE_MIXIN) } catch { /* not present */ }
     try { review = hierarchy.as<MRReviewMixinDoc>(issue, MR_REVIEW_MIXIN_DOC) } catch { /* not present */ }
     if (core !== undefined || review !== undefined) {
-      return { ...(core ?? {}), ...(review ?? {}) } as Partial<MRMixinDoc>
+      const merged: Record<string, unknown> = { ...(core ?? {}), ...(review ?? {}) }
+      return merged as Partial<MRMixinDoc>
     }
     try { legacy = hierarchy.as<MRMixinDoc>(issue, MR_MIXIN) } catch { /* not present */ }
     if (legacy !== undefined) return legacy
@@ -116,7 +117,8 @@ export function readMRMixinAttributes (
   const core = obj[MR_CORE_MIXIN as unknown as string]
   const review = obj[MR_REVIEW_MIXIN_DOC as unknown as string]
   if (core !== undefined || review !== undefined) {
-    return { ...(core ?? {}), ...(review ?? {}) } as Partial<MRMixinDoc>
+    const merged: Record<string, unknown> = { ...(core ?? {}), ...(review ?? {}) }
+    return merged as Partial<MRMixinDoc>
   }
   return (obj[MR_MIXIN as unknown as string] ?? {}) as Partial<MRMixinDoc>
 }
