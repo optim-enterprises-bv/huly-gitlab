@@ -3,14 +3,18 @@ import {
   GitLabGraphQLClient,
   detectGraphQLCapability,
   invalidateGraphQLCapability,
-  getGraphQLCapabilityCacheSize
+  getGraphQLCapabilityCacheSize,
+  CAPABILITY_POSITIVE_TTL_MS,
+  CAPABILITY_NEGATIVE_TTL_MS
 } from '../../src/adapter/gitlab-graphql-client'
+import { get as getMetric, reset as resetMetrics, METRIC_NAMES } from '../../src/metrics'
 
 const BASE_URL = 'http://gitlab.test'
 
 afterEach(() => {
   nock.cleanAll()
   invalidateGraphQLCapability()
+  resetMetrics()
 })
 
 // ---------------------------------------------------------------------------
@@ -43,16 +47,25 @@ test('GitLabGraphQLClient.query: POSTs to /api/graphql with bearer header', asyn
 })
 
 // ---------------------------------------------------------------------------
-// 3. detectGraphQLCapability: success → graphqlAvailable=true
+// 3. detectGraphQLCapability: success → graphqlAvailable=true, 1h TTL
 // ---------------------------------------------------------------------------
-test('detectGraphQLCapability: probe succeeds → graphqlAvailable=true', async () => {
+test('detectGraphQLCapability: probe succeeds → graphqlAvailable=true with 1h TTL', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
   nock(BASE_URL)
     .post('/api/graphql')
     .reply(200, { data: { currentUser: { id: 'gid://gitlab/User/1' } } })
 
-  const caps = await detectGraphQLCapability(BASE_URL, 'test-token')
+  const caps = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
   expect(caps.graphqlAvailable).toBe(true)
   expect(caps.schemaVersion).toBeNull()
+
+  // Still cached at TTL boundary minus 1ms
+  nowMs += CAPABILITY_POSITIVE_TTL_MS - 1
+  const second = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(second.graphqlAvailable).toBe(true)
+  expect(nock.pendingMocks()).toHaveLength(0)
 })
 
 // ---------------------------------------------------------------------------
@@ -133,4 +146,171 @@ test('invalidateGraphQLCapability(): undefined baseUrl clears all entries', asyn
 
   invalidateGraphQLCapability()
   expect(getGraphQLCapabilityCacheSize()).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// 8. 502 → short (5min) TTL; re-probes after TTL expires
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: 502 → 5min negative TTL; re-probes after TTL', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(502, 'Bad Gateway')
+
+  const first = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(first.graphqlAvailable).toBe(false)
+  expect(getGraphQLCapabilityCacheSize()).toBe(1)
+
+  // Within 5min TTL → cache hit, no re-probe
+  nowMs += CAPABILITY_NEGATIVE_TTL_MS - 1
+  const second = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(second.graphqlAvailable).toBe(false)
+  expect(nock.pendingMocks()).toHaveLength(0)
+
+  // After 5min TTL → re-probes
+  nowMs += 2
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(200, { data: { currentUser: { id: 'gid://gitlab/User/1' } } })
+
+  const third = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(third.graphqlAvailable).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// 9. 401 → no cache entry; second probe re-probes immediately
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: 401 → no cache entry; second call re-probes', async () => {
+  let probeCount = 0
+
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .twice()
+    .reply(() => {
+      probeCount++
+      return [401, { errors: [{ message: 'Unauthorized' }] }]
+    })
+
+  const first = await detectGraphQLCapability(BASE_URL, 'bad-token')
+  expect(first.graphqlAvailable).toBe(false)
+  expect(getGraphQLCapabilityCacheSize()).toBe(0)
+
+  const second = await detectGraphQLCapability(BASE_URL, 'bad-token')
+  expect(second.graphqlAvailable).toBe(false)
+  expect(probeCount).toBe(2)
+})
+
+// ---------------------------------------------------------------------------
+// 10. 403 → no cache entry; second probe re-probes immediately
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: 403 → no cache entry; second call re-probes', async () => {
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .twice()
+    .reply(403, { errors: [{ message: 'Forbidden' }] })
+
+  await detectGraphQLCapability(BASE_URL, 'limited-token')
+  expect(getGraphQLCapabilityCacheSize()).toBe(0)
+
+  await detectGraphQLCapability(BASE_URL, 'limited-token')
+  expect(getGraphQLCapabilityCacheSize()).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// 11. 404 → 1h negative TTL
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: 404 → 1h negative TTL', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(404, { errors: [{ message: 'Not Found' }] })
+
+  const first = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(first.graphqlAvailable).toBe(false)
+  expect(getGraphQLCapabilityCacheSize()).toBe(1)
+
+  // After 5min — still cached (1h TTL for 4xx)
+  nowMs += CAPABILITY_NEGATIVE_TTL_MS + 1
+  const second = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(second.graphqlAvailable).toBe(false)
+  expect(nock.pendingMocks()).toHaveLength(0)
+
+  // After 1h — cache expired, re-probes
+  nowMs = 1_000_000 + CAPABILITY_POSITIVE_TTL_MS + 1
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(200, { data: { currentUser: { id: 'gid://gitlab/User/1' } } })
+
+  const third = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(third.graphqlAvailable).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// 12. 200 with malformed body → 1h negative TTL
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: 200 with malformed body → 1h negative TTL', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
+  // graphql-request throws on responses with `errors` field even on 200
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(200, { errors: [{ message: 'something went wrong' }] })
+
+  const first = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(first.graphqlAvailable).toBe(false)
+  expect(getGraphQLCapabilityCacheSize()).toBe(1)
+
+  // After 5min — still cached (1h TTL since no status code → treated as permanent)
+  nowMs += CAPABILITY_NEGATIVE_TTL_MS + 1
+  const second = await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(second.graphqlAvailable).toBe(false)
+  expect(nock.pendingMocks()).toHaveLength(0)
+})
+
+// ---------------------------------------------------------------------------
+// 13. Negative cache hit increments GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT metric
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: negative cache hit increments metric', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(502, 'Bad Gateway')
+
+  await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(getMetric(METRIC_NAMES.GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT)).toBe(0)
+
+  // Second call hits negative cache
+  nowMs += 1_000
+  await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(getMetric(METRIC_NAMES.GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT)).toBe(1)
+
+  // Third call also hits negative cache
+  nowMs += 1_000
+  await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  expect(getMetric(METRIC_NAMES.GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT)).toBe(2)
+})
+
+// ---------------------------------------------------------------------------
+// 14. Positive cache hit does NOT increment negative metric
+// ---------------------------------------------------------------------------
+test('detectGraphQLCapability: positive cache hit does not increment negative metric', async () => {
+  let nowMs = 1_000_000
+  const nowFn = (): number => nowMs
+
+  nock(BASE_URL)
+    .post('/api/graphql')
+    .reply(200, { data: { currentUser: { id: 'gid://gitlab/User/1' } } })
+
+  await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+  nowMs += 10_000
+  await detectGraphQLCapability(BASE_URL, 'test-token', nowFn)
+
+  expect(getMetric(METRIC_NAMES.GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT)).toBe(0)
 })
