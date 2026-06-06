@@ -121,6 +121,22 @@ Post-deployment, monitor:
 
 ---
 
+## Follow-up: Path F + G Service-Account PersonId Resolution
+
+**Added post-Phase-5 (branch `feat/service-account-resolution-fg`).**
+
+Phase 5 shipped Path D (sentinel cast of `systemAccountUuid`) as the sole resolution strategy, with `SERVICE_ACCOUNT_RESOLVED=0` gauge and documented degradation. Two additional paths have now been implemented:
+
+- **Path F (operator-provided):** Set `SERVICE_ACCOUNT_PERSON_ID` env var to a valid UUID. Resolution uses this value directly, sets `SERVICE_ACCOUNT_RESOLVED=1`. No boot overhead.
+- **Path G (boot-time probe):** If Path F is absent, the pod attempts a boot-time probe: writes a sentinel doc, reads back `tx.modifiedBy`, deletes the sentinel. On success, `SERVICE_ACCOUNT_RESOLVED=1`. Probe is bounded to 10 s; on timeout or any error, falls back to Path D without blocking pod startup.
+- **Path D** remains the tertiary fallback when both F and G are unavailable/unsuccessful. `SERVICE_ACCOUNT_RESOLVED=0` is preserved for operator alerting.
+
+The resolution chain lives in `src/sync/service-account-resolution.ts` and is invoked from `src/index.ts` at boot, before TxSubscribers are started. The resolved PersonId is passed to all TxSubscriber instances as `serviceAccountPersonId`.
+
+Operators using GitLab CE or managed Huly instances where the service-account PersonId is known should set `SERVICE_ACCOUNT_PERSON_ID` (Path F) for zero-overhead guaranteed resolution. Operators who prefer automatic discovery without configuration can rely on Path G.
+
+---
+
 ## References
 
 - [Phase 5 Specification](../README.md#phase-5-true-final-closes-all-known-limitations)

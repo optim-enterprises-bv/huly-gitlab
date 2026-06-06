@@ -29,9 +29,16 @@ interface Config {
    * Unset → Express default (false). Set via `TRUST_PROXY` env.
    */
   TrustProxy?: string
+  /**
+   * Path F: operator-provided service-account PersonId.
+   * When set, used directly as the TxSubscriber echo-filter identity and
+   * sets SERVICE_ACCOUNT_RESOLVED=1. Must be a UUID string (Ref<Person> format).
+   * Optional — if absent, Path G (boot-time probe) or Path D (sentinel) applies.
+   */
+  ServiceAccountPersonId?: string
 }
 
-const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri' | 'TrustProxy' | 'ServerSecretPrevious'>, string> = {
+const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri' | 'TrustProxy' | 'ServerSecretPrevious' | 'ServiceAccountPersonId'>, string> = {
   Port: 'PORT',
   PublicBaseUrl: 'PUBLIC_BASE_URL',
   AccountsURL: 'ACCOUNTS_URL',
@@ -108,6 +115,17 @@ export function loadConfig (): Config {
 
   const serverSecretPrevious = process.env.SERVER_SECRET_PREVIOUS
 
+  const serviceAccountPersonIdRaw = process.env.SERVICE_ACCOUNT_PERSON_ID
+  let serviceAccountPersonId: string | undefined
+  if (serviceAccountPersonIdRaw !== undefined && serviceAccountPersonIdRaw !== '') {
+    // Validate UUID format (8-4-4-4-12 hex groups)
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    if (!UUID_RE.test(serviceAccountPersonIdRaw)) {
+      throw new Error('SERVICE_ACCOUNT_PERSON_ID must be a valid UUID (e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)')
+    }
+    serviceAccountPersonId = serviceAccountPersonIdRaw
+  }
+
   return {
     Port: port,
     PublicBaseUrl: publicBaseUrl,
@@ -129,7 +147,8 @@ export function loadConfig (): Config {
     BrandingPath: brandingPath,
     OAuthRedirectUri: `${publicBaseUrl}/oauth/callback`,
     CorsAllowedOrigins: corsAllowedOrigins,
-    TrustProxy: trustProxy
+    TrustProxy: trustProxy,
+    ServiceAccountPersonId: serviceAccountPersonId
   }
 }
 

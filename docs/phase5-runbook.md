@@ -599,3 +599,80 @@ High rate of negative cache hits short-circuiting GraphQL attempts.
 2. Check whether the GitLab instance was recently upgraded or temporarily unreachable.
 3. Restart the pod to flush the cache if the underlying condition has been resolved.
 4. If the GitLab instance genuinely does not support the operation, the REST fallback is correct and the alert threshold should be raised or the metric suppressed for that instance.
+
+---
+
+## Service-Account PersonId Resolution
+
+The TxSubscriber echo-storm filter (Layer 1) requires the pod's service-account `PersonId` — the value that the Huly transactor stamps on `tx.modifiedBy` for writes made by this pod. Three resolution paths are supported:
+
+### Path F — operator-provided (recommended)
+
+Set the `SERVICE_ACCOUNT_PERSON_ID` environment variable to the UUID of the service account.
+
+```bash
+# .env or pod environment
+SERVICE_ACCOUNT_PERSON_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+**How to obtain the value:**
+
+1. Enable `LOG_LEVEL=debug` temporarily on the pod.
+2. Watch for log lines like `TxSubscriber: onTx` or inspect `modifiedBy` in platform transaction logs.
+3. Alternatively, query the Huly account service for the system-account record.
+4. Set `SERVICE_ACCOUNT_PERSON_ID` to the UUID found in step 2 or 3.
+
+When Path F is active, the pod logs:
+```
+service-account-resolution: Path F engaged (operator-provided)
+main: service-account PersonId resolved { path: 'F', resolved: true }
+```
+
+The `SERVICE_ACCOUNT_RESOLVED` gauge is set to `1`.
+
+### Path G — boot-time probe (automatic)
+
+If `SERVICE_ACCOUNT_PERSON_ID` is not set, the pod attempts a boot-time probe on each workspace client:
+
+1. Writes a transient sentinel doc to the platform.
+2. Reads it back and captures `tx.modifiedBy`.
+3. Deletes the sentinel.
+4. Uses the captured PersonId as the echo-filter identity.
+
+The probe is bounded to **10 seconds**. On timeout or write error, Path D fallback applies.
+
+When Path G succeeds, the pod logs:
+```
+service-account-resolution: Path G probe succeeded { personId: "..." }
+service-account-resolution: Path G engaged (boot-time probe)
+main: service-account PersonId resolved { path: 'G', resolved: true }
+```
+
+The `SERVICE_ACCOUNT_RESOLVED` gauge is set to `1`.
+
+**Note:** Path G probe is run at per-workspace client init time. For pods managing many workspaces, probes are run in sequence during each workspace's first `onWorkspaceLoaded` callback.
+
+### Path D — sentinel fallback (degraded)
+
+If neither Path F nor Path G succeeds, the pod uses `systemAccountUuid` cast to `PersonId` as the echo-filter identity.
+
+When Path D is active, the pod logs:
+```
+service-account-resolution: Path D fallback (systemAccountUuid sentinel)
+main: service-account PersonId resolved { path: 'D', resolved: false }
+```
+
+The `SERVICE_ACCOUNT_RESOLVED` gauge is set to `0`.
+
+**Operator action:** Alert on `SERVICE_ACCOUNT_RESOLVED=0`. Configure `SERVICE_ACCOUNT_PERSON_ID` (Path F) or ensure Path G probe can write to the platform workspace. If the platform stamps the same `systemAccountUuid` on writes, Path D may be functionally correct but cannot be confirmed without Path F or G.
+
+### Health check
+
+```bash
+# Confirm resolution path in pod startup logs
+grep "service-account PersonId resolved" <pod-logs>
+
+# Monitor echo-filter metric — should be non-zero during applyRemote activity
+# A sustained zero indicates the filter identity may not match platform writes
+grep "SERVICE_ACCOUNT_RESOLVED" <pod-metrics>
+```
