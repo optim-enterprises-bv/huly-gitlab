@@ -1,5 +1,6 @@
 import { GraphQLClient } from 'graphql-request'
 import { validateGitLabBaseUrl } from '../util/url-validation'
+import { increment, METRIC_NAMES } from '../metrics'
 
 /**
  * Phase 5 P5-T-21 — GraphQL adapter for GitLab.
@@ -7,18 +8,21 @@ import { validateGitLabBaseUrl } from '../util/url-validation'
  * Thin wrapper over `graphql-request` that:
  *   - Validates the GitLab base URL via the shared SSRF allowlist.
  *   - Sends queries to `/api/graphql` with bearer auth.
- *   - Exposes a per-baseUrl 1-hour capability cache (`detectGraphQLCapability`)
+ *   - Exposes a per-baseUrl capability cache (`detectGraphQLCapability`)
  *     so callers can gate composite paths on GraphQL availability without
  *     re-probing on every call.
+ *   - Differentiates transient (5xx/network) vs permanent (4xx) errors with
+ *     different TTLs: positive=1h, permanent-negative=1h, transient-negative=5min.
  *   - Supports manual bust (`invalidateGraphQLCapability(baseUrl?)`) per critic
  *     bug B5: stale capability data must not route operators to a dead endpoint
  *     after a bind-time config change.
  */
 
 interface CapabilityCacheEntry {
-  graphqlSupported: boolean
+  available: boolean
   schemaVersion: string | null
-  detectedAt: number
+  cachedAt: number
+  ttlMs: number
 }
 
 export interface GraphQLCapabilities {
@@ -30,6 +34,9 @@ export interface GitLabGraphQLClientOptions {
   baseUrl: string
   token: string
 }
+
+export const CAPABILITY_POSITIVE_TTL_MS = 60 * 60 * 1000
+export const CAPABILITY_NEGATIVE_TTL_MS = 5 * 60 * 1000
 
 export class GitLabGraphQLClient {
   private readonly client: GraphQLClient
@@ -48,21 +55,57 @@ export class GitLabGraphQLClient {
   }
 }
 
-// Per-baseUrl capability cache (1-hour TTL). The cache key is the normalized
-// baseUrl; tokens are NOT part of the key because capability is an instance
-// property (CE vs EE, GraphQL on/off), not a token property.
+// Per-baseUrl capability cache. The cache key is the normalized baseUrl;
+// tokens are NOT part of the key because capability is an instance property
+// (CE vs EE, GraphQL on/off), not a token property.
 const capabilityCache = new Map<string, CapabilityCacheEntry>()
-const CAPABILITY_TTL_MS = 60 * 60 * 1000
 
 function normalizeBaseUrl (baseUrl: string): string {
   return baseUrl.replace(/\/$/, '')
 }
 
+function extractStatusCode (err: unknown): number | null {
+  if (err != null && typeof err === 'object') {
+    const e = err as Record<string, unknown>
+    if (typeof e.status === 'number') return e.status
+    if (typeof e.response === 'object' && e.response != null) {
+      const r = e.response as Record<string, unknown>
+      if (typeof r.status === 'number') return r.status
+    }
+  }
+  return null
+}
+
+function isTransientError (err: unknown): boolean {
+  const status = extractStatusCode(err)
+  if (status !== null) {
+    return status >= 500
+  }
+  // Network-level errors (ECONNREFUSED, ETIMEDOUT, etc.)
+  if (err != null && typeof err === 'object') {
+    const e = err as Record<string, unknown>
+    const code = typeof e.code === 'string' ? e.code : ''
+    if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || code === 'ENOTFOUND') return true
+    const msg = typeof e.message === 'string' ? e.message : ''
+    if (msg.includes('ECONNREFUSED') || msg.includes('ETIMEDOUT') || msg.includes('ENOTFOUND')) return true
+  }
+  return false
+}
+
+function isAuthError (err: unknown): boolean {
+  const status = extractStatusCode(err)
+  return status === 401 || status === 403
+}
+
 /**
  * Probe the GitLab instance to determine if GraphQL is available.
- * Result is cached per-baseUrl for 1 hour. On any error (network, 4xx, 5xx)
- * returns `{ graphqlAvailable: false }` and caches the negative result so a
- * dead endpoint is not re-probed every call.
+ *
+ * Error classification:
+ *   - 401/403: auth/token issue — do NOT cache (operator will see auth metric).
+ *   - 4xx (other): permanent negative — 1h TTL.
+ *   - 5xx / network errors: transient — 5min TTL.
+ *   - Parse failure on 200: permanent negative — 1h TTL.
+ *   - Success: positive — 1h TTL.
  */
 export async function detectGraphQLCapability (
   baseUrl: string,
@@ -71,17 +114,35 @@ export async function detectGraphQLCapability (
 ): Promise<GraphQLCapabilities> {
   const key = normalizeBaseUrl(baseUrl)
   const cached = capabilityCache.get(key)
-  if (cached !== undefined && nowFn() - cached.detectedAt < CAPABILITY_TTL_MS) {
-    return { graphqlAvailable: cached.graphqlSupported, schemaVersion: cached.schemaVersion }
+  if (cached !== undefined && nowFn() - cached.cachedAt < cached.ttlMs) {
+    if (!cached.available) {
+      increment(METRIC_NAMES.GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT)
+    }
+    return { graphqlAvailable: cached.available, schemaVersion: cached.schemaVersion }
   }
   try {
     const client = new GitLabGraphQLClient({ baseUrl, token })
     await client.query('{ currentUser { id } }')
-    const entry: CapabilityCacheEntry = { graphqlSupported: true, schemaVersion: null, detectedAt: nowFn() }
+    const entry: CapabilityCacheEntry = {
+      available: true,
+      schemaVersion: null,
+      cachedAt: nowFn(),
+      ttlMs: CAPABILITY_POSITIVE_TTL_MS
+    }
     capabilityCache.set(key, entry)
     return { graphqlAvailable: true, schemaVersion: null }
-  } catch {
-    const entry: CapabilityCacheEntry = { graphqlSupported: false, schemaVersion: null, detectedAt: nowFn() }
+  } catch (err) {
+    if (isAuthError(err)) {
+      // Do not cache — auth issues should be retried immediately after token fix.
+      return { graphqlAvailable: false, schemaVersion: null }
+    }
+    const ttlMs = isTransientError(err) ? CAPABILITY_NEGATIVE_TTL_MS : CAPABILITY_POSITIVE_TTL_MS
+    const entry: CapabilityCacheEntry = {
+      available: false,
+      schemaVersion: null,
+      cachedAt: nowFn(),
+      ttlMs
+    }
     capabilityCache.set(key, entry)
     return { graphqlAvailable: false, schemaVersion: null }
   }
