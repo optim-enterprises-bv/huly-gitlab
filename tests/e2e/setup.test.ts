@@ -33,6 +33,10 @@ import {
   linkUserOAuth,
   getUserOAuthStatus,
   deleteUserOAuthCredential,
+  triggerHulyTxWrite,
+  runMixinSplitMigration,
+  forceGraphQLFailure,
+  rotateServerSecret,
   HARNESS_CHAT_MESSAGE_CLASS,
   HARNESS_ISSUE_CLASS,
   type HarnessDeps,
@@ -665,6 +669,86 @@ describe('harness primitives', () => {
     expect(call.init?.method).toBe('DELETE')
     const headers = call.init?.headers as Record<string, string>
     expect(headers.Authorization).toBe('Bearer tok-x')
+  })
+
+  test('triggerHulyTxWrite calls updateMixin on the transactor with the given field/value', async () => {
+    const calls: Array<{ method: string, targetRef: string, mixin: string, attrs: Record<string, unknown> }> = []
+    const mockTransactor: MinimalTransactor = {
+      createMixin: async (targetRef, _cls, _space, mixin, attrs) => {
+        calls.push({ method: 'createMixin', targetRef, mixin, attrs })
+      },
+      updateMixin: async (targetRef, _cls, _space, mixin, attrs) => {
+        calls.push({ method: 'updateMixin', targetRef, mixin, attrs })
+      }
+    }
+    await triggerHulyTxWrite(mockTransactor, 'issue-ref-1', 'status', 'in-review')
+    expect(calls).toHaveLength(1)
+    expect(calls[0].method).toBe('updateMixin')
+    expect(calls[0].targetRef).toBe('issue-ref-1')
+    expect(calls[0].mixin).toBe('gitlab-mr')
+    expect(calls[0].attrs).toEqual({ status: 'in-review' })
+  })
+
+  test('runMixinSplitMigration POSTs to /migrate-mixin-split with bearer auth and parses JSON body', async () => {
+    const http = makeFetchMock()
+    http.on('/migrate-mixin-split', {
+      status: 200,
+      body: { docsScanned: 5, docsMigrated: 3, bindingsProcessed: 1 }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await runMixinSplitMigration(deps, {
+      podBaseUrl: 'http://pod.test:3600',
+      bindingId: 'b-split-1',
+      bearer: 'admin-token'
+    })
+    expect(result.status).toBe(200)
+    expect(result.body).toEqual({ docsScanned: 5, docsMigrated: 3, bindingsProcessed: 1 })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/api/v1/bindings/b-split-1/migrate-mixin-split')
+    expect(call.init?.method).toBe('POST')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer admin-token')
+  })
+
+  test('forceGraphQLFailure POSTs to /features/graphql_toggle with PRIVATE-TOKEN', async () => {
+    const http = makeFetchMock()
+    http.on('/graphql_toggle', { status: 200, body: { name: 'graphql_toggle', state: 'off' } })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await forceGraphQLFailure(deps, {
+      gitlabBaseUrl: 'http://gitlab.test:8929',
+      rootToken: 'root-tok'
+    })
+    expect(result.status).toBe(200)
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/features/graphql_toggle')
+    expect(call.init?.method).toBe('POST')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers['PRIVATE-TOKEN']).toBe('root-tok')
+    const body = JSON.parse(call.init?.body as string)
+    expect(body).toEqual({ value: false })
+  })
+
+  test('rotateServerSecret POSTs to /api/v1/admin/rotate-secret with bearer auth and newPrimary', async () => {
+    const http = makeFetchMock()
+    http.on('/rotate-secret', {
+      status: 200,
+      body: { rotated: true, previousKeyRetained: true }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await rotateServerSecret(deps, {
+      podUrl: 'http://pod.test:3600',
+      bearer: 'admin-secret',
+      newPrimary: 'new-key-xyz'
+    })
+    expect(result.status).toBe(200)
+    expect(result.body).toEqual({ rotated: true, previousKeyRetained: true })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/api/v1/admin/rotate-secret')
+    expect(call.init?.method).toBe('POST')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer admin-secret')
+    const body = JSON.parse(call.init?.body as string)
+    expect(body).toEqual({ newPrimary: 'new-key-xyz' })
   })
 
   test('isRealStackEnabled and isSoakEnabled honor env vars', () => {

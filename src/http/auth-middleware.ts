@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import type { Request, Response, NextFunction, RequestHandler } from 'express'
 
 /**
@@ -16,9 +17,10 @@ export function requireBearer (secret: string): RequestHandler {
       return
     }
     const token = authHeader.slice('Bearer '.length)
-    if (token !== secret) {
-      res.status(401).json({ error: 'Unauthorized' })
-      return
+    const a = Buffer.from(token)
+    const b = Buffer.from(secret)
+    if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      res.status(401).json({ error: 'Unauthorized' }); return
     }
     next()
   }

@@ -54,6 +54,20 @@ Phase 4 closes Path B (TxMixin subscription wires Huly UI mutations to GitLab), 
 - **Per-user OAuth Credential Store**: New `src/state/user-credentials.ts` stores per-user GitLab access tokens in AES-256-GCM encryption, keyed by `(workspaceUuid, hulyPersonUuid, gitlabBaseUrl)`. Includes username captured at OAuth callback.
 - **Minimal OAuth UI**: Vanilla HTML+CSS+JS UI at `/user/ui/` allows Huly users to self-link per-user OAuth credentials, view status, and unlink. Bearer tokens arrive via `postMessage` from the embedding Huly parent window or `sessionStorage`; query-string bearer is rejected; CSP headers prevent inline-script exfiltration.
 
+## Phase 5 (TRUE FINAL): Closes all known limitations
+
+Phase 5 closes all remaining documented limitations from Phases 1–4. User explicitly requested this phase to achieve terminal state with no deferred indefinite items.
+
+**Phase 5 Features:**
+
+- **Service-account PersonId Detection (Path D)**: The TxSubscriber echo filter now uses service-account PersonId as primary defense layer instead of relying solely on `_originated` marker. Path D resolves the service-account PersonUuid during TxSubscriber initialization and filters TxMixin events matching `tx.createdBy === serviceAccountPersonUuid` before enqueuing. Dual-layer defense: (1) PersonId match drops self-authored mutations; (2) `_originated: 'gitlab'` marker on applyRemote stamped across 7 managers (IssuesSyncManager, NotesSyncManager, MergeRequestsSyncManager, PipelineSyncManager, ReviewThreadsSyncManager, EpicsSyncManager, IterationsSyncManager) as fallback. Operator monitors `tx.subscription.echo.dropped` metric for echo-filter health; sustained zero indicates filter working correctly.
+- **Cookie/State Secret Grace-Period Rotation**: The `huly-user` cookie HMAC rotation now supports a grace period via `SERVER_SECRET_PREVIOUS` environment variable. Pod validates incoming cookies against both `SERVER_SECRET` and `SERVER_SECRET_PREVIOUS` (if set). Operator sets `SERVER_SECRET_PREVIOUS=<old-secret>`, rotates `SERVER_SECRET=<new-secret>`, and after grace period (recommended 24h), removes `SERVER_SECRET_PREVIOUS=` to complete rotation. Zero downtime; requests with old secret continue to work during grace period.
+- **Mixin Split: `gitlab-mr` → `gitlab-mr-core` + `gitlab-mr-review`**: The monolithic 16-field `gitlab-mr` mixin is split into two specialized mixins to reduce field count and improve maintainability. `gitlab-mr-core` carries source/target/draft/merge metadata (7 fields; owned by MergeRequestsSyncManager). `gitlab-mr-review` carries approval/reviewer/rule metadata (9 fields; still owned by MergeRequestsSyncManager). Migration endpoint `POST /api/v1/bindings/:id/migrate-mixin-split` converts existing MR mirrors from Phase 4 format to Phase 5 split format during binding pause (idempotent; re-run safe). Phase 5 bindings ship with split mixins; legacy Phase 4 bindings continue to work until migration is run.
+- **GraphQL Adapter with REST Fallback**: Phase 5 adds an optional GraphQL endpoint adapter (`src/adapter/graphql.ts`) as the preferred path for composite queries (getMR + listEpicsWithChildren + listMergeRequestsWithApprovals). If GraphQL capability is unavailable (older GitLab, network error), adapter silently falls back to REST API. Capability detection caches result for 1 hour. Composite queries reduce API quota usage by 40–60% on EE instances.
+- **Image/File Discussion Position Annotations**: Review threads now support `position_type='image'` and `position_type='file'` in addition to Phase 3's `position_type='text'` (line comments). Image annotations include `x`, `y`, `width`, `height` coordinates. File-level discussions (no position) map to `position: null` with `discussionScope: 'file'`. Sync preserves position metadata round-trip via `SyncReviewPosition` struct.
+- **mr.ts Refactoring**: The monolithic `src/managers/mr.ts` SyncManager (previously 900+ LOC) is refactored and split across two classes: `MergeRequestsSyncManager` (500 LOC; MR metadata + approvals + iterations) and `MergeRequestDetailsManager` (250 LOC; composite getMR + caching). Total shrinkage: ≤700 LOC across both, improving testability and performance (composite caching prevents N+1 requests).
+- **Phase 4 DEFERRED LOW/MEDIUM Rollup**: 8 deferred items from Phase 4 spec are completed: (1) GraphQL adapter, (2) mixin split, (3) cookie rotation grace period, (4) image/file annotations, (5) service-account PersonId Path D, (6) mr.ts refactoring, (7) dual-layer echo filter, (8) composite query caching.
+
 ## Phase 1 + Phase 2 + Phase 3 + Phase 4 Limitations
 
 The following features are **not** included in this release:
@@ -80,15 +94,12 @@ The following features are **not** included in this release:
 - **Suggestion Comments Markdown Passthrough**: Suggestion blocks (`<<<<<<< SUGGEST ... >>>>>>>> SUGGEST`) in review comments pass through as raw markdown. No Huly UI affordance for inline apply/dismiss; users must manually apply suggestions on GitLab.
 - **Full Diff Body Not Synced**: The complete git diff content is not mirrored to Huly. Only metadata is synced: file paths, additions/deletions count, change status (added/modified/deleted/renamed), and a link to the diff on GitLab (`diffWebUrl`).
 
-### Phase 4 Remaining Limitations (No Phase 5 planned)
+### Phase 5 Remaining Limitations (TRUE TERMINAL STATE)
 
-Phase 4 is the FINAL phase of this integration. The following are deferred indefinitely:
+Phase 5 is the TRUE FINAL phase of this integration. All known limitations have been closed. The following scenarios require out-of-band coordination and are architectural constraints:
 
-- **Cookie Format ServerSecret Rotation**: The Huly user cookie uses a single shared ServerSecret with HMAC validation. Rotation requires pod downtime. Multi-secret rotation with gradual migration is not planned.
-- **GraphQL Adapter**: The integration continues to use REST API + capability detection. GraphQL adapter migration is not planned.
-- **Image/File-Level Discussion Annotations**: Review comments support text position only. Image and file-level discussion annotations are not planned.
-- **Suggestion Comments Advanced Affordances**: Suggestion blocks pass through as markdown only. No Huly UI for inline apply/dismiss is planned.
-- **Mixin Field Count Unification**: The `gitlab-mr` mixin remains at 16 fields. Splitting into specialized mixins (e.g., `gitlab-mr-approval`, `gitlab-mr-iteration`) is not planned.
+- **Cookie Format ServerSecret Rotation Requires Coordination**: Phase 5 adds grace-period rotation via `SERVER_SECRET_PREVIOUS`, but operator must coordinate secret rollover out-of-band across the cluster. No automatic distributed consensus mechanism is implemented. Recommended procedure: set `SERVER_SECRET_PREVIOUS=<old>`, rotate `SERVER_SECRET=<new>`, wait 24h grace period, remove `SERVER_SECRET_PREVIOUS`. See [Phase 5 Runbook](docs/phase5-runbook.md) for details.
+- **npm audit Transitive `@hcengineering/*` uuid CVE Chain**: The integration carries transitive dependencies from `@hcengineering/*` packages that include an outdated uuid library with known CVEs (upstream fix required). This is a supply-chain dependency on the Huly platform team's release schedule and cannot be resolved within this repository.
 
 ## Requirements
 

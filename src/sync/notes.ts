@@ -12,6 +12,7 @@ import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import { resolveIssueRef, type BindingResolverInput } from './issues'
 import { markAndRetry, NOTE_RETRY_FLAG, REVIEW_RETRY_FLAG } from './deferred-parent'
+import { withOriginatedMarker } from './originated-marker'
 
 /**
  * Internal envelope carrying the note data plus its parent noteable iid.
@@ -524,7 +525,7 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
       const msgRef = await bctx.hulyClient.createDoc<ChatMessage>(
         chunter.class.ChatMessage,
         bctx.hulyProjectRef,
-        {
+        withOriginatedMarker({
           attachedTo: issueRef,
           attachedToClass: tracker.class.Issue,
           collection: 'comments',
@@ -533,7 +534,7 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
           modifiedOn: new Date(note.updatedAt).getTime(),
           createdBy: authorRef as ChatMessage['createdBy'],
           createdOn: new Date(note.createdAt).getTime()
-        }
+        })
       )
       await upsertIdMap(
         ctx.store.idmap(),
@@ -557,11 +558,11 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
         chunter.class.ChatMessage,
         bctx.hulyProjectRef,
         existing.hulyRef as Ref<ChatMessage>,
-        {
+        withOriginatedMarker({
           message: messageMarkup,
           modifiedOn: remoteTs.getTime(),
           modifiedBy: authorRef as ChatMessage['modifiedBy']
-        }
+        })
       )
       await setCursor(ctx.store.cursors(), binding, 'notes', remoteTs)
     }

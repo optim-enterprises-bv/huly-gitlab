@@ -8,6 +8,8 @@ import type { Store } from '../../src/state/store'
 import type { Logger } from '../../src/logging'
 import type { UserIdentity } from '../../src/huly/users'
 import { migrateReviewerLabels } from '../../src/sync/reviewer-migration'
+import { MR_MIXIN } from '../../src/sync/mr-mixin'
+import { ORIGINATED_MARKER_KEY, ORIGINATED_MARKER_VALUE } from '../../src/sync/originated-marker'
 
 // ---------------------------------------------------------------------------
 // Minimal fakes
@@ -86,13 +88,17 @@ function makeHulyClient (
     findOne: async (cls: unknown, q: Partial<Issue>): Promise<Issue | undefined> => {
       const clsStr = String(cls)
       if (q._id === undefined) return undefined
-      // mixin lookup
-      if (!clsStr.includes('tracker') && !clsStr.includes('Issue')) {
+      const issue = issues.get(q._id)
+      if (issue === undefined) return undefined
+      // Embed mixin data under the MR_MIXIN key so readMRMixinAttributes can find it.
+      // This mirrors how real Huly embeds mixin fields on the doc object.
+      if (clsStr.includes('tracker') || clsStr.includes('Issue')) {
         const mixin = mixinDocs.get(String(q._id))
-        if (mixin === undefined) return undefined
-        return { ...mixin, _id: q._id } as unknown as Issue
+        if (mixin !== undefined) {
+          return { ...issue, [MR_MIXIN as unknown as string]: mixin } as unknown as Issue
+        }
       }
-      return issues.get(q._id)
+      return issue
     },
 
     findAll: async (cls: unknown, q: Record<string, unknown>): Promise<TagElement[]> => {
@@ -402,6 +408,41 @@ describe('migrateReviewerLabels', () => {
     // issue43 labels untouched
     const issue43After = issues.get(issueRef43 as unknown as Ref<Issue>)
     expect(issue43After?.labels).toEqual([tagCarolRef])
+  })
+
+  // Case originated-marker: updateDoc and updateMixin calls carry _originated marker
+  it('originated marker is present in updateDoc and updateMixin payloads', async () => {
+    const binding = makeBinding(42)
+    const issueRef = 'huly-mr-marker'
+    const tagRef = 'tag-marker-alice'
+
+    const idmapCol = makeIdMapCol([makeIdMapEntry('ws-1', 42, 99, issueRef)])
+    const issues = new Map<Ref<Issue>, FakeIssue>([[
+      issueRef as unknown as Ref<Issue>,
+      makeIssue(issueRef, [tagRef])
+    ]])
+    const tagDocs = makeTagStore([
+      { _id: tagRef, title: 'gitlab:reviewer:alice' }
+    ]) as unknown as TagElement[]
+
+    const hulyClient = makeHulyClient(issues, tagDocs)
+
+    await migrateReviewerLabels(
+      {
+        store: makeStore(idmapCol),
+        hulyClient,
+        userIdentity: makeUserIdentity({ alice: 'uuid-alice' as PersonUuid }),
+        logger: makeLogger()
+      },
+      binding
+    )
+
+    const { updateDocCalls, updateMixinCalls } = hulyClient as ReturnType<typeof makeHulyClient>
+    expect(updateDocCalls).toHaveLength(1)
+    expect((updateDocCalls[0].update as Record<string, unknown>)[ORIGINATED_MARKER_KEY]).toBe(ORIGINATED_MARKER_VALUE)
+
+    expect(updateMixinCalls).toHaveLength(1)
+    expect(updateMixinCalls[0].attrs[ORIGINATED_MARKER_KEY]).toBe(ORIGINATED_MARKER_VALUE)
   })
 
   // Case 6: Idempotent — second run is a no-op (labelsStripped=0)

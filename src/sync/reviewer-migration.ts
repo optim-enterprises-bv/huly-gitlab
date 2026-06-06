@@ -7,7 +7,8 @@ import type { BindingDoc } from '../state/bindings'
 import type { UserIdentity } from '../huly/users'
 import type { Logger } from '../logging'
 import type { Store } from '../state/store'
-import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
+import { MR_MIXIN, readMRMixinAttributes, type MRMixinDoc } from './mr-mixin'
+import { withOriginatedMarker } from './originated-marker'
 import { increment, METRIC_NAMES } from '../metrics'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
@@ -140,7 +141,7 @@ export async function migrateReviewerLabels (
       tracker.class.Issue,
       hulyProjectRef,
       issueRef,
-      { labels: remainingLabels }
+      withOriginatedMarker({ labels: remainingLabels }) as unknown as Partial<Issue>
     )
 
     // 8. Write merged reviewers to mixin.
@@ -149,7 +150,7 @@ export async function migrateReviewerLabels (
       tracker.class.Issue,
       hulyProjectRef,
       MR_MIXIN,
-      { reviewers: mergedReviewers }
+      withOriginatedMarker({ reviewers: mergedReviewers }) as unknown as Partial<MRMixinDoc>
     )
   }
 
@@ -173,13 +174,8 @@ async function readExistingReviewers (
   issueRef: Ref<Issue>,
   _space: Ref<Space>
 ): Promise<PersonUuid[]> {
-  // findOne on the mixin class returns the mixin-extended doc when present.
-  const mixinQuery: Partial<MRMixinDoc> = { _id: issueRef }
-  const mixin = await client.findOne<MRMixinDoc>(
-    MR_MIXIN as unknown as Parameters<typeof client.findOne>[0],
-    mixinQuery
-  )
-  return mixin?.reviewers ?? []
+  const issue = await client.findOne<Issue>(tracker.class.Issue, { _id: issueRef })
+  return readMRMixinAttributes(issue).reviewers ?? []
 }
 
 function dedup<T> (arr: T[]): T[] {

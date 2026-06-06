@@ -10,6 +10,8 @@ import type { Capabilities, SyncEpic, SyncUser } from '../../src/adapter/types'
 import { EpicsSyncManager, type EpicsBindingContext } from '../../src/sync/epics'
 import { MR_EPIC_MIXIN } from '../../src/sync/epic-mixin'
 import { MR_MIXIN } from '../../src/sync/mr-mixin'
+import { MR_REVIEW_MIXIN_DOC } from '../../src/sync/mr-review-mixin-doc'
+import { readMRMixinAttributes } from '../../src/sync/mr-mixin'
 import type { SyncContext } from '../../src/sync/types'
 import * as metrics from '../../src/metrics'
 
@@ -368,7 +370,7 @@ describe('EpicsSyncManager', () => {
     expect(h.cursors.docs.find((d) => d.kind === 'epics')).toBeDefined()
   })
 
-  test('AC-1 single writer: applyRemote propagates parentEpicIid to child MR mirror via MR_MIXIN', async () => {
+  test('AC-1 single writer: applyRemote propagates parentEpicIid to child MR mirror via MR_REVIEW_MIXIN_DOC', async () => {
     const h = buildHarness()
     // Seed a child MR mirror in idmap.
     seedIdMap(h.idmap, 'merge_request', '42:11', 'huly-mr-child-1')
@@ -377,18 +379,25 @@ describe('EpicsSyncManager', () => {
     await h.manager.applyRemote(h.ctx, 'binding-1', epic)
 
     const childMixinUpdate = h.huly.updateMixinCalls.find(
-      (c) => c.objectId === 'huly-mr-child-1' && c.mixin === (MR_MIXIN as unknown as string)
+      (c) => c.objectId === 'huly-mr-child-1' && c.mixin === (MR_REVIEW_MIXIN_DOC as unknown as string)
     )
     expect(childMixinUpdate).toBeDefined()
     expect(childMixinUpdate?.attributes.parentEpicIid).toBe(7)
 
-    // EpicsSyncManager wrote ONLY parentEpicIid on the child — not any
+    // EpicsSyncManager wrote ONLY parentEpicIid (+ originated marker) — not any
     // gitlab-mr core field (TG-3 field-ownership symmetry).
-    expect(Object.keys(childMixinUpdate?.attributes ?? {})).toEqual(['parentEpicIid'])
+    expect(Object.keys(childMixinUpdate?.attributes ?? {}).filter((k) => k !== '_originated')).toEqual(['parentEpicIid'])
+    expect(childMixinUpdate?.attributes._originated).toBe('gitlab')
     expect(childMixinUpdate?.attributes.sourceBranch).toBeUndefined()
     expect(childMixinUpdate?.attributes.mergeStatus).toBeUndefined()
     expect(childMixinUpdate?.attributes.targetBranch).toBeUndefined()
     expect(childMixinUpdate?.attributes.draft).toBeUndefined()
+
+    // Legacy MR_MIXIN must NOT receive parentEpicIid.
+    const legacyMixinUpdate = h.huly.updateMixinCalls.find(
+      (c) => c.objectId === 'huly-mr-child-1' && c.mixin === (MR_MIXIN as unknown as string)
+    )
+    expect(legacyMixinUpdate).toBeUndefined()
   })
 
   test('AC-1 propagates parentEpicIid to child Issue mirror when child is plain issue', async () => {
@@ -501,9 +510,10 @@ describe('EpicsSyncManager', () => {
     )
     expect(childWrites).toHaveLength(2)
     for (const w of childWrites) {
-      const keys = Object.keys(w.attributes)
+      const keys = Object.keys(w.attributes).filter((k) => k !== '_originated')
       expect(keys).toEqual(['parentEpicIid'])
       expect(w.attributes.parentEpicIid).toBe(7)
+      expect(w.attributes._originated).toBe('gitlab')
       // Sentinel core MR fields must NOT appear.
       expect(w.attributes.sourceBranch).toBeUndefined()
       expect(w.attributes.targetBranch).toBeUndefined()
@@ -531,6 +541,26 @@ describe('EpicsSyncManager', () => {
     expect(h.idmap.docs.filter((d) => d.gitlabKind === 'epic')).toHaveLength(1)
   })
 
+  test('P5-T-18: readMRMixinAttributes returns parentEpicIid after epics writes to MR_REVIEW_MIXIN_DOC', async () => {
+    const h = buildHarness()
+    seedIdMap(h.idmap, 'merge_request', '42:77', 'huly-mr-child-77')
+
+    const epic = makeSyncEpic({ iid: 9, childIssueIids: [77] })
+    await h.manager.applyRemote(h.ctx, 'binding-1', epic)
+
+    // Simulate the doc as it would appear after updateMixin writes to MR_REVIEW_MIXIN_DOC:
+    // mixinByIssue stores merged attributes; build a fake Issue doc with the
+    // review mixin namespace populated.
+    const mixinData = h.huly.mixinByIssue.get('huly-mr-child-77') ?? {}
+    const fakeDoc = {
+      _id: 'huly-mr-child-77',
+      [MR_REVIEW_MIXIN_DOC as unknown as string]: mixinData
+    }
+
+    const attrs = readMRMixinAttributes(fakeDoc as unknown as Parameters<typeof readMRMixinAttributes>[0])
+    expect(attrs.parentEpicIid).toBe(9)
+  })
+
   test('applyRemote on CE returns silently (no Huly write) and increments epic.ee.skipped', async () => {
     const h = buildHarness({ edition: 'ce' })
     const epic = makeSyncEpic({ childIssueIids: [1, 2] })
@@ -542,5 +572,35 @@ describe('EpicsSyncManager', () => {
     expect(h.huly.updateMixinCalls).toHaveLength(0)
     expect(h.idmap.docs).toHaveLength(0)
     expect(metrics.get('epic.ee.skipped')).toBe(1)
+  })
+
+  test('P5-T-14: applyRemote create epic stamps _originated:gitlab on createDoc attrs and createMixin attrs', async () => {
+    const h = buildHarness()
+    const epic = makeSyncEpic()
+
+    await h.manager.applyRemote(h.ctx, 'binding-1', epic)
+
+    expect(h.huly.creates).toBe(1)
+    expect(h.huly.createMixinCalls).toHaveLength(1)
+
+    // createMixin attrs must carry the marker
+    const cm = h.huly.createMixinCalls[0]
+    expect(cm.attributes._originated).toBe('gitlab')
+    expect(cm.attributes.epicIid).toBe(7)
+  })
+
+  test('P5-T-14: parentEpicIid write on child MR stamps _originated:gitlab on updateMixin attrs', async () => {
+    const h = buildHarness()
+    seedIdMap(h.idmap, 'merge_request', '42:33', 'huly-mr-child-33')
+
+    const epic = makeSyncEpic({ childIssueIids: [33] })
+    await h.manager.applyRemote(h.ctx, 'binding-1', epic)
+
+    const childUpdate = h.huly.updateMixinCalls.find(
+      (c) => c.objectId === 'huly-mr-child-33' && c.mixin === (MR_REVIEW_MIXIN_DOC as unknown as string)
+    )
+    expect(childUpdate).toBeDefined()
+    expect(childUpdate?.attributes.parentEpicIid).toBe(7)
+    expect(childUpdate?.attributes._originated).toBe('gitlab')
   })
 })

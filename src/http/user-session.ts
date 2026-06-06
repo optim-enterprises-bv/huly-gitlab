@@ -59,7 +59,7 @@ export function createUserSessionRouter (deps: UserSessionRouterDeps): Router {
     const expiresAt = Date.now() + ttl * 1000
     const cookie = signCookie(
       { workspaceUuid, hulyPersonUuid, expiresAt },
-      config.ServerSecret
+      { primary: config.ServerSecret, previous: config.ServerSecretPrevious }
     )
 
     const attrs = ['Path=/user', 'HttpOnly', 'SameSite=Strict']

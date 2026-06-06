@@ -1031,3 +1031,38 @@ test('P3-T-08 T8. Position note + confidential MR (idmap miss) → deferred once
   expect(h.enqueued).toHaveLength(1) // no second enqueue
   expect(h.huly.creates).toBe(0)
 })
+
+// ---------------------------------------------------------------------------
+// P5-T-12: _originated:'gitlab' marker stamping on applyRemote writes
+// ---------------------------------------------------------------------------
+
+test('P5-T-12 T1. applyRemote create ChatMessage → createDoc attrs contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  const createDocSpy = jest.spyOn(h.huly, 'createDoc')
+
+  const record = makeNoteRecord({ id: 1000, body: 'Marker create test' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record)
+
+  expect(h.huly.creates).toBe(1)
+  expect(createDocSpy).toHaveBeenCalledTimes(1)
+  const attrs = createDocSpy.mock.calls[0][2] as Record<string, unknown>
+  expect(attrs._originated).toBe('gitlab')
+})
+
+test('P5-T-12 T2. applyRemote update ChatMessage → updateDoc operations contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  const updateDocSpy = jest.spyOn(h.huly, 'updateDoc')
+
+  // First arrival: create the message
+  const record1 = makeNoteRecord({ id: 1001, body: 'Original', updatedAt: '2024-01-01T10:00:00.000Z' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record1)
+
+  // Second arrival: newer timestamp triggers update
+  const record2 = makeNoteRecord({ id: 1001, body: 'Updated', updatedAt: '2024-01-02T10:00:00.000Z' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record2)
+
+  expect(h.huly.updates).toBe(1)
+  expect(updateDocSpy).toHaveBeenCalledTimes(1)
+  const ops = updateDocSpy.mock.calls[0][3] as Record<string, unknown>
+  expect(ops._originated).toBe('gitlab')
+})

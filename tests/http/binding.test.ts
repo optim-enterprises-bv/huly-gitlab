@@ -22,6 +22,18 @@ jest.mock('../../src/sync/reviewer-migration', () => ({
   }))
 }))
 
+// Mock migrateMixinSplit (P5-T-19) so the route can be tested without a real Huly client.
+jest.mock('../../src/sync/mixin-migration', () => ({
+  migrateMixinSplit: jest.fn(async () => ({
+    migratedAt: '2026-06-06T00:00:00.000Z',
+    mrsScanned: 0,
+    legacyStripped: 0,
+    coreWritten: 0,
+    reviewWritten: 0,
+    unresolvedCount: 0
+  }))
+}))
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -547,5 +559,121 @@ describe('binding admin routes', () => {
     expect(res.body).not.toHaveProperty('secret')
 
     expect(mockLoader.loadForMergeRequests).toHaveBeenCalledWith(bindingId)
+  })
+
+  // --- POST /api/v1/bindings/:id/migrate-mixin-split (P5-T-19) ---
+
+  test('24. migrate-mixin-split: binding active (disabled !== true) → 409', async () => {
+    const app = buildApp()
+    const postRes = await request(app)
+      .post('/api/v1/bindings')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send(validBody)
+
+    expect(postRes.status).toBe(201)
+    const { bindingId } = postRes.body as { bindingId: string }
+
+    const res = await request(app)
+      .post(`/api/v1/bindings/${bindingId}/migrate-mixin-split`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('binding active')
+    expect(typeof res.body.message).toBe('string')
+    expect(res.body.message).toMatch(/Pause binding/)
+    expect(res.body.message).toMatch(/disabled: true/)
+  })
+
+  test('25. migrate-mixin-split: binding paused → 200 with MixinSplitMigrationResult JSON', async () => {
+    const postApp = buildApp()
+    const postRes = await request(postApp)
+      .post('/api/v1/bindings')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send(validBody)
+
+    expect(postRes.status).toBe(201)
+    const { bindingId } = postRes.body as { bindingId: string }
+
+    // Pause binding directly in store
+    const { ObjectId } = await import('mongodb')
+    await store.bindings().updateOne(
+      { _id: new ObjectId(bindingId) },
+      { $set: { disabled: true } }
+    )
+
+    const mockLoader = {
+      loadForMergeRequests: jest.fn(async () => ({
+        workspaceUuid: 'ws-test-1',
+        gitlabProjectId: 100,
+        gitlabProjectPath: 'group/repo',
+        hulyProjectRef: 'proj-test-1',
+        hulyClient: {} as unknown,
+        gitlabClient: {} as unknown,
+        statuses: [],
+        userIdentity: {} as unknown,
+        labelCache: {} as unknown,
+        milestoneCache: {} as unknown,
+        defaultTaskType: 'taskType:1',
+        gitlabBaseUrl: 'http://gitlab.test',
+        credentials: { resolveActorToken: async () => undefined }
+      }))
+    } as unknown as BindingLoader
+
+    const appWithLoader = express()
+    appWithLoader.use(bodyParser.json({ limit: '5mb' }))
+    appWithLoader.use(
+      createBindingRouter(store, ENCRYPTION_KEY, SERVER_SECRET, makeLogger(), undefined, undefined, mockLoader)
+    )
+
+    const res = await request(appWithLoader)
+      .post(`/api/v1/bindings/${bindingId}/migrate-mixin-split`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveProperty('migratedAt')
+    expect(res.body).toHaveProperty('mrsScanned')
+    expect(res.body).toHaveProperty('legacyStripped')
+    expect(res.body).toHaveProperty('coreWritten')
+    expect(res.body).toHaveProperty('reviewWritten')
+    expect(res.body).toHaveProperty('unresolvedCount')
+    expect(res.body).not.toHaveProperty('webhookSecretRef')
+    expect(res.body).not.toHaveProperty('webhookSecret')
+
+    expect(mockLoader.loadForMergeRequests).toHaveBeenCalledWith(bindingId)
+  })
+
+  // Phase 5 P5-T-21: admin GraphQL capability cache invalidation
+  test('26. invalidate-graphql-cache: missing bearer → 401', async () => {
+    const app = buildApp()
+    const res = await request(app).post('/api/v1/admin/invalidate-graphql-cache').send({})
+    expect(res.status).toBe(401)
+  })
+
+  test('27. invalidate-graphql-cache: bearer + no body → invalidates all, returns cacheSize', async () => {
+    const { invalidateGraphQLCapability } = await import('../../src/adapter/gitlab-graphql-client')
+    invalidateGraphQLCapability()
+
+    const app = buildApp()
+    const res = await request(app)
+      .post('/api/v1/admin/invalidate-graphql-cache')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send({})
+
+    expect(res.status).toBe(200)
+    expect(res.body.invalidated).toBe('all')
+    expect(typeof res.body.cacheSize).toBe('number')
+    expect(res.body.cacheSize).toBe(0)
+  })
+
+  test('28. invalidate-graphql-cache: bearer + {baseUrl} → invalidates that one, returns cacheSize', async () => {
+    const app = buildApp()
+    const res = await request(app)
+      .post('/api/v1/admin/invalidate-graphql-cache')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send({ baseUrl: 'http://gitlab.test' })
+
+    expect(res.status).toBe(200)
+    expect(res.body.invalidated).toBe('http://gitlab.test')
+    expect(typeof res.body.cacheSize).toBe('number')
   })
 })

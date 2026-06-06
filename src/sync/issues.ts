@@ -14,6 +14,7 @@ import type { LabelCache } from './label-cache'
 import type { MilestoneCache } from './milestone-cache'
 import { mapHulyStatus, mapRemoteState } from './status-map'
 import type { BindingRef, SyncContext, SyncManager } from './types'
+import { withOriginatedMarker } from './originated-marker'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 
@@ -252,7 +253,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
       const issueRef = await bctx.hulyClient.createDoc<Issue>(
         tracker.class.Issue,
         bctx.hulyProjectRef,
-        {
+        withOriginatedMarker({
           title: syncIssue.title,
           description: descriptionMarkup,
           status: statusRef,
@@ -262,7 +263,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
           milestone: milestoneRef,
           kind: bctx.defaultTaskType,
           modifiedOn: remoteTs
-        }
+        })
       )
       await upsertIdMap(
         ctx.store.idmap(),
@@ -341,7 +342,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         existing.hulyRef as Ref<Issue>,
-        update
+        withOriginatedMarker(update)
       )
     }
 

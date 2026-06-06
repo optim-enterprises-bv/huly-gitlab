@@ -6,7 +6,9 @@ import { findByGitlab, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
 import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import { MR_EPIC_MIXIN, type MREpicMixinDoc } from './epic-mixin'
-import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
+// legacy MR_MIXIN no longer imported (P5-T-18 split parentEpicIid out) } from './mr-mixin'
+import { MR_REVIEW_MIXIN_DOC, type MRReviewMixinDoc } from './mr-review-mixin-doc'
+import { withOriginatedMarker } from './originated-marker'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import * as metrics from '../metrics'
 
@@ -106,7 +108,7 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
       issueRef = await bctx.hulyClient.createDoc<Issue>(
         tracker.class.Issue,
         bctx.hulyProjectRef,
-        {
+        withOriginatedMarker({
           title: syncEpic.title,
           description: descriptionMarkup,
           status: statusRef,
@@ -116,7 +118,7 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
           milestone: null,
           kind: bctx.defaultTaskType,
           modifiedOn: remoteTsMs
-        }
+        })
       )
       await upsertIdMap(
         ctx.store.idmap(),
@@ -132,7 +134,7 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         MR_EPIC_MIXIN,
-        buildEpicMixinCreateData(syncEpic)
+        withOriginatedMarker(buildEpicMixinCreateData(syncEpic))
       )
     } else {
       issueRef = existing.hulyRef as Ref<Issue>
@@ -176,7 +178,7 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         MR_EPIC_MIXIN,
-        buildEpicMixinUpdateData(syncEpic)
+        withOriginatedMarker(buildEpicMixinUpdateData(syncEpic))
       )
     }
 
@@ -197,12 +199,12 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
         childGitlabId
       )
       if (mrChild !== null) {
-        await bctx.hulyClient.updateMixin<Issue, MRMixinDoc>(
+        await bctx.hulyClient.updateMixin<Issue, MRReviewMixinDoc>(
           mrChild.hulyRef as Ref<Issue>,
           tracker.class.Issue,
           bctx.hulyProjectRef,
-          MR_MIXIN,
-          { parentEpicIid: syncEpic.iid }
+          MR_REVIEW_MIXIN_DOC,
+          withOriginatedMarker({ parentEpicIid: syncEpic.iid })
         )
         continue
       }
@@ -213,17 +215,14 @@ export class EpicsSyncManager implements SyncManager<SyncEpic> {
         childGitlabId
       )
       if (issueChild !== null) {
-        // Issue-mirror children carry parentEpicIid via the gitlab-mr mixin's
-        // shared schema (P4-T-02: the field lives on `MRMixinDoc`; whichever
-        // mixin is applied to the mirror Issue picks it up). For Phase 4 we
-        // write it under MR_MIXIN since that's the only declared shape that
-        // carries the field.
-        await bctx.hulyClient.updateMixin<Issue, MRMixinDoc>(
+        // Issue-mirror children carry parentEpicIid via the review mixin
+        // (P5-T-02: parentEpicIid is a review-side field on MRReviewMixinDoc).
+        await bctx.hulyClient.updateMixin<Issue, MRReviewMixinDoc>(
           issueChild.hulyRef as Ref<Issue>,
           tracker.class.Issue,
           bctx.hulyProjectRef,
-          MR_MIXIN,
-          { parentEpicIid: syncEpic.iid }
+          MR_REVIEW_MIXIN_DOC,
+          withOriginatedMarker({ parentEpicIid: syncEpic.iid })
         )
         continue
       }

@@ -1096,3 +1096,130 @@ export async function deleteUserOAuthCredential (
   })
   return { status: res.status }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: originated-marker, mixin-split, GraphQL fallback, secret rotation
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a field on a mirror Issue via the transactor to exercise the
+ * originated-marker / echo-storm filter path (P5-T-28).
+ *
+ * The real harness wires `transactor` to a `@hcengineering/client` connection
+ * using the service-account identity so the resulting tx is authored by the
+ * service account. TxSubscriber sees `tx.modifiedBy === serviceAccountPersonId`
+ * and drops the tx via the originated-marker check. Unit tests inject a mock
+ * that records the call shape.
+ */
+export async function triggerHulyTxWrite (
+  transactor: MinimalTransactor,
+  targetRef: string,
+  field: string,
+  value: unknown
+): Promise<void> {
+  await transactor.updateMixin(
+    targetRef,
+    HARNESS_ISSUE_CLASS,
+    targetRef,
+    'gitlab-mr',
+    { [field]: value }
+  )
+}
+
+export interface MixinSplitMigrationArgs {
+  podBaseUrl: string
+  bindingId: string
+  bearer: string
+}
+
+/**
+ * POST to the mixin-split migration endpoint. Returns the parsed JSON body
+ * alongside the HTTP status so 200, 409, and error paths can be asserted.
+ */
+export async function runMixinSplitMigration (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: MixinSplitMigrationArgs
+): Promise<MigrationResponse> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}/migrate-mixin-split`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${args.bearer}` }
+    }
+  )
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}
+
+export interface ForceGraphQLFailureArgs {
+  gitlabBaseUrl: string
+  rootToken: string
+}
+
+/**
+ * Force the GitLab GraphQL endpoint to fail so the pod exercises the REST
+ * fallback path (P5-T-28). On a real stack this disables the GraphQL endpoint
+ * via a feature flag; in unit tests this is a no-op (callers inject a fetch
+ * mock that already returns 500 for /api/graphql).
+ */
+export async function forceGraphQLFailure (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: ForceGraphQLFailureArgs
+): Promise<{ status: number }> {
+  const res = await deps.fetch(
+    `${args.gitlabBaseUrl}/api/v4/features/graphql_toggle`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': args.rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ value: false })
+    }
+  )
+  return { status: res.status }
+}
+
+export interface RotateServerSecretArgs {
+  podUrl: string
+  bearer: string
+  newPrimary: string
+}
+
+export interface RotateServerSecretResponse {
+  status: number
+  body: unknown
+}
+
+/**
+ * Admin call to rotate the pod's signing secret (P5-T-28). The pod promotes
+ * `newPrimary` to the PRIMARY slot and moves the current primary into the
+ * PREVIOUS_SECRET grace window so cookies signed before rotation remain valid.
+ */
+export async function rotateServerSecret (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: RotateServerSecretArgs
+): Promise<RotateServerSecretResponse> {
+  const res = await deps.fetch(`${args.podUrl}/api/v1/admin/rotate-secret`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${args.bearer}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ newPrimary: args.newPrimary })
+  })
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}

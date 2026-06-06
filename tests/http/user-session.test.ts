@@ -94,7 +94,7 @@ describe('POST /user/session (B5)', () => {
     const m = cookieHeader.match(/huly-user=([^;]+);/)
     expect(m).not.toBeNull()
     const cookieVal = m![1]
-    const identity = verifyCookie(cookieVal, SERVER_SECRET)
+    const identity = verifyCookie(cookieVal, { primary: SERVER_SECRET })
     expect(identity).not.toBeNull()
     expect(identity!.workspaceUuid).toBe('ws-rt')
     expect(identity!.hulyPersonUuid).toBe('person-rt')

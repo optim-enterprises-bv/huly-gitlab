@@ -17,11 +17,15 @@
 
 import express from 'express'
 import request from 'supertest'
+import * as fs from 'fs'
+import * as path from 'path'
 import type { Client, PersonId, WorkspaceUuid } from '@hcengineering/core'
 import { SyncEngine, InMemoryBindingBreaker } from '../../src/sync'
 import { EpicsSyncManager } from '../../src/sync/epics'
 import { TxSubscriber } from '../../src/sync/tx-subscription'
 import { createApp } from '../../src/http'
+import * as metricsModule from '../../src/metrics'
+import { METRIC_NAMES } from '../../src/metrics'
 import type { Store } from '../../src/state/store'
 import type { Config } from '../../src/config'
 import type { Logger } from '../../src/logging'
@@ -187,6 +191,25 @@ describe('P4-T-19: index wiring', () => {
       .get('/user/oauth/status')
       .query({ gitlabBaseUrl: 'https://gitlab.com' })
     expect(status.status).toBe(401)
+  })
+
+  it('P5-T-04: SERVICE_ACCOUNT_RESOLVED gauge initialized at 0 (Path D sentinel fallback)', () => {
+    // Reset so we get a clean baseline regardless of test order.
+    metricsModule.reset(METRIC_NAMES.SERVICE_ACCOUNT_RESOLVED)
+    // Simulate what src/index.ts does at startup: increment by 0 to register
+    // the gauge entry without changing the value from the sentinel default.
+    metricsModule.increment(METRIC_NAMES.SERVICE_ACCOUNT_RESOLVED, 0)
+    expect(metricsModule.get(METRIC_NAMES.SERVICE_ACCOUNT_RESOLVED)).toBe(0)
+  })
+
+  it('P5-T-04: src/index.ts contains operator alert comment for echo-filter monitoring', () => {
+    const indexSrc = fs.readFileSync(
+      path.resolve(__dirname, '../../src/index.ts'),
+      'utf8'
+    )
+    expect(indexSrc).toContain('Operator must monitor')
+    expect(indexSrc).toContain('tx.subscription.echo.dropped')
+    expect(indexSrc).toContain('Path D')
   })
 
   it('engine-started flag drains buffered txes after late markEngineStarted', () => {

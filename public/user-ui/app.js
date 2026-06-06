@@ -8,6 +8,36 @@ const gitlabUrlInput = document.getElementById('gitlab-url')
 const errorMessage = document.getElementById('error-message')
 const formSection = document.getElementById('form-section')
 
+/**
+ * Get allowed parent origins from window global or meta tag.
+ * Returns null if no allowlist is configured (fail-closed: reject all postMessages).
+ * Returns array of allowed origins if configured.
+ */
+function getAllowedOrigins () {
+  // Check window.HULY_PARENT_ORIGINS first
+  if (window.HULY_PARENT_ORIGINS && Array.isArray(window.HULY_PARENT_ORIGINS)) {
+    return window.HULY_PARENT_ORIGINS
+  }
+  // Check data-allowed-origins meta tag
+  const metaTag = document.querySelector('meta[data-allowed-origins]')
+  if (metaTag && metaTag.getAttribute('data-allowed-origins')) {
+    const origins = metaTag.getAttribute('data-allowed-origins').split(',').map(o => o.trim()).filter(o => o)
+    return origins.length > 0 ? origins : null
+  }
+  return null
+}
+
+/**
+ * Validate postMessage origin against allowlist.
+ * Returns true if origin is allowed, false otherwise.
+ * If no allowlist configured, returns false (fail-closed).
+ */
+function isOriginAllowed (origin) {
+  const allowedOrigins = getAllowedOrigins()
+  if (!allowedOrigins) return false
+  return allowedOrigins.includes(origin)
+}
+
 function acquireBearer () {
   const params = new URLSearchParams(window.location.search)
   if (params.has('bearer')) {
@@ -20,6 +50,11 @@ function acquireBearer () {
 }
 
 window.addEventListener('message', (e) => {
+  // Validate origin before processing any postMessage
+  if (!isOriginAllowed(e.origin)) {
+    console.warn(`postMessage from unauthorized origin rejected: ${e.origin}`)
+    return
+  }
   if (e.data?.type === 'huly-bearer') {
     bearer = e.data.token
     if (e.data.workspaceUuid) sessionStorage.setItem('hulyWorkspaceUuid', e.data.workspaceUuid)
@@ -123,7 +158,10 @@ function init () {
   } else {
     setTimeout(() => { bearer ? loadStatus() : showNoBearerMessage() }, 100)
   }
-  window.parent.postMessage({ type: 'huly-ui-ready' }, '*')
+  const allowedOrigins = getAllowedOrigins()
+  if (allowedOrigins !== null && allowedOrigins.length > 0) {
+    window.parent.postMessage({ type: 'huly-ui-ready' }, allowedOrigins[0])
+  }
 }
 
 if (document.readyState === 'loading') {

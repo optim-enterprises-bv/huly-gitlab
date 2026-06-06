@@ -78,11 +78,14 @@ export function createApp (deps: AppDependencies): express.Express {
     deps.bindingLoader
   ))
 
+  // Shared secret-rotation config for HMAC dual-verify across cookie + state surfaces.
+  const secrets = { primary: config.ServerSecret, previous: config.ServerSecretPrevious }
+
   // OAuth routes
-  app.use('/oauth', createOAuthRouter({ config, store, logger }))
+  app.use('/oauth', createOAuthRouter({ config, store, logger, secrets }))
 
   // Per-user OAuth routes (Phase 4 — cookie-auth + rate-limit + GitLab user lookup).
-  app.use('/user/oauth', createUserOAuthRouter({ config, store, logger }))
+  app.use('/user/oauth', createUserOAuthRouter({ config, store, logger, secrets }))
 
   // B5: cookie-mint endpoint (bearer-protected). Platform integration point.
   app.use('/user', createUserSessionRouter({ config, logger }))

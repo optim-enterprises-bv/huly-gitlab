@@ -5,6 +5,7 @@ import { withRateLimitRetry, type RateLimitHeaders } from './rate-limit'
 import { validateGitLabBaseUrl } from '../util/url-validation'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
+import { GitLabGraphQLClient, detectGraphQLCapability } from './gitlab-graphql-client'
 import type {
   ApprovalStatus,
   Capabilities,
@@ -179,6 +180,10 @@ interface RawDiscussionPosition {
   old_path?: string | null
   new_line?: number | null
   old_line?: number | null
+  x?: number | null
+  y?: number | null
+  width?: number | null
+  height?: number | null
 }
 
 interface RawDiscussionNote {
@@ -436,14 +441,36 @@ function mapWebhook (raw: RawWebhook): SyncWebhook {
 }
 
 function mapReviewPosition (raw: RawDiscussionPosition): SyncReviewPosition {
+  const filePath = raw.new_path ?? raw.old_path ?? ''
+  const pt = raw.position_type ?? 'text'
+  if (pt === 'image') {
+    return {
+      positionType: 'image',
+      filePath,
+      x: raw.x ?? 0,
+      y: raw.y ?? 0,
+      width: raw.width ?? 0,
+      height: raw.height ?? 0,
+      baseSha: raw.base_sha,
+      headSha: raw.head_sha
+    }
+  }
+  if (pt === 'file') {
+    return {
+      positionType: 'file',
+      filePath,
+      baseSha: raw.base_sha,
+      headSha: raw.head_sha
+    }
+  }
   return {
-    filePath: raw.new_path ?? raw.old_path ?? '',
+    positionType: 'text',
+    filePath,
     oldLine: raw.old_line ?? null,
     newLine: raw.new_line ?? null,
     baseSha: raw.base_sha,
     headSha: raw.head_sha,
-    startSha: raw.start_sha,
-    positionType: 'text'
+    startSha: raw.start_sha
   }
 }
 
@@ -458,7 +485,7 @@ function mapReviewNote (raw: RawDiscussionNote): SyncReviewNote {
     resolvable: raw.resolvable === true,
     resolved: raw.resolved === true
   }
-  if (raw.position != null && (raw.position.position_type === undefined || raw.position.position_type === 'text')) {
+  if (raw.position != null) {
     note.position = mapReviewPosition(raw.position)
   }
   return note
@@ -466,13 +493,14 @@ function mapReviewNote (raw: RawDiscussionNote): SyncReviewNote {
 
 /**
  * Map a GitLab discussion to SyncReviewThread. Returns null when the discussion's
- * notes carry a non-text position type (e.g. 'image', 'file') — caller drops the row
- * and increments the discussion.position.unsupported metric.
+ * notes carry an unknown position type — caller drops the row and increments the
+ * discussion.position.unsupported metric.
  */
 function mapDiscussion (raw: RawDiscussion, projectId: number, mergeRequestIid: number): SyncReviewThread | null {
   if (raw.notes.length === 0) return null
   for (const n of raw.notes) {
-    if (n.position?.position_type !== undefined && n.position.position_type !== 'text') {
+    const pt = n.position?.position_type
+    if (pt !== undefined && pt !== 'text' && pt !== 'image' && pt !== 'file') {
       return null
     }
   }
@@ -599,6 +627,368 @@ function mapEpic (raw: RawEpic, childIssueIids: number[] = []): SyncEpic {
     createdAt: new Date(raw.created_at),
     updatedAt: new Date(raw.updated_at)
   }
+}
+
+// ---------------------------------------------------------------------------
+// P5-T-22: GraphQL composite getMergeRequest mapping.
+//
+// `mapGraphQLMRResponse` is exported (for testability) and converts a single
+// GraphQL `project.mergeRequest` payload into the canonical SyncMergeRequest
+// shape that REST composite produces. Confidential MRs raise the same
+// ConfidentialMergeRequestError the REST path raises so callers cannot
+// observe a behavioral difference between paths.
+// ---------------------------------------------------------------------------
+
+export const GRAPHQL_MR_COMPOSITE_QUERY = `
+  query MRComposite($projectFullPath: ID!, $mrIid: String!) {
+    project(fullPath: $projectFullPath) {
+      mergeRequest(iid: $mrIid) {
+        iid
+        title
+        description
+        state
+        draft
+        sourceBranch
+        targetBranch
+        mergeStatus
+        mergedAt
+        createdAt
+        updatedAt
+        webUrl
+        confidential
+        labels { nodes { title } }
+        milestone { iid title }
+        author { id username name publicEmail avatarUrl webUrl }
+        assignees { nodes { id username name publicEmail avatarUrl webUrl } }
+        reviewers { nodes { id username name publicEmail avatarUrl webUrl } }
+        headPipeline { status }
+        approved
+        approvalsRequired
+        approvedBy { nodes { id username name publicEmail avatarUrl webUrl } }
+        approvalState {
+          rules {
+            id
+            name
+            type
+            approvalsRequired
+            eligibleApprovers { id username name publicEmail avatarUrl webUrl }
+            approvedBy { nodes { id username name publicEmail avatarUrl webUrl } }
+          }
+        }
+        diffStats { path additions deletions }
+      }
+    }
+  }
+`
+
+interface GraphQLUser {
+  id: string | number
+  username: string
+  name: string
+  publicEmail?: string | null
+  avatarUrl?: string | null
+  webUrl: string
+}
+
+interface GraphQLMRRule {
+  id: string | number
+  name: string
+  type?: string | null
+  approvalsRequired: number
+  eligibleApprovers?: GraphQLUser[] | null
+  approvedBy?: { nodes?: GraphQLUser[] | null } | null
+}
+
+interface GraphQLMRDiffStat {
+  path: string
+  additions: number
+  deletions: number
+}
+
+interface GraphQLMRPayload {
+  iid: number | string
+  title: string
+  description?: string | null
+  state: string
+  draft: boolean
+  sourceBranch: string
+  targetBranch: string
+  mergeStatus: string
+  mergedAt?: string | null
+  createdAt: string
+  updatedAt: string
+  webUrl: string
+  confidential: boolean
+  labels?: { nodes?: Array<{ title: string }> | null } | null
+  milestone?: { iid: number | string, title: string } | null
+  author: GraphQLUser
+  assignees?: { nodes?: GraphQLUser[] | null } | null
+  reviewers?: { nodes?: GraphQLUser[] | null } | null
+  headPipeline?: { status: string } | null
+  approved?: boolean | null
+  approvalsRequired?: number | null
+  approvedBy?: { nodes?: GraphQLUser[] | null } | null
+  approvalState?: { rules?: GraphQLMRRule[] | null } | null
+  diffStats?: GraphQLMRDiffStat[] | null
+}
+
+export interface GraphQLMRResponse {
+  project: {
+    mergeRequest: GraphQLMRPayload | null
+  } | null
+}
+
+function numericId (raw: string | number): number {
+  if (typeof raw === 'number') return raw
+  const m = /(\d+)$/.exec(raw)
+  return m !== null ? parseInt(m[1], 10) : 0
+}
+
+function mapGraphQLUser (raw: GraphQLUser): SyncUser {
+  return {
+    id: numericId(raw.id),
+    username: raw.username,
+    name: raw.name,
+    email: raw.publicEmail ?? null,
+    avatarUrl: raw.avatarUrl ?? null,
+    webUrl: raw.webUrl
+  }
+}
+
+function mapGraphQLMRState (raw: string): SyncMergeRequest['state'] {
+  const s = raw.toLowerCase()
+  if (s === 'closed' || s === 'merged' || s === 'locked') return s
+  return 'opened'
+}
+
+function mapGraphQLMergeStatus (raw: string): MergeStatus {
+  const s = raw.toLowerCase()
+  if (s === 'can_be_merged' || s === 'cannot_be_merged' || s === 'unchecked' || s === 'locked') {
+    return s
+  }
+  return 'unchecked'
+}
+
+function mapGraphQLRule (raw: GraphQLMRRule): SyncMRApprovalRule {
+  return {
+    id: numericId(raw.id),
+    name: raw.name,
+    ruleType: mapApprovalRuleType(raw.type ?? 'regular'),
+    eligibleApprovers: (raw.eligibleApprovers ?? []).map(mapGraphQLUser),
+    approvalsRequired: raw.approvalsRequired,
+    approvedBy: (raw.approvedBy?.nodes ?? []).map(mapGraphQLUser)
+  }
+}
+
+/**
+ * Map a GraphQL composite MR response to SyncMergeRequest.
+ * Throws ConfidentialMergeRequestError when the MR is confidential.
+ * Throws NotFoundError when `project` or `mergeRequest` is null.
+ */
+export function mapGraphQLMRResponse (data: GraphQLMRResponse): SyncMergeRequest {
+  const mr = data.project?.mergeRequest
+  if (mr == null) {
+    throw new NotFoundError('graphql.merge_request.null')
+  }
+  if (mr.confidential) {
+    throw new ConfidentialMergeRequestError(numericId(mr.iid))
+  }
+  const approvedBy = (mr.approvedBy?.nodes ?? []).map(mapGraphQLUser)
+  const approvalsRequired = mr.approvalsRequired ?? 0
+  const approvalStatus: ApprovalStatus =
+    approvalsRequired > 0 && approvedBy.length >= approvalsRequired ? 'approved' : 'pending'
+  const changedFiles: SyncChangedFile[] = (mr.diffStats ?? []).map((d) => ({
+    path: d.path,
+    additions: d.additions,
+    deletions: d.deletions,
+    status: 'modified'
+  }))
+  const out: SyncMergeRequest = {
+    iid: numericId(mr.iid),
+    projectId: 0,
+    title: mr.title,
+    description: mr.description ?? '',
+    state: mapGraphQLMRState(mr.state),
+    draft: mr.draft,
+    sourceBranch: mr.sourceBranch,
+    targetBranch: mr.targetBranch,
+    mergeStatus: mapGraphQLMergeStatus(mr.mergeStatus),
+    mergedAt: mr.mergedAt != null ? new Date(mr.mergedAt) : null,
+    pipelineStatus: mr.headPipeline != null ? mapPipelineStatus(mr.headPipeline.status) : null,
+    labels: (mr.labels?.nodes ?? []).map((l) => l.title),
+    milestone: mr.milestone != null ? { iid: numericId(mr.milestone.iid), title: mr.milestone.title } : null,
+    assignees: (mr.assignees?.nodes ?? []).map(mapGraphQLUser),
+    author: mapGraphQLUser(mr.author),
+    createdAt: new Date(mr.createdAt),
+    updatedAt: new Date(mr.updatedAt),
+    webUrl: mr.webUrl,
+    confidential: mr.confidential,
+    reviewers: (mr.reviewers?.nodes ?? []).map(mapGraphQLUser),
+    approvedBy,
+    approvalsRequired,
+    approvalStatus,
+    diffWebUrl: `${mr.webUrl}/diffs`,
+    changedFiles,
+    approvalRules: (mr.approvalState?.rules ?? []).map(mapGraphQLRule)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// P5-T-23: GraphQL listEpicsWithChildren mapping.
+//
+// Single-roundtrip query for a group's epics plus their child issue iids. The
+// REST path requires one call per epic to populate `childIssueIids`, so on a
+// group with N epics this collapses N+1 round-trips into 1. `mapGraphQLEpicNode`
+// is exported for testability.
+// ---------------------------------------------------------------------------
+
+export const GRAPHQL_EPICS_WITH_CHILDREN_QUERY = `
+  query EpicsWithChildren($groupFullPath: ID!, $updatedAfter: Time) {
+    group(fullPath: $groupFullPath) {
+      epics(updatedAfter: $updatedAfter) {
+        nodes {
+          iid
+          title
+          description
+          state
+          webUrl
+          confidential
+          createdAt
+          updatedAt
+          group { id }
+          author { id username name publicEmail avatarUrl webUrl }
+          issues {
+            nodes { iid }
+          }
+        }
+      }
+    }
+  }
+`
+
+interface GraphQLEpicIssueNode {
+  iid: number | string
+}
+
+interface GraphQLEpicNode {
+  iid: number | string
+  title: string
+  description?: string | null
+  state: string
+  webUrl: string
+  confidential?: boolean | null
+  createdAt: string
+  updatedAt: string
+  group?: { id: string | number } | null
+  author: GraphQLUser
+  issues?: { nodes?: GraphQLEpicIssueNode[] | null } | null
+}
+
+export interface GraphQLEpicsResponse {
+  group: {
+    epics: { nodes?: GraphQLEpicNode[] | null } | null
+  } | null
+}
+
+function mapGraphQLEpicState (raw: string): SyncEpic['state'] {
+  return raw.toLowerCase() === 'closed' ? 'closed' : 'opened'
+}
+
+/**
+ * Map a single GraphQL epic node to SyncEpic.
+ * Confidential epics are skipped by the caller (see listEpicsWithChildren).
+ */
+export function mapGraphQLEpicNode (raw: GraphQLEpicNode): SyncEpic {
+  const childIssueIids: number[] = []
+  for (const node of raw.issues?.nodes ?? []) {
+    const iidRaw = node.iid
+    const n = typeof iidRaw === 'number' ? iidRaw : parseInt(String(iidRaw), 10)
+    if (Number.isFinite(n) && n > 0) {
+      childIssueIids.push(n)
+    }
+  }
+  return {
+    iid: numericId(raw.iid),
+    groupId: raw.group != null ? numericId(raw.group.id) : 0,
+    title: raw.title,
+    description: raw.description ?? '',
+    state: mapGraphQLEpicState(raw.state),
+    webUrl: raw.webUrl,
+    childIssueIids,
+    author: mapGraphQLUser(raw.author),
+    createdAt: new Date(raw.createdAt),
+    updatedAt: new Date(raw.updatedAt)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P5-T-24: GraphQL listMergeRequestsWithApprovals mapping.
+//
+// Reuses the same per-MR fields as the P5-T-22 composite query but for a list
+// of MRs in a project. REST path needs one composite fetch per MR (3-5 calls
+// each) — GraphQL fetches the whole page in a single round-trip.
+// `mapGraphQLMRListNode` is exported for testability.
+// ---------------------------------------------------------------------------
+
+export const GRAPHQL_MR_LIST_WITH_APPROVALS_QUERY = `
+  query MRListWithApprovals($projectFullPath: ID!, $updatedAfter: Time) {
+    project(fullPath: $projectFullPath) {
+      mergeRequests(updatedAfter: $updatedAfter) {
+        nodes {
+          iid
+          title
+          description
+          state
+          draft
+          sourceBranch
+          targetBranch
+          mergeStatus
+          mergedAt
+          createdAt
+          updatedAt
+          webUrl
+          confidential
+          labels { nodes { title } }
+          milestone { iid title }
+          author { id username name publicEmail avatarUrl webUrl }
+          assignees { nodes { id username name publicEmail avatarUrl webUrl } }
+          reviewers { nodes { id username name publicEmail avatarUrl webUrl } }
+          headPipeline { status }
+          approved
+          approvalsRequired
+          approvedBy { nodes { id username name publicEmail avatarUrl webUrl } }
+          approvalState {
+            rules {
+              id
+              name
+              type
+              approvalsRequired
+              eligibleApprovers { id username name publicEmail avatarUrl webUrl }
+              approvedBy { nodes { id username name publicEmail avatarUrl webUrl } }
+            }
+          }
+          diffStats { path additions deletions }
+        }
+      }
+    }
+  }
+`
+
+export interface GraphQLMRListResponse {
+  project: {
+    mergeRequests: { nodes?: GraphQLMRPayload[] | null } | null
+  } | null
+}
+
+/**
+ * Map a single GraphQL MR list node to SyncMergeRequest. Confidential MRs are
+ * skipped by the caller (see listMergeRequestsWithApprovals). Unlike the
+ * composite mapper, this does NOT throw NotFoundError on a null payload —
+ * the caller iterates the nodes array and the array is the source of truth.
+ */
+export function mapGraphQLMRListNode (raw: GraphQLMRPayload): SyncMergeRequest {
+  return mapGraphQLMRResponse({ project: { mergeRequest: raw } })
 }
 
 interface ApprovalRuleCacheEntry {
@@ -1098,6 +1488,57 @@ export class GitLabClient {
   }
 
   /**
+   * P5-T-24: list MRs with Phase 3/4 fields (approvals, reviewers, approval
+   * rules, diff stats) populated in one round-trip when GitLab supports
+   * GraphQL. The REST fallback issues `listMergeRequests` + one composite
+   * `getMergeRequest` per row (N+1 over the 3-5 call composite).
+   *
+   * Requires a project full path (string) for the GraphQL path; numeric ids
+   * skip straight to the REST fallback because `project(fullPath:)` does not
+   * accept numeric ids.
+   */
+  async listMergeRequestsWithApprovals (
+    projectPath: number | string,
+    opts: { updatedAfter?: Date } = {}
+  ): Promise<SyncMergeRequest[]> {
+    if (typeof projectPath === 'string') {
+      try {
+        const cap = await detectGraphQLCapability(this.baseUrl, this.token)
+        if (cap.graphqlAvailable) {
+          const vars: Record<string, unknown> = { projectFullPath: projectPath }
+          if (opts.updatedAfter !== undefined) {
+            vars.updatedAfter = opts.updatedAfter.toISOString()
+          }
+          const data = await new GitLabGraphQLClient({ baseUrl: this.baseUrl, token: this.token })
+            .query<GraphQLMRListResponse>(GRAPHQL_MR_LIST_WITH_APPROVALS_QUERY, vars)
+          const nodes = data.project?.mergeRequests?.nodes ?? []
+          const out: SyncMergeRequest[] = []
+          for (const node of nodes) {
+            if (node.confidential) continue
+            out.push(mapGraphQLMRListNode(node))
+          }
+          metrics.increment(METRIC_NAMES.MR_LIST_GRAPHQL_HIT)
+          return out
+        }
+      } catch (err) {
+        this.logger.info('mr.list.graphql.fallback', { projectPath, error: String(err) })
+      }
+    }
+    metrics.increment(METRIC_NAMES.MR_LIST_REST_FALLBACK)
+    const base = await this.listMergeRequests(projectPath, opts)
+    const enriched: SyncMergeRequest[] = []
+    for (const mr of base) {
+      try {
+        enriched.push(await this.getMergeRequest(projectPath, mr.iid))
+      } catch (err) {
+        if (err instanceof ConfidentialMergeRequestError) continue
+        throw err
+      }
+    }
+    return enriched
+  }
+
+  /**
    * Fetch a single MR with Phase 3 + Phase 4 composite enrichment.
    *
    * On CE this issues THREE HTTP requests:
@@ -1128,6 +1569,34 @@ export class GitLabClient {
    * undefined to avoid an N+1 explosion.
    */
   async getMergeRequest (projectId: number | string, mrIid: number): Promise<SyncMergeRequest> {
+    // P5-T-22: prefer the single-roundtrip GraphQL composite when GitLab supports
+    // it. The path requires a project full path (string projectId) because the
+    // GraphQL `project(fullPath:)` field does not accept numeric ids. If only a
+    // numeric id is known, fall through to the REST composite which handles
+    // both shapes natively.
+    if (typeof projectId === 'string') {
+      try {
+        const cap = await detectGraphQLCapability(this.baseUrl, this.token)
+        if (cap.graphqlAvailable) {
+          const data = await new GitLabGraphQLClient({ baseUrl: this.baseUrl, token: this.token })
+            .query<GraphQLMRResponse>(GRAPHQL_MR_COMPOSITE_QUERY, { projectFullPath: projectId, mrIid: String(mrIid) })
+          const mr = mapGraphQLMRResponse(data)
+          mr.projectId = typeof mr.projectId === 'number' && mr.projectId > 0 ? mr.projectId : 0
+          metrics.increment(METRIC_NAMES.MR_COMPOSITE_GRAPHQL_HIT)
+          return mr
+        }
+      } catch (err) {
+        if (err instanceof ConfidentialMergeRequestError) {
+          throw err
+        }
+        this.logger.info('mr.composite.graphql.fallback', { projectId, mrIid, error: String(err) })
+      }
+      metrics.increment(METRIC_NAMES.MR_COMPOSITE_REST_FALLBACK)
+    }
+    return await this.getMergeRequestREST(projectId, mrIid)
+  }
+
+  private async getMergeRequestREST (projectId: number | string, mrIid: number): Promise<SyncMergeRequest> {
     const raw = await this.request<RawMergeRequest>('GET', `/api/v4/projects/${projectId}/merge_requests/${mrIid}`)
     if (raw.confidential) {
       throw new ConfidentialMergeRequestError(mrIid)
@@ -1263,9 +1732,9 @@ export class GitLabClient {
    * List MR review threads (discussions).
    *
    * Paginated via the X-Next-Page header (same shape as listMergeRequests).
-   * Filters out discussions whose notes carry a non-text position (e.g.
-   * 'image' / 'file' diff positions) and emits a `discussion.position.unsupported`
-   * info log per dropped row.
+   * Maps position_type 'text', 'image', and 'file' to their respective
+   * SyncReviewPosition variants. Unknown position types are dropped and emit a
+   * `discussion.position.unsupported` warn log per dropped row.
    *
    * Resolvable general-MR review threads (no position) are included.
    */
@@ -1312,7 +1781,7 @@ export class GitLabClient {
             for (const d of raw) {
               const t = mapDiscussion(d, projectIdNum, mrIid)
               if (t === null) {
-                this.logger.info('discussion.position.unsupported', { projectId, mrIid, discussionId: d.id })
+                this.logger.warn('discussion.position.unsupported', { projectId, mrIid, discussionId: d.id })
                 metrics.increment(METRIC_NAMES.DISCUSSION_POSITION_UNSUPPORTED)
                 continue
               }
@@ -1756,6 +2225,55 @@ export class GitLabClient {
     }
 
     return results
+  }
+
+  /**
+   * P5-T-23: list a group's epics with `childIssueIids` populated in a single
+   * round-trip when GitLab supports GraphQL. The REST fallback issues
+   * `listEpics` + one `listEpicIssues` call per epic (N+1).
+   *
+   * The GraphQL path requires the group's full path (string). Numeric ids
+   * short-circuit to the REST fallback because `group(fullPath:)` does not
+   * accept numeric ids. CE returns `[]` silently (same shape as `listEpics`).
+   */
+  async listEpicsWithChildren (
+    groupPath: number | string,
+    opts: { updatedAfter?: Date } = {}
+  ): Promise<SyncEpic[]> {
+    if (!this.ensureEE()) {
+      return []
+    }
+    if (typeof groupPath === 'string') {
+      try {
+        const cap = await detectGraphQLCapability(this.baseUrl, this.token)
+        if (cap.graphqlAvailable) {
+          const vars: Record<string, unknown> = { groupFullPath: groupPath }
+          if (opts.updatedAfter !== undefined) {
+            vars.updatedAfter = opts.updatedAfter.toISOString()
+          }
+          const data = await new GitLabGraphQLClient({ baseUrl: this.baseUrl, token: this.token })
+            .query<GraphQLEpicsResponse>(GRAPHQL_EPICS_WITH_CHILDREN_QUERY, vars)
+          const nodes = data.group?.epics?.nodes ?? []
+          const out: SyncEpic[] = []
+          for (const node of nodes) {
+            if (node.confidential === true) continue
+            out.push(mapGraphQLEpicNode(node))
+          }
+          metrics.increment(METRIC_NAMES.EPICS_LIST_GRAPHQL_HIT)
+          return out
+        }
+      } catch (err) {
+        this.logger.info('epics.list.graphql.fallback', { groupPath, error: String(err) })
+      }
+    }
+    metrics.increment(METRIC_NAMES.EPICS_LIST_REST_FALLBACK)
+    const base = await this.listEpics(groupPath, opts)
+    const enriched: SyncEpic[] = []
+    for (const epic of base) {
+      const children = await this.listEpicIssues(groupPath, epic.iid)
+      enriched.push({ ...epic, childIssueIids: children.iids })
+    }
+    return enriched
   }
 
   /**
