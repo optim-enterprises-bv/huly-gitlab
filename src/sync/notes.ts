@@ -11,6 +11,8 @@ import { METRIC_NAMES } from '../metrics'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import { resolveIssueRef, type BindingResolverInput } from './issues'
+import type { MirrorDeps } from './attachments'
+import { mirrorBodyGitlabToHuly, mirrorBodyHulyToGitlab } from './attachments'
 import { markAndRetry, NOTE_RETRY_FLAG, REVIEW_RETRY_FLAG } from './deferred-parent'
 import { withOriginatedMarker } from './originated-marker'
 
@@ -269,6 +271,12 @@ export interface NotesSyncManagerDeps {
   enqueuer?: NotesBackfillEnqueuer
   /** Function form preferred for new wiring */
   backfillEnqueuer?: NotesBackfillEnqueuerFn
+  /**
+   * Optional attachment mirror deps. When present, GitLab upload links in note
+   * bodies are mirrored into Huly (and vice versa). When absent or when mirror
+   * fails, the original link is preserved (link-through fallback).
+   */
+  mirrorDeps?: MirrorDeps
 }
 
 const HULY_CLASS_CHAT_MESSAGE = 'chunter.class.ChatMessage'
@@ -517,7 +525,27 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
 
     const refUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}/-/issues`
     const imageUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}`
-    const messageMarkup = gfmMarkdownToMarkup(note.body, refUrl, imageUrl)
+
+    let noteBody = note.body
+    if (this.deps.mirrorDeps !== undefined) {
+      try {
+        noteBody = await mirrorBodyGitlabToHuly(
+          this.deps.mirrorDeps,
+          note.body,
+          bctx.gitlabBaseUrl,
+          bctx.gitlabProjectPath
+        )
+      } catch (err) {
+        ctx.logger.warn('NotesSyncManager: attachment mirror failed — using link-through', {
+          binding,
+          noteId: note.id,
+          error: err instanceof Error ? err.message : String(err)
+        })
+        ctx.logger.info('ATTACHMENT_MIRROR_FAILED', { binding, noteId: note.id })
+      }
+    }
+
+    const messageMarkup = gfmMarkdownToMarkup(noteBody, refUrl, imageUrl)
 
     const authorRef = await this.resolveAuthor(note.author, bctx.userIdentity)
 
@@ -655,7 +683,19 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
         })
         return
       }
-      const body = markupToGfmMarkdown(messageMarkup, refUrl, imageUrl)
+      let body = markupToGfmMarkdown(messageMarkup, refUrl, imageUrl)
+      if (this.deps.mirrorDeps !== undefined) {
+        try {
+          body = await mirrorBodyHulyToGitlab(this.deps.mirrorDeps, body, bctx.gitlabProjectId)
+        } catch (err) {
+          ctx.logger.warn('NotesSyncManager: attachment mirror (Huly→GitLab) failed — using link-through', {
+            binding,
+            hulyRef,
+            error: err instanceof Error ? err.message : String(err)
+          })
+          ctx.logger.info('ATTACHMENT_MIRROR_FAILED', { binding, hulyRef })
+        }
+      }
       let created: SyncNote
       if (parentIsMR) {
         created = await bctx.gitlabClient.createMRNote(bctx.gitlabProjectId, resolvedIid, { body })
@@ -707,7 +747,19 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
     }
 
     if (messageMarkup !== undefined) {
-      const body = markupToGfmMarkdown(messageMarkup, refUrl, imageUrl)
+      let body = markupToGfmMarkdown(messageMarkup, refUrl, imageUrl)
+      if (this.deps.mirrorDeps !== undefined) {
+        try {
+          body = await mirrorBodyHulyToGitlab(this.deps.mirrorDeps, body, bctx.gitlabProjectId)
+        } catch (err) {
+          ctx.logger.warn('NotesSyncManager: attachment mirror (Huly→GitLab) failed — using link-through', {
+            binding,
+            hulyRef,
+            error: err instanceof Error ? err.message : String(err)
+          })
+          ctx.logger.info('ATTACHMENT_MIRROR_FAILED', { binding, hulyRef })
+        }
+      }
       if (parentIsMR) {
         await bctx.gitlabClient.updateMRNote(bctx.gitlabProjectId, issueIid, noteId, { body })
       } else {

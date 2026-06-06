@@ -2413,6 +2413,110 @@ export class GitLabClient {
     }
     throw new GitLabApiError(`namespace walk exceeded depth for project ${projectId}`, 0)
   }
+
+  /**
+   * Download a GitLab upload URL and return the raw bytes.
+   * Uses the service-account token for authentication.
+   * Returns null when the resource is not found (404).
+   */
+  async downloadUpload (url: string): Promise<Buffer | null> {
+    const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token }
+
+    return await withRateLimitRetry(async () => {
+      const res = await fetch(url, { headers })
+
+      const rlHeaders: RateLimitHeaders = {
+        'retry-after': res.headers.get('retry-after') ?? undefined,
+        'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+        'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+      }
+
+      return {
+        status: res.status,
+        headers: rlHeaders,
+        body: async () => {
+          if (res.status === 404) return null
+          if (res.status === 401 || res.status === 403) {
+            const text = await res.text()
+            throw new AuthError(`GitLab auth error ${res.status} downloading upload: ${text}`)
+          }
+          if (res.status >= 400) {
+            const text = await res.text()
+            throw new GitLabApiError(`GitLab download error ${res.status}: ${text}`, res.status, text)
+          }
+          const ab = await res.arrayBuffer()
+          return Buffer.from(ab)
+        }
+      }
+    })
+  }
+
+  /**
+   * Upload a file to a GitLab project via POST /api/v4/projects/:id/uploads.
+   * Returns the upload metadata including the markdown reference GitLab generates.
+   */
+  async uploadFile (
+    projectId: number | string,
+    filename: string,
+    bytes: Buffer
+  ): Promise<{ url: string, alt: string, markdown: string }> {
+    const boundary = `----FormBoundary${Math.random().toString(36).slice(2)}`
+
+    const filenameEncoded = encodeURIComponent(filename)
+    const bodyParts: Buffer[] = [
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filenameEncoded}"\r\nContent-Type: application/octet-stream\r\n\r\n`
+      ),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    ]
+    const body = Buffer.concat(bodyParts)
+
+    const uploadUrl = `${this.baseUrl}/api/v4/projects/${projectId}/uploads`
+    const headers: Record<string, string> = {
+      'PRIVATE-TOKEN': this.token,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': String(body.byteLength)
+    }
+
+    interface RawUploadResponse {
+      alt: string
+      url: string
+      full_path: string
+      markdown: string
+    }
+
+    return await withRateLimitRetry(async () => {
+      const res = await fetch(uploadUrl, { method: 'POST', headers, body })
+
+      const rlHeaders: RateLimitHeaders = {
+        'retry-after': res.headers.get('retry-after') ?? undefined,
+        'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+        'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+      }
+
+      return {
+        status: res.status,
+        headers: rlHeaders,
+        body: async () => {
+          if (res.status === 401 || res.status === 403) {
+            const text = await res.text()
+            throw new AuthError(`GitLab auth error ${res.status} uploading file: ${text}`)
+          }
+          if (res.status >= 400) {
+            const text = await res.text()
+            throw new GitLabApiError(`GitLab upload error ${res.status}: ${text}`, res.status, text)
+          }
+          const raw = await res.json() as RawUploadResponse
+          return {
+            url: raw.full_path ?? raw.url,
+            alt: raw.alt,
+            markdown: raw.markdown
+          }
+        }
+      }
+    })
+  }
 }
 
 /**

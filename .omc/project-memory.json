@@ -45,8 +45,8 @@
     "runtime": "Node.js 2223"
   },
   "build": {
-    "buildCommand": "npx tsc --noEmit -p tsconfig.test.json 2>&1",
-    "testCommand": "npm test 2>&1",
+    "buildCommand": "grep -rn '^<<<<<<<\\|^=======$\\|^>>>>>>>' src/ 2>&1 | head -10 && echo \"---tsc---\" && npx tsc --noEmit -p tsconfig.test.json > /tmp/tsc.out 2>&1; echo \"tsc=$?\"; tail -20 /tmp/tsc.out",
+    "testCommand": "npx eslint src/ --ext .ts > /tmp/lint.out 2>&1; echo \"lint=$?\"; tail -10 /tmp/lint.out && echo \"---tests---\" && npm test --silent --forceExit 2>&1 | tail -10",
     "lintCommand": "npm run lint",
     "devCommand": "npm run dev",
     "scripts": {
@@ -186,6 +186,12 @@
       "type": "file"
     },
     {
+      "path": "src/state/store.ts",
+      "accessCount": 5,
+      "lastAccessed": 1780729371647,
+      "type": "file"
+    },
+    {
       "path": "src/sync/mixin-migration.ts",
       "accessCount": 4,
       "lastAccessed": 1780724971896,
@@ -195,6 +201,12 @@
       "path": "src/sync/reviewer-migration.ts",
       "accessCount": 4,
       "lastAccessed": 1780725008291,
+      "type": "file"
+    },
+    {
+      "path": "src/adapter/gitlab-client.ts",
+      "accessCount": 4,
+      "lastAccessed": 1780729490743,
       "type": "file"
     },
     {
@@ -234,6 +246,18 @@
       "type": "file"
     },
     {
+      "path": "src/sync/issues.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780729307656,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/notes.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780729335308,
+      "type": "file"
+    },
+    {
       "path": "src/http/rate-limit.ts",
       "accessCount": 1,
       "lastAccessed": 1780724807487,
@@ -261,12 +285,6 @@
       "path": "src/sync/mr-review-mixin.ts",
       "accessCount": 1,
       "lastAccessed": 1780724837832,
-      "type": "file"
-    },
-    {
-      "path": "src/state/store.ts",
-      "accessCount": 1,
-      "lastAccessed": 1780724863529,
       "type": "file"
     }
   ],

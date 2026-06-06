@@ -14,6 +14,8 @@ import type { LabelCache } from './label-cache'
 import type { MilestoneCache } from './milestone-cache'
 import { mapHulyStatus, mapRemoteState } from './status-map'
 import type { BindingRef, SyncContext, SyncManager } from './types'
+import type { MirrorDeps } from './attachments'
+import { mirrorBodyGitlabToHuly, mirrorBodyHulyToGitlab } from './attachments'
 import { withOriginatedMarker } from './originated-marker'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
@@ -159,6 +161,12 @@ export interface IssuesSyncManagerDeps {
   enqueuer?: BackfillEnqueuer
   /** Function form preferred for new wiring */
   backfillEnqueuer?: BackfillEnqueuerFn
+  /**
+   * Optional attachment mirror deps. When present, GitLab upload links in issue
+   * descriptions are mirrored into Huly (and vice versa). When absent or when
+   * mirror fails, the original link is preserved (link-through fallback).
+   */
+  mirrorDeps?: MirrorDeps
 }
 
 /**
@@ -217,7 +225,27 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
     // Translate description (markdown → markup) once
     const refUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}/-/issues`
     const imageUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}`
-    const descriptionMarkup = gfmMarkdownToMarkup(syncIssue.description ?? '', refUrl, imageUrl)
+
+    let rawDescription = syncIssue.description ?? ''
+    if (this.deps.mirrorDeps !== undefined) {
+      try {
+        rawDescription = await mirrorBodyGitlabToHuly(
+          this.deps.mirrorDeps,
+          rawDescription,
+          bctx.gitlabBaseUrl,
+          bctx.gitlabProjectPath
+        )
+      } catch (err) {
+        ctx.logger.warn('IssuesSyncManager: attachment mirror failed — using link-through', {
+          binding,
+          iid: syncIssue.iid,
+          error: err instanceof Error ? err.message : String(err)
+        })
+        ctx.logger.info('ATTACHMENT_MIRROR_FAILED', { binding, iid: syncIssue.iid })
+      }
+    }
+
+    const descriptionMarkup = gfmMarkdownToMarkup(rawDescription, refUrl, imageUrl)
 
     // Resolve assignee (first assignee mapped; multi-assignee not modelled in tracker.Issue.assignee)
     const assigneeRef = await this.resolveAssignee(syncIssue.assignees, bctx.userIdentity)
@@ -398,9 +426,22 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
       ? (mapHulyStatus(projectKey, statusRef, bctx.statuses) === 'closed' ? 'close' : 'reopen')
       : undefined
 
-    const description = descriptionMarkup !== undefined
+    let description = descriptionMarkup !== undefined
       ? markupToGfmMarkdown(descriptionMarkup, refUrl, imageUrl)
       : undefined
+
+    if (description !== undefined && this.deps.mirrorDeps !== undefined) {
+      try {
+        description = await mirrorBodyHulyToGitlab(this.deps.mirrorDeps, description, bctx.gitlabProjectId)
+      } catch (err) {
+        ctx.logger.warn('IssuesSyncManager: attachment mirror (Huly→GitLab) failed — using link-through', {
+          binding,
+          hulyRef,
+          error: err instanceof Error ? err.message : String(err)
+        })
+        ctx.logger.info('ATTACHMENT_MIRROR_FAILED', { binding, hulyRef })
+      }
+    }
 
     if (mapping === null) {
       // CREATE on GitLab side

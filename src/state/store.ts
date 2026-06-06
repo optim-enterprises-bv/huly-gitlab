@@ -7,6 +7,7 @@ import type { InflightDoc } from './inflight'
 import type { CredentialDoc } from './credentials'
 import type { OAuthStateDoc } from './oauth-state'
 import type { UserCredentialDoc } from './user-credentials'
+import type { AttachmentMirrorDoc } from './attachment-mirror'
 
 export interface DismissedSuggestionDoc {
   workspaceUuid: string
@@ -78,6 +79,10 @@ export class Store {
     return this.getDb().collection<DismissedSuggestionDoc>('dismissed_suggestions')
   }
 
+  attachmentMirror (): Collection<AttachmentMirrorDoc> {
+    return this.getDb().collection<AttachmentMirrorDoc>('attachment_mirror')
+  }
+
   private async createIndexes (): Promise<void> {
     const db = this.getDb()
 
@@ -141,6 +146,12 @@ export class Store {
     await db.collection('dismissed_suggestions').createIndex(
       { workspaceUuid: 1, hulyPersonUuid: 1, bindingId: 1, mrIid: 1, noteId: 1 },
       { unique: true, name: 'dismissed_suggestions_unique' }
+    )
+
+    // attachment_mirror: unique per (contentHash, origin) — dedupe key
+    await db.collection('attachment_mirror').createIndex(
+      { contentHash: 1, origin: 1 },
+      { unique: true, name: 'attachment_mirror_hash_origin' }
     )
   }
 }
