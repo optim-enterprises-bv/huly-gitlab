@@ -211,6 +211,206 @@ curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/re-register-we
 
 ---
 
+### PATCH /api/v1/bindings/:id
+
+Update binding configuration (currently supports the `disabled` toggle). Used to pause a binding before running the reviewer-label migration.
+
+**Request:**
+```bash
+curl -X PATCH http://localhost:3600/api/v1/bindings/binding-id-123 \
+  -H "Authorization: Bearer ${SERVER_SECRET}" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled": true}'
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- `disabled` (boolean, required) — Set to `true` to pause sync; `false` to resume.
+
+**Response:**
+```json
+{
+  "bindingId": "binding-id-123",
+  "disabled": true,
+  "updatedAt": "2026-06-05T10:30:00Z"
+}
+```
+
+**Response fields:**
+- `bindingId` (string) — The updated binding
+- `disabled` (boolean) — Current disabled state
+- `updatedAt` (ISO 8601 string) — Timestamp of the update
+
+**Status Codes:**
+- `200` — Binding updated successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId) or invalid request body
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+
+**Notes:**
+- **Pause before migration:** The reviewer-label migration endpoint (`POST /api/v1/bindings/:id/migrate-reviewer-labels`) requires the binding to be disabled (`disabled: true`) before migration runs to prevent sync writes during label conversion.
+- **Idempotent:** Setting `disabled: true` when already disabled (or `disabled: false` when already enabled) is safe and returns `200`.
+- **See also:** [Phase 3 Migration Runbook](../docs/phase3-runbook.md) for the full operator workflow.
+
+---
+
+### POST /api/v1/bindings/:id/migrate-mixin-split
+
+Migrate Phase 4 monolithic `gitlab-mr` mixin to Phase 5 split `gitlab-mr-core` + `gitlab-mr-review` mixins. **Requires the binding to be paused (`disabled: true`) before execution.** This is a one-shot operation per binding; running on an already-migrated binding is safe (idempotent).
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/migrate-mixin-split \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- Empty (POST with no body)
+
+**Response (success):**
+```json
+{
+  "migratedAt": "2026-06-06T10:00:00Z",
+  "mrsScanned": 156,
+  "splitsPerformed": 156,
+  "coreFieldsMoved": 1092,
+  "reviewFieldsMoved": 1404
+}
+```
+
+**Response fields:**
+- `migratedAt` (ISO 8601 string) — Timestamp of the migration
+- `mrsScanned` (integer) — Number of mirrored MR Issues examined
+- `splitsPerformed` (integer) — Number of MR documents split into two mixins
+- `coreFieldsMoved` (integer) — Total Phase 2–5 core fields migrated
+- `reviewFieldsMoved` (integer) — Total Phase 3–5 review fields migrated
+
+**Response (conflict):**
+```json
+{
+  "error": "binding_active",
+  "message": "Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running migration; re-enable after.",
+  "timestamp": "2026-06-06T10:00:00Z"
+}
+```
+
+**Status Codes:**
+- `200` — Migration completed successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId)
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+- `409` — Binding is active (`disabled !== true`); pause before retrying
+
+**Notes:**
+- **Idempotent and safe:** Re-running migration on an already-migrated binding is safe. Attempting to split an already-split mixin returns 200 with `splitsPerformed: 0`.
+- **Phase 4 → Phase 5 migration:** All existing Phase 4 bindings carrying monolithic `gitlab-mr` mixin are migrated by this endpoint. Phase 5 bindings ship with split mixins by default.
+- **Operator workflow:** See [Phase 5 Migration Runbook](../docs/phase5-runbook.md) for the recommended sequence:
+  1. Pause: `PATCH /api/v1/bindings/:id {disabled: true}`
+  2. Migrate: `POST /api/v1/bindings/:id/migrate-mixin-split`
+  3. Resume: `PATCH /api/v1/bindings/:id {disabled: false}`
+
+---
+
+### POST /api/v1/bindings/:id/migrate-reviewer-labels
+
+Migrate Phase 2 synthetic reviewer labels to Phase 3 typed `reviewers` field. **Requires the binding to be paused (`disabled: true`) before execution.** This is a one-shot operation per binding; running on an already-migrated binding is safe (idempotent).
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/migrate-reviewer-labels \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- Empty (POST with no body)
+
+**Response (success):**
+```json
+{
+  "migratedAt": "2026-06-05T10:35:00Z",
+  "mrsScanned": 42,
+  "labelsStripped": 87,
+  "reviewersResolved": 87,
+  "unresolvedCount": 0
+}
+```
+
+**Response fields:**
+- `migratedAt` (ISO 8601 string) — Timestamp of the migration
+- `mrsScanned` (integer) — Number of mirrored MR Issues examined
+- `labelsStripped` (integer) — Number of `gitlab:reviewer:*` labels removed
+- `reviewersResolved` (integer) — Number of labels successfully mapped to PersonUuids
+- `unresolvedCount` (integer) — Number of labels that could not be resolved to Huly persons (best-effort migration; these reviewers are dropped)
+
+**Response (conflict):**
+```json
+{
+  "error": "binding_active",
+  "message": "Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running migration; re-enable after.",
+  "timestamp": "2026-06-05T10:35:00Z"
+}
+```
+
+**Status Codes:**
+- `200` — Migration completed successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId)
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+- `409` — Binding is active (`disabled !== true`); pause before retrying
+
+**Notes:**
+- **Idempotent and safe:** Re-running migration on an already-migrated binding is safe. Labels already converted will be re-stripped; `reviewersResolved` will be lower on second run (labels already gone).
+- **Unresolved reviewers:** If a `gitlab:reviewer:*` label maps to a GitLab user who has no Huly identity, the label is still stripped but the reviewer is not added to the typed `reviewers` field. Check `unresolvedCount` in the response; manual cleanup via GitLab may be needed for those cases.
+- **Operator workflow:** See [Phase 3 Migration Runbook](../docs/phase3-runbook.md) for the recommended sequence:
+  1. Pause: `PATCH /api/v1/bindings/:id {disabled: true}`
+  2. Migrate: `POST /api/v1/bindings/:id/migrate-reviewer-labels`
+  3. Resume: `PATCH /api/v1/bindings/:id {disabled: false}`
+
+---
+
+### POST /api/v1/admin/invalidate-graphql-cache
+
+Invalidate the GraphQL capability cache for all GitLab instances. Used after a GitLab upgrade or when testing GraphQL support without waiting for the 1-hour TTL.
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/admin/invalidate-graphql-cache \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Response:**
+```json
+{
+  "invalidatedAt": "2026-06-06T10:05:00Z",
+  "instancesAffected": 3,
+  "message": "GraphQL capability cache cleared for all instances"
+}
+```
+
+**Response fields:**
+- `invalidatedAt` (ISO 8601 string) — Timestamp of the cache invalidation
+- `instancesAffected` (integer) — Number of GitLab instances with cached capabilities cleared
+- `message` (string) — Status message
+
+**Status Codes:**
+- `200` — Cache invalidated successfully
+- `401` — Invalid or missing `Authorization` header
+
+**Notes:**
+- **Effect:** The next composite query (getMR + approvals + rules + iteration) will perform fresh GraphQL capability detection. If GraphQL is available, it will be used; otherwise falls back to REST.
+- **Typical use:** After GitLab upgrade or maintenance window when GraphQL support status may have changed.
+- **No disruption:** Invalidation does not affect in-flight requests; only new capability checks are affected.
+
+---
+
 ## OAuth Flow
 
 ### GET /oauth/start
@@ -348,6 +548,265 @@ curl http://localhost:3600/api/v1/credentials \
 - `401` — Invalid or missing `Authorization` header
 
 **Security Note:** Plaintext tokens, ciphertexts, and IVs are not returned in this response.
+
+---
+
+## Phase 4: Per-User OAuth Endpoints
+
+### GET /user/oauth/start
+
+Initiate OAuth flow for a Huly user to link their per-user GitLab credentials. **Cookie-protected; rate-limited.**
+
+**Request:**
+```bash
+curl -i http://localhost:3600/user/oauth/start \
+  -H "Cookie: huly-user=<huly-user-cookie>"
+```
+
+**Headers:**
+- `Cookie: huly-user` — Required. JSON+HMAC cookie containing `hulyPersonUuid` and `workspaceUuid`.
+
+**Query Parameters:**
+- `gitlabBaseUrl` (string, optional) — GitLab instance URL (default: `GITLAB_BASE_URL` env). Used for multi-instance bindings.
+
+**Response:**
+```
+HTTP/1.1 302 Found
+Location: https://gitlab.example.com/oauth/authorize?client_id=...&state=...&code_challenge=...
+```
+
+**Status Codes:**
+- `302` — Redirect to GitLab OAuth authorize endpoint
+- `400` — Invalid or malformed cookie
+- `401` — Cookie validation failed (invalid HMAC or expired)
+- `429` — Rate limit exceeded (5 req/min per IP)
+
+**Security:**
+- Cookie is HMAC-validated on the server; no token in query string.
+- PKCE challenge is generated server-side and stored in transient state.
+- Caller MUST follow the 302 redirect to complete OAuth flow.
+
+---
+
+### GET /user/oauth/callback
+
+OAuth callback endpoint invoked by GitLab after user grants permission. **Public (no auth required); state-validated.**
+
+**Request:**
+```bash
+GET /user/oauth/callback?code=...&state=...
+```
+
+**Query Parameters:**
+- `code` (string, required) — OAuth authorization code from GitLab
+- `state` (string, required) — PKCE state parameter (validates `code_challenge`)
+- `error` (string, optional) — GitLab error code if user declined
+
+**Response (success):**
+```
+HTTP/1.1 302 Found
+Location: /user/ui/?status=linked&username=@gitlab-username
+Set-Cookie: huly-user=...; HttpOnly; SameSite=Lax
+```
+
+**Response (error):**
+```
+HTTP/1.1 302 Found
+Location: /user/ui/?status=error&message=oauth_denied
+```
+
+**Status Codes:**
+- `302` — Redirect to `/user/ui/` UI (always 302, even on error)
+- `400` — Invalid state or missing code parameter
+
+**Flow:**
+1. Validate PKCE state (prevents CSRF; stored server-side during `/user/oauth/start`)
+2. Exchange `code` for `access_token` via GitLab token endpoint
+3. Call `GET /api/v4/user` to fetch GitLab username
+4. Encrypt and store token + username in `user_credentials` collection (keyed by `(workspaceUuid, hulyPersonUuid, gitlabBaseUrl)`)
+5. Redirect to `/user/ui/` with success status
+
+---
+
+### GET /user/oauth/status
+
+Get current OAuth status for the authenticated user. **Cookie-protected.**
+
+**Request:**
+```bash
+curl http://localhost:3600/user/oauth/status \
+  -H "Cookie: huly-user=<huly-user-cookie>"
+```
+
+**Headers:**
+- `Cookie: huly-user` — Required
+
+**Query Parameters:**
+- `gitlabBaseUrl` (string, optional) — GitLab instance URL (default: `GITLAB_BASE_URL`). Use for multi-instance bindings.
+
+**Response (linked):**
+```json
+{
+  "status": "linked",
+  "username": "@gitlab-username",
+  "gitlabBaseUrl": "https://gitlab.example.com",
+  "createdAt": "2026-06-05T10:00:00Z",
+  "expiresAt": "2026-06-08T10:00:00Z"
+}
+```
+
+**Response (not linked):**
+```json
+{
+  "status": "not_linked",
+  "gitlabBaseUrl": "https://gitlab.example.com"
+}
+```
+
+**Response (expired):**
+```json
+{
+  "status": "expired",
+  "username": "@gitlab-username",
+  "expiresAt": "2026-06-05T10:00:00Z",
+  "message": "Token expired; relink required"
+}
+```
+
+**Status Codes:**
+- `200` — Status retrieved successfully
+- `400` — Invalid or malformed cookie
+- `401` — Cookie validation failed
+
+---
+
+### DELETE /user/oauth/credential
+
+Unlink a per-user GitLab credential. **Cookie-protected.**
+
+**Request:**
+```bash
+curl -X DELETE http://localhost:3600/user/oauth/credential \
+  -H "Cookie: huly-user=<huly-user-cookie>"
+```
+
+**Query Parameters:**
+- `gitlabBaseUrl` (string, optional) — GitLab instance URL (default: `GITLAB_BASE_URL`)
+
+**Response:**
+```json
+{
+  "status": "unlinked",
+  "gitlabBaseUrl": "https://gitlab.example.com",
+  "timestamp": "2026-06-05T10:05:00Z"
+}
+```
+
+**Status Codes:**
+- `200` — Credential deleted successfully
+- `400` — Invalid or malformed cookie
+- `401` — Cookie validation failed
+- `404` — No credential found for this user/instance pair
+
+---
+
+### GET /user/ui/
+
+Minimal OAuth UI for linking/unlinking GitLab credentials. **Public endpoint; returns static HTML + vanilla JS.**
+
+**Request:**
+```bash
+curl http://localhost:3600/user/ui/
+```
+
+**Response:**
+```html
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Security-Policy: default-src 'none'; script-src 'wasm-unsafe-eval'; style-src 'unsafe-inline'
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GitLab Credential Manager</title>
+  <style>
+    /* minimal inline CSS; no external resources */
+  </style>
+</head>
+<body>
+  <!-- Vanilla HTML + JS; no build step required -->
+  <div id="app">
+    <h1>Link GitLab Credential</h1>
+    <p id="status">Loading...</p>
+    <button id="linkBtn" onclick="linkGitlab()">Link GitLab</button>
+    <button id="unlinkBtn" style="display:none" onclick="unlinkGitlab()">Unlink</button>
+  </div>
+  <script>
+    // Vanilla JS; bearer token arrives via postMessage or sessionStorage only
+    // Query-string bearer is REJECTED
+  </script>
+</body>
+</html>
+```
+
+**Security Headers:**
+- `Content-Security-Policy: default-src 'none'; script-src 'wasm-unsafe-eval'; style-src 'unsafe-inline'` — Prevents inline-script bearer exfiltration; no external resources
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: SAMEORIGIN`
+
+**Bearer Token Transport (Bug-6):**
+- The UI expects the Huly parent window to call `iframe.postMessage({bearer: 'token'}, origin)` to pass credentials
+- Alternatively, credentials are read from `sessionStorage.getItem('huly:bearer')`
+- **Query-string bearer is explicitly REJECTED** at the UI layer (`location.search` is not consulted for tokens)
+
+---
+
+## Epic Webhook Events (Phase 4)
+
+Webhook subscriptions expand in Phase 4 to include `epic_events` on EE instances:
+
+### POST /webhook/:bindingId (Epic Hook)
+
+GitLab epic webhook event receiver. **Invoked by GitLab, not directly by administrators.**
+
+**Request (example: Epic Hook):**
+```
+POST /webhook/binding-id-123 HTTP/1.1
+Host: your-host:3600
+X-Gitlab-Token: webhook-secret-here
+X-Gitlab-Event: Epic Hook
+Content-Type: application/json
+
+{
+  "object_kind": "epic",
+  "event_type": "epic",
+  "action": "open",
+  "object_attributes": {
+    "iid": 5,
+    "group_id": 42,
+    "title": "Q2 Planning",
+    "state": "opened",
+    "updated_at": "2026-06-05T10:00:00Z",
+    "url": "https://gitlab.example/groups/team/-/epics/5",
+    ...
+  }
+}
+```
+
+**Webhook Event Subscription (Phase 4 addition):**
+- `epic_events` — Epic creation, update, open/close (EE only)
+
+**Processing:**
+- Signature validation via `crypto.timingSafeEqual`
+- Deduplication check
+- Enqueued to SyncEngine via `EpicsSyncManager`
+- On CE (Community Edition): epic events are silently dropped with `ee.feature.skipped` metric
+
+**Status Codes:**
+- `200` — Event queued for processing
+- `401` — Signature validation failed
+- `404` — Binding not found
+- `503` — Feature unavailable (CE instance; epic_events ignored)
 
 ---
 

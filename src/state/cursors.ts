@@ -1,6 +1,6 @@
 import { type Collection } from 'mongodb'
 
-export type CursorKind = 'issues' | 'notes' | 'merge_requests' | 'pipelines'
+export type CursorKind = 'issues' | 'notes' | 'merge_requests' | 'pipelines' | 'reviews' | 'epics' | 'iterations'
 
 export interface CursorDoc {
   bindingId: string

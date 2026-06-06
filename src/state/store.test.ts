@@ -222,6 +222,27 @@ describe('Cursors upsert', () => {
     expect((await getCursor(store.cursors(), 'bind-4', 'merge_requests'))?.getTime()).toBe(ts1.getTime())
     expect((await getCursor(store.cursors(), 'bind-4', 'pipelines'))?.getTime()).toBe(ts2.getTime())
   })
+
+  it('upserts and retrieves a reviews cursor', async () => {
+    const ts = new Date('2025-07-01T00:00:00Z')
+    await setCursor(store.cursors(), 'bind-5', 'reviews', ts)
+    const result = await getCursor(store.cursors(), 'bind-5', 'reviews')
+    expect(result?.getTime()).toBe(ts.getTime())
+  })
+
+  it('upserts and retrieves an epics cursor', async () => {
+    const ts = new Date('2025-08-01T00:00:00Z')
+    await setCursor(store.cursors(), 'bind-6', 'epics', ts)
+    const result = await getCursor(store.cursors(), 'bind-6', 'epics')
+    expect(result?.getTime()).toBe(ts.getTime())
+  })
+
+  it('upserts and retrieves an iterations cursor', async () => {
+    const ts = new Date('2025-09-01T00:00:00Z')
+    await setCursor(store.cursors(), 'bind-6', 'iterations', ts)
+    const result = await getCursor(store.cursors(), 'bind-6', 'iterations')
+    expect(result?.getTime()).toBe(ts.getTime())
+  })
 })
 
 describe('IdMap bidirectional lookup', () => {
@@ -301,6 +322,51 @@ describe('IdMap bidirectional lookup', () => {
     const mr = await findByGitlab(store.idmap(), 'ws-x', 'merge_request', '42')
     expect(issue?.hulyRef).toBe('huly-issue-42')
     expect(mr?.hulyRef).toBe('huly-mr-42')
+  })
+
+  it('upserts review_thread kind and finds by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-rt', 'review_thread', 'disc-abc', 'chunter.class.Thread', 'huly-thread-abc')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-rt', 'review_thread', 'disc-abc')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-thread-abc')
+    expect(byGitlab?.hulyClass).toBe('chunter.class.Thread')
+    const byHuly = await findByHuly(store.idmap(), 'ws-rt', 'chunter.class.Thread', 'huly-thread-abc')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('disc-abc')
+    expect(byHuly?.gitlabKind).toBe('review_thread')
+  })
+
+  it('upserts epic kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-ep', 'epic', '7', 'tracker.class.Epic', 'huly-epic-7')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-ep', 'epic', '7')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-epic-7')
+    expect(byGitlab?.gitlabKind).toBe('epic')
+    const byHuly = await findByHuly(store.idmap(), 'ws-ep', 'tracker.class.Epic', 'huly-epic-7')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('7')
+  })
+
+  it('upserts iteration kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-it', 'iteration', '55', 'tracker.class.Sprint', 'huly-iter-55')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-it', 'iteration', '55')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-iter-55')
+    expect(byGitlab?.gitlabKind).toBe('iteration')
+    const byHuly = await findByHuly(store.idmap(), 'ws-it', 'tracker.class.Sprint', 'huly-iter-55')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('55')
+  })
+
+  it('upserts approval_rule kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-ar', 'approval_rule', '12', 'tracker.class.ApprovalRule', 'huly-ar-12')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-ar', 'approval_rule', '12')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-ar-12')
+    expect(byGitlab?.gitlabKind).toBe('approval_rule')
+    const byHuly = await findByHuly(store.idmap(), 'ws-ar', 'tracker.class.ApprovalRule', 'huly-ar-12')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('12')
   })
 })
 

@@ -1,3 +1,12 @@
+/**
+ * Phase 3 mixin-change-payload shape (verified P3-T-01b 2026-06-06):
+ *   client.updateMixin(... MR_MIXIN, { approvedBy }) fires applyLocal with
+ *   change carrying FLAT keys at the top level (matches Phase 2 convention).
+ * applyLocal reads typed Phase 3 deltas via:
+ *   change.approvedBy as PersonUuid[] | undefined
+ *   change.reviewers  as PersonUuid[] | undefined
+ * (NOT change['gitlab-mr.X'] — see Phase 3 plan §B3 / Path B.)
+ */
 import type {
   Doc,
   PersonUuid,
@@ -8,19 +17,47 @@ import type {
 } from '@hcengineering/core'
 import tracker, { type Issue, IssuePriority, type Status, type TaskType } from '@hcengineering/tracker'
 import type { TagElement } from '@hcengineering/tags'
-import { deepEqual } from 'fast-equals'
 import type { GitLabClient } from '../adapter/gitlab-client'
-import type { SyncMergeRequest } from '../adapter/types'
+import type {
+  SyncMergeRequest,
+  SyncMRApprovals,
+  SyncMRChanges
+} from '../adapter/types'
 import { gfmMarkdownToMarkup, markupToGfmMarkdown } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
-import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
+import { prefixGitlabIdForMultiInstance } from './multi-instance'
+import type { UserIdentity } from '../huly/users'
 import { applyLwwFieldByField, type FieldDecision, type FieldVersion } from './conflict'
 import type { LabelCache } from './label-cache'
 import type { MilestoneCache } from './milestone-cache'
-import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
+import { readMRMixinAttributes } from './mr-mixin'
+import { MR_CORE_MIXIN, type MRCoreMixinDoc } from './mr-core-mixin'
+import { MR_REVIEW_MIXIN_DOC, type MRReviewMixinDoc } from './mr-review-mixin-doc'
 import { mapHulyStatusToMRStateEvent, mapRemoteMRState } from './mr-status-map'
 import type { BindingRef, SyncContext, SyncManager } from './types'
+import {
+  APPROVAL_RACE_WINDOW_MS,
+  applyApprovalActions,
+  buildCoreFromSyncMR,
+  buildReviewFromSyncMR,
+  type MRCredentialResolver
+} from './mr-approvals'
+import { withOriginatedMarker } from './originated-marker'
+import {
+  areEqual,
+  ensureRemoteLabels,
+  parseIid,
+  resolveAssignee,
+  resolveLocalLabels,
+  resolveReviewerUuids,
+  stripDocPrefix
+} from './mr-helpers'
+export {
+  getApprovalServiceAccountFallbackCount,
+  resetApprovalServiceAccountFallbackCount,
+  type MRCredentialResolver
+} from './mr-approvals'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 
@@ -29,9 +66,16 @@ export { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
 /**
  * Minimal binding shape needed for resolution. The real `BindingDoc` from state/bindings.ts
  * satisfies this structurally.
+ *
+ * B1: optional `gitlabBaseUrl` + `isMultiInstanceWorkspace` allow callers in
+ * multi-instance workspaces to prefix the idmap gitlabId via
+ * `prefixGitlabIdForMultiInstance` and avoid cross-instance projectId collisions.
+ * When omitted (the common single-instance case) the raw key is used unchanged.
  */
 export interface MRBindingResolverInput {
   gitlabProjectId: number
+  gitlabBaseUrl?: string
+  isMultiInstanceWorkspace?: boolean
 }
 
 /**
@@ -45,7 +89,13 @@ export async function resolveMRRef (
   binding: MRBindingResolverInput,
   mrIid: number
 ): Promise<Ref<Issue> | undefined> {
-  const gitlabId = `${binding.gitlabProjectId}:${mrIid}`
+  const rawId = `${binding.gitlabProjectId}:${mrIid}`
+  const gitlabId = (binding.isMultiInstanceWorkspace === true && binding.gitlabBaseUrl !== undefined)
+    ? prefixGitlabIdForMultiInstance({
+      isMultiInstanceWorkspace: true,
+      gitlabBaseUrl: binding.gitlabBaseUrl
+    }, rawId)
+    : rawId
   const mapping = await findByGitlab(ctx.store.idmap(), ctx.workspaceUuid, 'merge_request', gitlabId)
   if (mapping === null) return undefined
   return mapping.hulyRef as Ref<Issue>
@@ -70,6 +120,26 @@ export interface MRBindingContext {
   defaultTaskType: Ref<TaskType>
   /** Absolute base URL used to resolve relative attachment links in markdown. */
   gitlabBaseUrl: string
+  /**
+   * Per-actor credential resolver — stub in Phase 3 (always returns
+   * undefined). P3-T-10 wires the real implementation.
+   */
+  credentials: MRCredentialResolver
+  /**
+   * B1: true when ≥ 2 distinct GitLab base URLs are registered for this workspace.
+   * When true, `findByGitlab`/`upsertIdMap` calls in this manager prefix the
+   * gitlabId via `prefixGitlabIdForMultiInstance` to prevent project-ID collisions
+   * between GitLab instances (TG-4 defense-in-depth).
+   */
+  isMultiInstanceWorkspace?: boolean
+  /**
+   * Task 2: Optional pre-resolved project full path (e.g. "group/project").
+   * When present, getMergeRequest / listMergeRequestsWithApprovals / listEpicsWithChildren
+   * can engage the single-roundtrip GraphQL path instead of falling back to REST due
+   * to a numeric projectId. Lazily populated on first composite call via getProject REST.
+   * Cached here to avoid repeat lookups within the same binding lifetime.
+   */
+  resolvedProjectPath?: string
 }
 
 /** Loader callback — engine returns the per-binding context. */
@@ -96,6 +166,31 @@ export interface MRGitLabClient {
   createLabel: GitLabClient['createLabel']
   listMilestones: GitLabClient['listMilestones']
   createMilestone: GitLabClient['createMilestone']
+  /** Phase 3 (P3-T-07): two-way approval actions. */
+  approveMR: (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ) => Promise<void>
+  unapproveMR: (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ) => Promise<void>
+  /** Phase 3 (P3-T-07): composite enrichment helpers. */
+  getMRApprovals: (
+    projectId: number | string,
+    mrIid: number
+  ) => Promise<SyncMRApprovals>
+  getMRChanges: (
+    projectId: number | string,
+    mrIid: number,
+    fallbackWebUrl?: string
+  ) => Promise<SyncMRChanges>
+  /** Task 2: resolve project by numeric id to get the full path. */
+  getProject: GitLabClient['getProject']
+  /** Task 2: single-roundtrip composite MR fetch (uses GraphQL when path known). */
+  getMergeRequest: GitLabClient['getMergeRequest']
 }
 
 export interface UpdateMRBody {
@@ -188,7 +283,10 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     syncMR: SyncMergeRequest
   ): Promise<void> {
     const bctx = await this.deps.loadBinding(binding)
-    const gitlabId = `${bctx.gitlabProjectId}:${syncMR.iid}`
+    const gitlabId = prefixGitlabIdForMultiInstance(
+      { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+      `${bctx.gitlabProjectId}:${syncMR.iid}`
+    )
 
     const existing = await findByGitlab(ctx.store.idmap(), bctx.workspaceUuid, 'merge_request', gitlabId)
 
@@ -196,10 +294,13 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     const imageUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}`
     const descriptionMarkup = gfmMarkdownToMarkup(syncMR.description ?? '', refUrl, imageUrl)
 
-    const assigneeRef = await this.resolveAssignee(syncMR.assignees, bctx.userIdentity)
-    const reviewerLabels = await this.resolveReviewerLabels(syncMR.reviewers, bctx)
-    const baseLabels = await this.resolveLocalLabels(syncMR.labels, bctx)
-    const labelRefs = [...baseLabels, ...reviewerLabels]
+    const assigneeRef = await resolveAssignee(syncMR.assignees, bctx.userIdentity)
+    // Phase 3 (P3-T-07): typed reviewers replace synthetic labels.
+    // resolveReviewerLabels remains exported below for the P3-T-09 migration helper
+    // to scan, but is no longer called from applyRemote (B-C16).
+    const reviewerUuids = await resolveReviewerUuids(syncMR.reviewers, bctx.userIdentity)
+    const approvedByUuids = await resolveReviewerUuids(syncMR.approvedBy, bctx.userIdentity)
+    const labelRefs = await resolveLocalLabels(syncMR.labels, bctx.labelCache, bctx.hulyClient)
 
     const milestoneRef = syncMR.milestone !== null
       ? await bctx.milestoneCache.ensureLocalMilestone(
@@ -238,7 +339,7 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
       const issueRef = await bctx.hulyClient.createDoc<Issue>(
         tracker.class.Issue,
         bctx.hulyProjectRef,
-        {
+        withOriginatedMarker({
           title: syncMR.title,
           description: descriptionMarkup,
           status: statusRef,
@@ -248,16 +349,29 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
           milestone: milestoneRef,
           kind: bctx.defaultTaskType,
           modifiedOn: remoteTs.getTime()
-        }
+        })
       )
 
-      await bctx.hulyClient.createMixin<Issue, MRMixinDoc>(
+      // P5-T-17: split write — MR_CORE_MIXIN (always) + MR_REVIEW_MIXIN_DOC (conditional).
+      // Legacy MR_MIXIN is NOT written on new applyRemote paths; the P5-T-19 migration
+      // helper covers existing legacy data.
+      await bctx.hulyClient.createMixin<Issue, MRCoreMixinDoc>(
         issueRef,
         tracker.class.Issue,
         bctx.hulyProjectRef,
-        MR_MIXIN,
-        buildMixinCreateData(syncMR)
+        MR_CORE_MIXIN,
+        withOriginatedMarker(buildCoreFromSyncMR(syncMR))
       )
+      const reviewCreate = buildReviewFromSyncMR(syncMR, reviewerUuids, approvedByUuids)
+      if (Object.keys(reviewCreate).length > 0) {
+        await bctx.hulyClient.createMixin<Issue, MRReviewMixinDoc>(
+          issueRef,
+          tracker.class.Issue,
+          bctx.hulyProjectRef,
+          MR_REVIEW_MIXIN_DOC,
+          withOriginatedMarker(reviewCreate)
+        )
+      }
 
       await upsertIdMap(
         ctx.store.idmap(),
@@ -352,25 +466,66 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         issueRef,
-        update
+        withOriginatedMarker(update)
       )
+    }
+
+    // Phase 3: race mitigation (C10 / B6) — when remote.approvedBy is strictly
+    // smaller than the locally-known set, keep local entries IF EITHER:
+    //   (a) we are within the in-flight race window (local touched within 30s), OR
+    //   (b) the local timestamp is newer than the remote payload.
+    //
+    // B6: Previous logic required BOTH (`&&`) the race window AND
+    // `localTsMs >= remoteTsMs`. That blocked the exact race it defended:
+    // Huly write at T0, GitLab webhook at T3 carries stale state with remote ts
+    // NEWER (server clock advanced) — `localTsMs >= remoteTsMs` is false and
+    // the guard never engages. Combining via OR engages on either signal.
+    let resolvedApprovedBy: PersonUuid[] | undefined = approvedByUuids
+    if (resolvedApprovedBy !== undefined) {
+      const existingMixin = readMRMixinAttributes(hulyIssue)
+      const localApprovedBy = existingMixin?.approvedBy ?? []
+      const localTsMs = hulyIssue.modifiedOn
+      const remoteTsMs = remoteTs.getTime()
+      const withinRace = localTsMs > 0 && (Date.now() - localTsMs) < APPROVAL_RACE_WINDOW_MS
+      const localNewer = localTsMs > 0 && localTsMs >= remoteTsMs
+      if (localApprovedBy.length > resolvedApprovedBy.length && (withinRace || localNewer)) {
+        resolvedApprovedBy = localApprovedBy
+      }
     }
 
     // Mixin-carried fields are GitLab-authoritative; always overwrite (remote-wins).
     // C2: NEVER write pipelineStatus here. PipelineSyncManager owns that field.
-    await bctx.hulyClient.updateMixin<Issue, MRMixinDoc>(
+    // P5-T-17: split write — MR_CORE_MIXIN (always) + MR_REVIEW_MIXIN_DOC (conditional).
+    // Legacy MR_MIXIN is NOT written on new applyRemote paths.
+    await bctx.hulyClient.updateMixin<Issue, MRCoreMixinDoc>(
       issueRef,
       tracker.class.Issue,
       bctx.hulyProjectRef,
-      MR_MIXIN,
-      buildMixinUpdateData(syncMR)
+      MR_CORE_MIXIN,
+      withOriginatedMarker(buildCoreFromSyncMR(syncMR))
     )
+    const reviewUpdate = buildReviewFromSyncMR(syncMR, reviewerUuids, resolvedApprovedBy)
+    if (Object.keys(reviewUpdate).length > 0) {
+      await bctx.hulyClient.updateMixin<Issue, MRReviewMixinDoc>(
+        issueRef,
+        tracker.class.Issue,
+        bctx.hulyProjectRef,
+        MR_REVIEW_MIXIN_DOC,
+        withOriginatedMarker(reviewUpdate)
+      )
+    }
 
     if (localTs === undefined || remoteTs > localTs) {
       await setCursor(ctx.store.cursors(), binding, 'merge_requests', remoteTs)
     }
   }
 
+  /**
+   * NOTE (Phase 3 Path B gap): This method is reachable in production ONLY if a
+   * TxProcessor subscription is wired to call `engine.enqueueLocalEvent`.
+   * Currently no such wiring exists in `src/index.ts`. Calls from tests work
+   * fine; real Huly UI mutations do NOT trigger this path. Phase 4 work.
+   */
   async applyLocal (
     ctx: SyncContext,
     binding: BindingRef,
@@ -420,7 +575,7 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     }
 
     const labelNames = labels !== undefined
-      ? await this.ensureRemoteLabels(labels, bctx)
+      ? await ensureRemoteLabels(labels, bctx.labelCache, bctx.gitlabClient)
       : undefined
 
     let milestoneId: number | undefined
@@ -450,9 +605,34 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     if (stateEvent !== undefined) update.state_event = stateEvent
     if (targetBranch !== undefined) update.target_branch = targetBranch
 
-    if (Object.keys(update).length === 0) return
+    let touchedRemote = false
+    if (Object.keys(update).length > 0) {
+      await bctx.gitlabClient.updateMergeRequest(bctx.gitlabProjectId, iid, update)
+      touchedRemote = true
+    }
 
-    await bctx.gitlabClient.updateMergeRequest(bctx.gitlabProjectId, iid, update)
+    // Phase 3 (P3-T-07): approval action handling. Read flat keys per B3 / Path B.
+    const approvedByChange = change.approvedBy as PersonUuid[] | undefined
+    if (approvedByChange !== undefined) {
+      await applyApprovalActions(
+        ctx.logger, bctx, binding, hulyRef, iid, approvedByChange
+      )
+      touchedRemote = true
+    }
+
+    // Phase 3 (P3-T-07): Huly-side reviewer changes are NOT synced in Phase 3.
+    // GitLab is authoritative; Phase 4 will route reviewer add/remove back.
+    const reviewersChange = change.reviewers as PersonUuid[] | undefined
+    if (reviewersChange !== undefined) {
+      ctx.logger.warn('mr.reviewers.huly.unsynced', {
+        binding,
+        hulyRef,
+        iid,
+        note: 'Reviewer changes from Huly not synced; managed on GitLab.'
+      })
+    }
+
+    if (!touchedRemote) return
     await setCursor(ctx.store.cursors(), binding, 'merge_requests', new Date())
   }
 
@@ -480,123 +660,52 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     }
   }
 
-  // ---------------------------------------------------------------------------
-
-  private async resolveAssignee (
-    assignees: SyncMergeRequest['assignees'],
-    userIdentity: UserIdentity
-  ): Promise<PersonUuid | string | null> {
-    if (assignees.length === 0) return null
-    const first = assignees[0]
-    const identity: IdentitySyncUser = {
-      gitlabId: String(first.id),
-      ...(first.email !== null ? { email: first.email } : {}),
-      ...(first.name !== '' ? { name: first.name } : {}),
-      ...(first.username !== '' ? { username: first.username } : {})
-    }
-    const matched = await userIdentity.mapByGitlabUser(identity)
-    if (matched !== undefined) return matched
-    return await userIdentity.ensureStubGuest(identity)
-  }
-
-  private async resolveLocalLabels (
-    names: readonly string[],
-    bctx: MRBindingContext
-  ): Promise<Array<Ref<TagElement>>> {
-    const out: Array<Ref<TagElement>> = []
-    for (const name of names) {
-      const ref = await bctx.labelCache.ensureLocalTag(bctx.hulyClient, name)
-      out.push(ref)
-    }
-    return out
-  }
-
   /**
-   * Project reviewers onto synthetic `gitlab:reviewer:<username>` labels (critic C4).
+   * Project reviewers onto synthetic `gitlab:reviewer:<username>` labels.
    *
-   * GitLab MR reviewers do not have a typed analogue on tracker.Issue in Phase 2;
-   * we surface them as labels so they round-trip via the existing label channel.
+   * Phase 2 used this as the canonical reviewer representation (critic C4).
+   * Phase 3 stops calling it from applyRemote (typed `reviewers` field replaces
+   * the synthetic-label projection), but the function is RETAINED and exported
+   * via the manager so the reviewer-migration helper (P3-T-09) can scan and
+   * strip the legacy labels (C16).
    */
-  private async resolveReviewerLabels (
+  async resolveReviewerLabels (
     reviewers: SyncMergeRequest['reviewers'],
     bctx: MRBindingContext
   ): Promise<Array<Ref<TagElement>>> {
     const out: Array<Ref<TagElement>> = []
-    for (const r of reviewers) {
+    for (const r of reviewers ?? []) {
       const name = `gitlab:reviewer:${r.username}`
       const ref = await bctx.labelCache.ensureLocalTag(bctx.hulyClient, name)
       out.push(ref)
     }
     return out
   }
+}
 
-  private async ensureRemoteLabels (
-    labels: Array<{ name: string, color?: string }>,
-    bctx: MRBindingContext
-  ): Promise<string[]> {
-    const names: string[] = []
-    for (const l of labels) {
-      const ensured = await bctx.labelCache.ensureRemoteLabel(bctx.gitlabClient, l.name, l.color)
-      names.push(ensured.name)
-    }
-    return names
+/**
+ * Task 2: lazily resolve the GitLab project full path (e.g. "group/project")
+ * from the numeric `bctx.gitlabProjectId` via a REST `getProject` call. The
+ * result is cached on `bctx.resolvedProjectPath` so subsequent calls within
+ * the same binding context are free.
+ *
+ * Callers pass the resolved path to `getMergeRequest`, `listMergeRequestsWithApprovals`,
+ * and `listEpicsWithChildren` so those methods can engage the single-roundtrip
+ * GraphQL path instead of falling back to REST (which requires a string project path).
+ *
+ * If the REST call fails, returns the numeric id cast to string as a safe fallback
+ * (the downstream methods will still work via the REST composite path).
+ */
+export async function resolveProjectPath (bctx: MRBindingContext): Promise<string> {
+  if (bctx.resolvedProjectPath !== undefined) {
+    return bctx.resolvedProjectPath
   }
-}
-
-// ---------------------------------------------------------------------------
-// Mixin delta builders. The MRMixinDoc shape is exported from ./mr-mixin.
-// ---------------------------------------------------------------------------
-
-function buildMixinCreateData (syncMR: SyncMergeRequest): Omit<MRMixinDoc, keyof Issue> {
-  return {
-    sourceBranch: syncMR.sourceBranch,
-    targetBranch: syncMR.targetBranch,
-    draft: syncMR.draft,
-    mergedAt: syncMR.mergedAt,
-    mergeStatus: syncMR.mergeStatus,
-    webUrl: syncMR.webUrl,
-    gitlabIid: syncMR.iid,
-    gitlabProjectId: syncMR.projectId
+  try {
+    const project = await bctx.gitlabClient.getProject(bctx.gitlabProjectId)
+    bctx.resolvedProjectPath = project.pathWithNamespace
+    return bctx.resolvedProjectPath
+  } catch {
+    // Fallback: return numeric id as string (GraphQL gate won't fire but REST still works)
+    return String(bctx.gitlabProjectId)
   }
-}
-
-function buildMixinUpdateData (syncMR: SyncMergeRequest): Partial<Omit<MRMixinDoc, keyof Issue>> {
-  return {
-    sourceBranch: syncMR.sourceBranch,
-    targetBranch: syncMR.targetBranch,
-    draft: syncMR.draft,
-    mergedAt: syncMR.mergedAt,
-    mergeStatus: syncMR.mergeStatus,
-    webUrl: syncMR.webUrl
-  }
-}
-
-// ---------------------------------------------------------------------------
-
-function stripDocPrefix (doc: string): string {
-  const colon = doc.indexOf(':')
-  if (colon < 0) return doc
-  return doc.slice(colon + 1)
-}
-
-function parseIid (gitlabId: string): number | null {
-  const colon = gitlabId.indexOf(':')
-  if (colon < 0) return null
-  const n = Number.parseInt(gitlabId.slice(colon + 1), 10)
-  return Number.isFinite(n) ? n : null
-}
-
-function areEqual (a: unknown, b: unknown): boolean {
-  if (a === b) return true
-  if (Array.isArray(a) && Array.isArray(b)) {
-    if (a.length !== b.length) return false
-    const sa = new Set(a as unknown[])
-    const sb = new Set(b as unknown[])
-    if (sa.size !== sb.size) return false
-    for (const x of sa) {
-      if (!sb.has(x)) return false
-    }
-    return true
-  }
-  return deepEqual(a, b)
 }

@@ -7,6 +7,7 @@ import type { SyncIssue } from '../adapter/types'
 import { gfmMarkdownToMarkup, markupToGfmMarkdown } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
+import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import { applyLwwFieldByField, type FieldDecision, type FieldVersion } from './conflict'
 import type { LabelCache } from './label-cache'
@@ -15,6 +16,7 @@ import { mapHulyStatus, mapRemoteState } from './status-map'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import type { MirrorDeps } from './attachments'
 import { mirrorBodyGitlabToHuly, mirrorBodyHulyToGitlab } from './attachments'
+import { withOriginatedMarker } from './originated-marker'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 
@@ -24,13 +26,23 @@ const HULY_CLASS_ISSUE = 'tracker:class:Issue'
  * notes/comments to the right issue.
  *
  * Returns undefined when the issue has not yet been mirrored into Huly.
+ *
+ * B1: when the caller is in a multi-instance workspace, the gitlabId is
+ * prefixed via `prefixGitlabIdForMultiInstance` to avoid collisions across
+ * GitLab instances sharing the same numeric projectId.
  */
 export async function resolveIssueRef (
   ctx: SyncContext,
   binding: BindingResolverInput,
   gitlabIssueIid: number
 ): Promise<Ref<Issue> | undefined> {
-  const gitlabId = `${binding.gitlabProjectId}:${gitlabIssueIid}`
+  const rawId = `${binding.gitlabProjectId}:${gitlabIssueIid}`
+  const gitlabId = (binding.isMultiInstanceWorkspace === true && binding.gitlabBaseUrl !== undefined)
+    ? prefixGitlabIdForMultiInstance({
+      isMultiInstanceWorkspace: true,
+      gitlabBaseUrl: binding.gitlabBaseUrl
+    }, rawId)
+    : rawId
   const mapping = await findByGitlab(ctx.store.idmap(), ctx.workspaceUuid, 'issue', gitlabId)
   if (mapping === null) return undefined
   return mapping.hulyRef as Ref<Issue>
@@ -39,9 +51,15 @@ export async function resolveIssueRef (
 /**
  * Minimal binding shape needed for resolution. The real `BindingDoc` from state/bindings.ts
  * satisfies this structurally.
+ *
+ * B1: optional `gitlabBaseUrl` + `isMultiInstanceWorkspace` allow multi-instance
+ * callers to prefix the idmap gitlabId. When omitted (single-instance default)
+ * the raw key is used.
  */
 export interface BindingResolverInput {
   gitlabProjectId: number
+  gitlabBaseUrl?: string
+  isMultiInstanceWorkspace?: boolean
 }
 
 /**
@@ -64,6 +82,13 @@ export interface BindingContext {
   defaultTaskType: Ref<TaskType>
   /** Absolute base URL used to resolve relative attachment links in markdown */
   gitlabBaseUrl: string
+  /**
+   * B1: true when ≥ 2 distinct GitLab base URLs are registered for this
+   * workspace. When true, idmap gitlabId values are prefixed via
+   * `prefixGitlabIdForMultiInstance` to prevent project-ID collisions
+   * between GitLab instances (TG-4 defense-in-depth).
+   */
+  isMultiInstanceWorkspace?: boolean
 }
 
 /**
@@ -189,7 +214,10 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
     syncIssue: SyncIssue
   ): Promise<void> {
     const bctx = await this.deps.loadBinding(binding)
-    const gitlabId = `${bctx.gitlabProjectId}:${syncIssue.iid}`
+    const gitlabId = prefixGitlabIdForMultiInstance(
+      { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+      `${bctx.gitlabProjectId}:${syncIssue.iid}`
+    )
     const projectKey = String(bctx.gitlabProjectId)
 
     const existing = await findByGitlab(ctx.store.idmap(), bctx.workspaceUuid, 'issue', gitlabId)
@@ -253,7 +281,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
       const issueRef = await bctx.hulyClient.createDoc<Issue>(
         tracker.class.Issue,
         bctx.hulyProjectRef,
-        {
+        withOriginatedMarker({
           title: syncIssue.title,
           description: descriptionMarkup,
           status: statusRef,
@@ -263,7 +291,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
           milestone: milestoneRef,
           kind: bctx.defaultTaskType,
           modifiedOn: remoteTs
-        }
+        })
       )
       await upsertIdMap(
         ctx.store.idmap(),
@@ -342,7 +370,7 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         existing.hulyRef as Ref<Issue>,
-        update
+        withOriginatedMarker(update)
       )
     }
 
@@ -429,11 +457,15 @@ export class IssuesSyncManager implements SyncManager<SyncIssue> {
       if (stateEvent !== undefined) body.state_event = stateEvent
 
       const created = await bctx.gitlabClient.createIssue(bctx.gitlabProjectId, body)
+      const createdGitlabId = prefixGitlabIdForMultiInstance(
+        { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+        `${bctx.gitlabProjectId}:${created.iid}`
+      )
       await upsertIdMap(
         ctx.store.idmap(),
         bctx.workspaceUuid,
         'issue',
-        `${bctx.gitlabProjectId}:${created.iid}`,
+        createdGitlabId,
         HULY_CLASS_ISSUE,
         hulyRef
       )
@@ -541,7 +573,10 @@ function stripDocPrefix (doc: string): string {
 }
 
 function parseIid (gitlabId: string): number | null {
-  const colon = gitlabId.indexOf(':')
+  // B1: multi-instance keys are `${hash8}:${projectId}:${iid}`; single-instance
+  // keys are `${projectId}:${iid}`. In both cases the iid is the LAST `:`-separated
+  // segment, so parse from the rightmost colon.
+  const colon = gitlabId.lastIndexOf(':')
   if (colon < 0) return null
   const n = Number.parseInt(gitlabId.slice(colon + 1), 10)
   return Number.isFinite(n) ? n : null

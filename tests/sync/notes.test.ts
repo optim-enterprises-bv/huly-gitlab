@@ -813,3 +813,256 @@ test('P2-T-09 T7. backfill enumerates MR-note backfill for bindings with MRs', a
   const note0 = (h.enqueued[0].record as { note: SyncNote }).note
   expect(note0.noteableType).toBe('MergeRequest')
 })
+
+// ---------------------------------------------------------------------------
+// P3-T-08: line-position routing extension tests
+// NOTE (C9): these tests assert the enqueue CALL SHAPE only. Live engine wiring
+// (kind 'review' registration) lands in P3-T-10.
+// ---------------------------------------------------------------------------
+
+function makePositionWebhookPayload (overrides: {
+  noteId?: number
+  body?: string
+  headSha?: string
+  baseSha?: string
+  startSha?: string
+  positionType?: string
+  discussionId?: string
+  newLine?: number | null
+  oldLine?: number | null
+} = {}): Record<string, unknown> {
+  return {
+    object_kind: 'note',
+    object_attributes: {
+      id: overrides.noteId ?? 700,
+      body: overrides.body ?? 'Review line comment',
+      noteable_type: 'MergeRequest',
+      system: false,
+      confidential: false,
+      created_at: '2024-03-01T10:00:00.000Z',
+      updated_at: '2024-03-01T10:00:00.000Z',
+      discussion_id: overrides.discussionId ?? 'disc-abc-123',
+      author: { id: 10, username: 'user10', name: 'User 10', email: null, avatar_url: null, url: '' },
+      position: {
+        position_type: overrides.positionType ?? 'text',
+        head_sha: overrides.headSha ?? 'headabc',
+        base_sha: overrides.baseSha ?? 'baseabc',
+        start_sha: overrides.startSha ?? 'startabc',
+        new_path: 'src/foo.ts',
+        old_path: 'src/foo.ts',
+        new_line: overrides.newLine !== undefined ? overrides.newLine : 42,
+        old_line: overrides.oldLine !== undefined ? overrides.oldLine : null
+      }
+    },
+    merge_request: { iid: MR_IID }
+  }
+}
+
+test('P3-T-08 T1. position note re-enqueued with kind "review"; no ChatMessage created from notes path', async () => {
+  // Seed MR so parent is found
+  const h = buildHarness({ seedIssue: false, seedMR: true })
+  const payload = makePositionWebhookPayload()
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+
+  // No ChatMessage created via notes path
+  expect(h.huly.creates).toBe(0)
+  // Exactly one re-enqueue with kind 'review'
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.enqueued[0].kind).toBe('review')
+  // The envelope carries the discussionId
+  expect(h.enqueued[0].record.discussionId).toBe('disc-abc-123')
+  // The envelope carries the correct mergeRequestIid
+  expect(h.enqueued[0].record.mergeRequestIid).toBe(MR_IID)
+})
+
+test('P3-T-08 T2. note WITHOUT position → existing Issue/MR path (Phase 2 regression)', async () => {
+  const h = buildHarness({ seedIssue: false, seedMR: true })
+
+  const webhookPayload: Record<string, unknown> = {
+    object_kind: 'note',
+    object_attributes: {
+      id: 701,
+      body: 'Ordinary MR comment',
+      noteable_type: 'MergeRequest',
+      system: false,
+      confidential: false,
+      created_at: '2024-03-01T10:00:00.000Z',
+      updated_at: '2024-03-01T10:00:00.000Z',
+      author: { id: 10, username: 'user10', name: 'User 10', email: null, avatar_url: null, url: '' }
+      // no position field
+    },
+    merge_request: { iid: MR_IID }
+  }
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', webhookPayload)
+
+  // Existing path: ChatMessage created, nothing enqueued as review
+  expect(h.huly.creates).toBe(1)
+  expect(h.enqueued.filter(e => e.kind === 'review')).toHaveLength(0)
+})
+
+test('P3-T-08 T3 (C3). Suggestion block in body passes through verbatim in re-enqueued record', async () => {
+  const h = buildHarness({ seedIssue: false, seedMR: true })
+  const suggestionBody = '```suggestion\nconst x = 1\n```\n<<<<<<< SUGGEST\nsome suggestion\n======='
+  const payload = makePositionWebhookPayload({ noteId: 702, body: suggestionBody })
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.enqueued[0].kind).toBe('review')
+  // Body preserved verbatim in the enqueued thread's first note
+  const notes = (h.enqueued[0].record as { notes: Array<{ body: string }> }).notes
+  expect(notes).toHaveLength(1)
+  expect(notes[0].body).toBe(suggestionBody)
+})
+
+test('P3-T-08 T4. position_type != "text" (e.g. "image") → falls through to notes path, not review path', async () => {
+  const h = buildHarness({ seedIssue: false, seedMR: true })
+  const payload = makePositionWebhookPayload({ noteId: 703, positionType: 'image' })
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+
+  // image-position notes route via notes path (not re-enqueued as review)
+  expect(h.enqueued.filter(e => e.kind === 'review')).toHaveLength(0)
+  // The MR parent is seeded, so a ChatMessage gets created
+  expect(h.huly.creates).toBe(1)
+})
+
+test('P3-T-08 T5 (C13). Body edit + resolved flip simultaneously: notes path handles body; review guard returns on kind=review', async () => {
+  // When a change arrives with both body update and kind='review', applyLocal
+  // returns early so ReviewThreadsSyncManager handles the resolution flip.
+  // Separately, a change without kind='review' but with a body update is handled by the notes path.
+  const h = buildHarness()
+
+  // Seed an existing note mapping for a review_thread (gitlabKind = 'review_thread')
+  const noteId = 800
+  const gitlabNoteId = `${PROJECT_ID}:${noteId}`
+  const hulyRef = 'huly-msg-review-thread'
+  await h.idmap.updateOne(
+    { workspaceUuid: WORKSPACE, gitlabKind: 'review_thread', gitlabId: gitlabNoteId },
+    { $set: { workspaceUuid: WORKSPACE, gitlabKind: 'review_thread', gitlabId: gitlabNoteId, hulyClass: 'chunter.class.ChatMessage', hulyRef } }
+  )
+
+  // Change with kind='review' → notes path returns immediately (review manager handles resolved flip)
+  await h.manager.applyLocal(h.ctx, 'binding-1', `note:${hulyRef}`, {
+    kind: 'review',
+    resolved: true,
+    message: 'Updated body text'
+  })
+  // No GitLab API calls from notes path
+  expect(h.gitlab.updateNote).not.toHaveBeenCalled()
+  expect(h.gitlab.updateMRNote).not.toHaveBeenCalled()
+
+  // Change without kind='review' but mapping is review_thread → also skipped by notes path
+  // (ReviewThreadsSyncManager owns review_thread entries)
+  await h.manager.applyLocal(h.ctx, 'binding-1', `note:${hulyRef}`, {
+    message: 'Body update for review thread'
+  })
+  expect(h.gitlab.updateNote).not.toHaveBeenCalled()
+  expect(h.gitlab.updateMRNote).not.toHaveBeenCalled()
+})
+
+test('P3-T-08 T6 (C14). Deferred review retry: position note arrives before parent MR → _reviewRetried set; second arrival with MR present → re-enqueue with kind "review"', async () => {
+  // First attempt: MR not seeded → deferred as note with _reviewRetried=true
+  const h = buildHarness({ seedIssue: false, seedMR: false })
+  const payload = makePositionWebhookPayload({ noteId: 900 })
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+
+  // Should be deferred back as 'note' (not review yet — parent missing)
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.enqueued[0].kind).toBe('note')
+  expect(h.enqueued[0].record._reviewRetried).toBe(true)
+  expect(h.huly.creates).toBe(0)
+
+  // Now seed the MR and retry
+  await h.idmap.updateOne(
+    { workspaceUuid: WORKSPACE, gitlabKind: 'merge_request', gitlabId: MR_GITLAB_ID },
+    { $set: { workspaceUuid: WORKSPACE, gitlabKind: 'merge_request', gitlabId: MR_GITLAB_ID, hulyClass: 'tracker:class:Issue', hulyRef: MR_REF } }
+  )
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', h.enqueued[0].record)
+
+  // Second attempt: MR now present → enqueued as 'review'
+  expect(h.enqueued).toHaveLength(2)
+  expect(h.enqueued[1].kind).toBe('review')
+  // _reviewRetried propagated into the review envelope
+  expect(h.enqueued[1].record._reviewRetried).toBe(true)
+})
+
+test('P3-T-08 T7 (C14). Deferred drop: position note + parent still missing on retry → dropped, review.parent.missing metric logged', async () => {
+  const h = buildHarness({ seedIssue: false, seedMR: false })
+  const warn = jest.fn()
+  h.ctx.logger.warn = warn
+
+  const payload = makePositionWebhookPayload({ noteId: 901 })
+
+  // First attempt → deferred
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.enqueued[0].record._reviewRetried).toBe(true)
+
+  // Second attempt with _reviewRetried=true, MR still missing → dropped
+  await h.manager.applyRemote(h.ctx, 'binding-1', h.enqueued[0].record)
+
+  // No further enqueue
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.huly.creates).toBe(0)
+  // review.parent.missing metric logged
+  expect(warn).toHaveBeenCalledWith(
+    expect.stringContaining('review note parent MR still missing after retry'),
+    expect.objectContaining({ metric: 'review.parent.missing' })
+  )
+})
+
+test('P3-T-08 T8. Position note + confidential MR (idmap miss) → deferred once then dropped (defense-in-depth)', async () => {
+  // No MR in idmap — simulates confidential MR that the webhook layer filtered out
+  const h = buildHarness({ seedIssue: false, seedMR: false })
+  const payload = makePositionWebhookPayload({ noteId: 902 })
+
+  // First attempt → deferred
+  await h.manager.applyRemote(h.ctx, 'binding-1', payload)
+  expect(h.enqueued).toHaveLength(1)
+  expect(h.enqueued[0].kind).toBe('note')
+
+  // Second attempt → dropped (MR never appears)
+  await h.manager.applyRemote(h.ctx, 'binding-1', h.enqueued[0].record)
+  expect(h.enqueued).toHaveLength(1) // no second enqueue
+  expect(h.huly.creates).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// P5-T-12: _originated:'gitlab' marker stamping on applyRemote writes
+// ---------------------------------------------------------------------------
+
+test('P5-T-12 T1. applyRemote create ChatMessage → createDoc attrs contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  const createDocSpy = jest.spyOn(h.huly, 'createDoc')
+
+  const record = makeNoteRecord({ id: 1000, body: 'Marker create test' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record)
+
+  expect(h.huly.creates).toBe(1)
+  expect(createDocSpy).toHaveBeenCalledTimes(1)
+  const attrs = createDocSpy.mock.calls[0][2] as Record<string, unknown>
+  expect(attrs._originated).toBe('gitlab')
+})
+
+test('P5-T-12 T2. applyRemote update ChatMessage → updateDoc operations contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  const updateDocSpy = jest.spyOn(h.huly, 'updateDoc')
+
+  // First arrival: create the message
+  const record1 = makeNoteRecord({ id: 1001, body: 'Original', updatedAt: '2024-01-01T10:00:00.000Z' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record1)
+
+  // Second arrival: newer timestamp triggers update
+  const record2 = makeNoteRecord({ id: 1001, body: 'Updated', updatedAt: '2024-01-02T10:00:00.000Z' })
+  await h.manager.applyRemote(h.ctx, 'binding-1', record2)
+
+  expect(h.huly.updates).toBe(1)
+  expect(updateDocSpy).toHaveBeenCalledTimes(1)
+  const ops = updateDocSpy.mock.calls[0][3] as Record<string, unknown>
+  expect(ops._originated).toBe('gitlab')
+})

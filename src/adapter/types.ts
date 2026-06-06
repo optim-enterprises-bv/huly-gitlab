@@ -35,11 +35,96 @@ export interface SyncNote {
   system: boolean
   confidential: boolean
   noteableType?: 'Issue' | 'MergeRequest'
+  /** Phase 3 — present only for line comments (position_type === 'text'). */
+  position?: SyncReviewPosition
 }
 
 export type MergeStatus = 'can_be_merged' | 'cannot_be_merged' | 'unchecked' | 'locked'
 
+export type ApprovalStatus = 'pending' | 'approved' | 'changes_requested'
+
+export interface SyncChangedFile {
+  path: string
+  oldPath?: string
+  additions: number
+  deletions: number
+  status: 'added' | 'modified' | 'deleted' | 'renamed'
+  /** Raw unified diff text for this file, populated by getMRChanges. */
+  diffBody?: string
+  /** True when diffBody was truncated at DIFF_BODY_MAX_BYTES. */
+  diffOverflow?: boolean
+}
+
+export type SyncReviewPosition =
+  | { positionType: 'text', filePath: string, oldLine: number | null, newLine: number | null, baseSha: string, headSha: string, startSha: string }
+  | { positionType: 'image', filePath: string, x: number, y: number, width: number, height: number, baseSha: string, headSha: string }
+  | { positionType: 'file', filePath: string, baseSha: string, headSha: string }
+
+export interface SyncReviewNote {
+  id: number
+  body: string
+  author: SyncUser
+  createdAt: Date
+  updatedAt: Date
+  system: boolean
+  resolvable: boolean
+  resolved: boolean
+  position?: SyncReviewPosition
+}
+
+export interface SyncReviewThread {
+  discussionId: string
+  mergeRequestIid: number
+  projectId: number
+  resolved: boolean
+  resolvedBy: SyncUser | null
+  resolvedAt: Date | null
+  notes: SyncReviewNote[]
+  updatedAt: Date
+}
+
+export interface SyncMRChanges {
+  diffWebUrl: string
+  changedFiles: SyncChangedFile[]
+}
+
+export interface SyncMRApprovals {
+  approvedBy: SyncUser[]
+  approvalsRequired: number
+}
+
 export type SyncPipelineStatus = 'pending' | 'running' | 'success' | 'failed' | 'canceled'
+
+export interface SyncMRApprovalRule {
+  id: number
+  name: string
+  ruleType: 'regular' | 'any_approver' | 'code_owner' | 'report_approver'
+  eligibleApprovers: SyncUser[]
+  approvalsRequired: number
+  approvedBy: SyncUser[]
+}
+
+export interface SyncIteration {
+  id: string
+  title: string
+  startDate: Date
+  dueDate: Date
+  state: 'upcoming' | 'started' | 'closed'
+  webUrl: string
+}
+
+export interface SyncEpic {
+  iid: number
+  groupId: number
+  title: string
+  description: string
+  state: 'opened' | 'closed'
+  webUrl: string
+  childIssueIids: number[]
+  author: SyncUser
+  createdAt: Date
+  updatedAt: Date
+}
 
 export interface SyncMergeRequest {
   iid: number
@@ -56,12 +141,24 @@ export interface SyncMergeRequest {
   labels: string[]
   milestone: { iid: number, title: string } | null
   assignees: SyncUser[]
-  reviewers: SyncUser[]
   author: SyncUser
   createdAt: Date
   updatedAt: Date
   webUrl: string
   confidential: boolean
+  /**
+   * OPTIONAL: only populated by getMergeRequest (composite fetch).
+   * listMergeRequests returns these as undefined.
+   * applyRemote MUST treat undefined as 'not yet fetched', NOT 'clear field'.
+   */
+  reviewers?: SyncUser[]
+  approvedBy?: SyncUser[]
+  approvalsRequired?: number
+  approvalStatus?: ApprovalStatus
+  diffWebUrl?: string
+  changedFiles?: SyncChangedFile[]
+  approvalRules?: SyncMRApprovalRule[]
+  iteration?: SyncIteration | null
 }
 
 export interface SyncPipeline {

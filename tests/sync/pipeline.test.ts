@@ -8,9 +8,11 @@ import type { SyncPipeline } from '../../src/adapter/types'
 import {
   PipelineSyncManager,
   type PipelineBindingContext,
-  unboundPipelineCount as _unboundPipelineCountImport,
-  incrementPipelineLruDrop
+  incrementPipelineLruDrop,
+  getUnboundPipelineCount,
+  getPipelineLruDropCount
 } from '../../src/sync/pipeline'
+import { reset as resetMetrics } from '../../src/metrics'
 import type { SyncContext } from '../../src/sync/types'
 
 // ---------------------------------------------------------------------------
@@ -210,15 +212,12 @@ describe('PipelineSyncManager', () => {
         loadBinding: async () => makeBindingContext(hulyClient)
       })
 
-      // Import the module to capture current count before
-      const mod = await import('../../src/sync/pipeline')
-      const before = mod.unboundPipelineCount
-
+      resetMetrics()
       const pipeline = makePipeline({ mergeRequestIid: null })
       await manager.applyRemote(ctx, 'binding-1', pipeline)
 
       expect(hulyClient.mixinUpdates).toHaveLength(0)
-      expect(mod.unboundPipelineCount).toBe(before + 1)
+      expect(getUnboundPipelineCount()).toBe(1)
     })
   })
 
@@ -260,9 +259,9 @@ describe('PipelineSyncManager', () => {
       expect(call.objectId).toBe('huly-issue-ref-42')
       expect(call.mixin).toBe('gitlab-mr')
 
-      // Critic C2: ONLY pipelineStatus — no title, description, status, or other fields
-      expect(call.attributes).toEqual({ pipelineStatus: 'success' })
-      expect(Object.keys(call.attributes)).toHaveLength(1)
+      // Critic C2: ONLY pipelineStatus (plus the originated marker)
+      expect(call.attributes).toEqual({ pipelineStatus: 'success', _originated: 'gitlab' })
+      expect(Object.keys(call.attributes)).toHaveLength(2)
     })
 
     it('writes pipelineStatus: null when pipeline status is null', async () => {
@@ -280,7 +279,25 @@ describe('PipelineSyncManager', () => {
       await manager.applyRemote(ctx, 'binding-1', pipeline)
 
       expect(hulyClient.mixinUpdates).toHaveLength(1)
-      expect(hulyClient.mixinUpdates[0].attributes).toEqual({ pipelineStatus: null })
+      expect(hulyClient.mixinUpdates[0].attributes).toEqual({ pipelineStatus: null, _originated: 'gitlab' })
+    })
+
+    it('stamps _originated: gitlab on the updateMixin attributes', async () => {
+      const hulyClient = makeHulyClient()
+      const idmap = makeIdMap()
+      const ctx = makeCtx(idmap)
+
+      seedMrInIdmap(idmap, 'ws-1', 55, 'huly-issue-ref-55')
+
+      const manager = new PipelineSyncManager({
+        loadBinding: async () => makeBindingContext(hulyClient)
+      })
+
+      const pipeline = makePipeline({ mergeRequestIid: 55, status: 'running' })
+      await manager.applyRemote(ctx, 'binding-1', pipeline)
+
+      expect(hulyClient.mixinUpdates).toHaveLength(1)
+      expect(hulyClient.mixinUpdates[0].attributes._originated).toBe('gitlab')
     })
   })
 
@@ -319,11 +336,10 @@ describe('PipelineSyncManager', () => {
 
   // LRU eviction counter (Phase 2 limitation documented in pipeline.ts)
   describe('incrementPipelineLruDrop', () => {
-    it('increments pipelineLruDropCount', async () => {
-      const mod = await import('../../src/sync/pipeline')
-      const before = mod.pipelineLruDropCount
+    it('increments pipelineLruDropCount', () => {
+      resetMetrics()
       incrementPipelineLruDrop()
-      expect(mod.pipelineLruDropCount).toBe(before + 1)
+      expect(getPipelineLruDropCount()).toBe(1)
     })
   })
 })

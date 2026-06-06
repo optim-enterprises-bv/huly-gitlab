@@ -20,6 +20,7 @@ export interface WebhookEventFlags {
   job_events?: boolean
   member_events?: boolean
   subgroup_events?: boolean
+  epic_events?: boolean
 }
 
 export interface BuildWebhookPayloadInput {
@@ -44,8 +45,10 @@ export function buildWebhookPayload (opts: BuildWebhookPayloadInput): Record<str
     job_events: opts.eventFlags.job_events ?? false,
     member_events: opts.eventFlags.member_events ?? false,
     subgroup_events: opts.eventFlags.subgroup_events ?? false,
+    epic_events: opts.eventFlags.epic_events ?? false,
     // Confidential flags HARDCODED FALSE — never let caller override.
     confidential_issues_events: false,
-    confidential_note_events: false
+    confidential_note_events: false,
+    confidential_epic_events: false
   }
 }

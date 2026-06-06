@@ -488,6 +488,101 @@ describe('BindingLifecycleService', () => {
     await mongod.stop()
   })
 
+  // 14. onBindingCreate (Phase 4 EE): event flags include epic_events:true on EE
+  test('onBindingCreate (Phase 4 EE): registers webhook with epic_events:true on EE', async () => {
+    const { MongoMemoryServer } = await import('mongodb-memory-server')
+    const { Store } = await import('../../src/state/store')
+    const { putCredential } = await import('../../src/state/credentials')
+
+    const mongod = await MongoMemoryServer.create()
+    const store = new Store(mongod.getUri(), 'test-lifecycle-14')
+    await store.connect()
+    const encryptionKey = randomBytes(32)
+
+    const secretRef = await putCredential(store.credentials(), encryptionKey, {
+      kind: 'webhook_secret',
+      plaintext: randomBytes(32).toString('base64')
+    })
+
+    const testBinding = makeBinding({ webhookSecretRef: secretRef })
+    await store.bindings().insertOne(testBinding)
+
+    let capturedBody: Record<string, unknown> | undefined
+    const factory: GitLabClientFactory = jest.fn(async () => {
+      const client = {
+        createProjectWebhook: jest.fn(async (_projectId: unknown, body: Record<string, unknown>) => {
+          capturedBody = body
+          return makeHook(14)
+        }),
+        capabilities: { edition: 'ee', graphqlAvailable: true }
+      } as unknown as import('../../src/adapter/gitlab-client').GitLabClient
+      return client
+    })
+
+    const svc = new BindingLifecycleService({ store, encryptionKey, gitlabClientFactory: factory, logger: makeLogger() })
+    await svc.onBindingCreate(testBinding, PUBLIC_BASE_URL)
+
+    expect(capturedBody).toBeDefined()
+    expect(capturedBody?.issues_events).toBe(true)
+    expect(capturedBody?.note_events).toBe(true)
+    expect(capturedBody?.merge_requests_events).toBe(true)
+    expect(capturedBody?.pipeline_events).toBe(true)
+    expect(capturedBody?.epic_events).toBe(true)
+    expect(capturedBody?.confidential_issues_events).toBe(false)
+    expect(capturedBody?.confidential_note_events).toBe(false)
+    expect(capturedBody?.confidential_epic_events).toBe(false)
+
+    await store.disconnect()
+    await mongod.stop()
+  })
+
+  // 15. onBindingCreate (Phase 4 CE): event flags exclude epic_events on CE
+  test('onBindingCreate (Phase 4 CE): registers webhook without epic_events on CE', async () => {
+    const { MongoMemoryServer } = await import('mongodb-memory-server')
+    const { Store } = await import('../../src/state/store')
+    const { putCredential } = await import('../../src/state/credentials')
+
+    const mongod = await MongoMemoryServer.create()
+    const store = new Store(mongod.getUri(), 'test-lifecycle-15')
+    await store.connect()
+    const encryptionKey = randomBytes(32)
+
+    const secretRef = await putCredential(store.credentials(), encryptionKey, {
+      kind: 'webhook_secret',
+      plaintext: randomBytes(32).toString('base64')
+    })
+
+    const testBinding = makeBinding({ webhookSecretRef: secretRef })
+    await store.bindings().insertOne(testBinding)
+
+    let capturedBody: Record<string, unknown> | undefined
+    const factory: GitLabClientFactory = jest.fn(async () => {
+      const client = {
+        createProjectWebhook: jest.fn(async (_projectId: unknown, body: Record<string, unknown>) => {
+          capturedBody = body
+          return makeHook(15)
+        }),
+        capabilities: { edition: 'ce', graphqlAvailable: false }
+      } as unknown as import('../../src/adapter/gitlab-client').GitLabClient
+      return client
+    })
+
+    const svc = new BindingLifecycleService({ store, encryptionKey, gitlabClientFactory: factory, logger: makeLogger() })
+    await svc.onBindingCreate(testBinding, PUBLIC_BASE_URL)
+
+    expect(capturedBody).toBeDefined()
+    expect(capturedBody?.issues_events).toBe(true)
+    expect(capturedBody?.note_events).toBe(true)
+    expect(capturedBody?.merge_requests_events).toBe(true)
+    expect(capturedBody?.pipeline_events).toBe(true)
+    expect(capturedBody?.epic_events).toBe(false)
+    expect(capturedBody?.confidential_issues_events).toBe(false)
+    expect(capturedBody?.confidential_note_events).toBe(false)
+
+    await store.disconnect()
+    await mongod.stop()
+  })
+
   // 12. reRegisterWebhook: existing webhookId — PUTs the full Phase 2 event flag set + confidential_*=false
   test('reRegisterWebhook: existing webhookId — calls updateProjectWebhookEventFlags with all 4 flags and confidential_* false (B4)', async () => {
     const { MongoMemoryServer } = await import('mongodb-memory-server')
@@ -582,6 +677,53 @@ describe('BindingLifecycleService', () => {
     const { ObjectId } = await import('mongodb')
     const updated = await store.bindings().findOne({ _id: new ObjectId(bindingId) })
     expect(updated?.webhookRegistered).toBe(false)
+
+    await store.disconnect()
+    await mongod.stop()
+  })
+
+  // 16. reRegisterWebhook (Phase 4 EE): event flags include epic_events:true on EE
+  test('reRegisterWebhook (Phase 4 EE): updates webhook with epic_events:true on EE', async () => {
+    const { MongoMemoryServer } = await import('mongodb-memory-server')
+    const { Store } = await import('../../src/state/store')
+    const { putCredential } = await import('../../src/state/credentials')
+
+    const mongod = await MongoMemoryServer.create()
+    const store = new Store(mongod.getUri(), 'test-lifecycle-16')
+    await store.connect()
+    const encryptionKey = randomBytes(32)
+
+    const secretRef = await putCredential(store.credentials(), encryptionKey, {
+      kind: 'webhook_secret',
+      plaintext: randomBytes(32).toString('base64')
+    })
+
+    const testBinding = makeBinding({ webhookSecretRef: secretRef, webhookId: 400, webhookRegistered: true })
+    await store.bindings().insertOne(testBinding)
+
+    let capturedBody: Record<string, unknown> | undefined
+    const mockUpdate = jest.fn(async (_projectId: unknown, _hookId: number, body: Record<string, unknown>) => {
+      capturedBody = body
+      return makeHook(400)
+    })
+    const factory: GitLabClientFactory = jest.fn(async () => ({
+      updateProjectWebhook: mockUpdate,
+      capabilities: { edition: 'ee', graphqlAvailable: true }
+    } as unknown as import('../../src/adapter/gitlab-client').GitLabClient))
+
+    const svc = new BindingLifecycleService({ store, encryptionKey, gitlabClientFactory: factory, logger: makeLogger() })
+    const result = await svc.reRegisterWebhook(testBinding, PUBLIC_BASE_URL)
+
+    expect(result.webhookRegistered).toBe(true)
+    expect(capturedBody).toBeDefined()
+    expect(capturedBody?.issues_events).toBe(true)
+    expect(capturedBody?.note_events).toBe(true)
+    expect(capturedBody?.merge_requests_events).toBe(true)
+    expect(capturedBody?.pipeline_events).toBe(true)
+    expect(capturedBody?.epic_events).toBe(true)
+    expect(capturedBody?.confidential_issues_events).toBe(false)
+    expect(capturedBody?.confidential_note_events).toBe(false)
+    expect(capturedBody?.confidential_epic_events).toBe(false)
 
     await store.disconnect()
     await mongod.stop()

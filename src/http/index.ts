@@ -2,16 +2,21 @@ import express from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
 import bodyParser from 'body-parser'
+import path from 'node:path'
 import type { Config } from '../config'
 import type { Store } from '../state/store'
 import type { SyncEngine } from '../sync/engine'
 import type { Logger } from '../logging'
 import type { CredentialResolver } from '../auth'
 import type { BindingLifecycleService } from '../sync/binding-lifecycle'
+import type { BindingLoader } from '../sync/binding-loader'
 import { createHealthRouter } from './health'
 import { createWebhookRouter } from './webhook'
 import { createBindingRouter } from './binding'
 import { createOAuthRouter } from './oauth'
+import { createUserOAuthRouter } from './user-oauth'
+import { createUserSessionRouter } from './user-session'
+import { createUserSuggestionsRouter } from './user-suggestions'
 import { createCredentialsRouter } from '../auth'
 
 export interface AppDependencies {
@@ -21,11 +26,18 @@ export interface AppDependencies {
   logger: Logger
   credentialResolver?: CredentialResolver
   bindingLifecycle?: BindingLifecycleService
+  bindingLoader?: BindingLoader
 }
 
 export function createApp (deps: AppDependencies): express.Express {
   const { config, store, syncEngine, logger } = deps
   const app = express()
+
+  // B7: configure trust-proxy when running behind a reverse proxy so `req.ip`
+  // and `X-Forwarded-*` headers reflect the real client. Unset → default false.
+  if (config.TrustProxy !== undefined) {
+    app.set('trust proxy', config.TrustProxy)
+  }
 
   // Parse encryption key once
   const encryptionKey = Buffer.from(config.CredentialEncryptionKey, 'base64')
@@ -63,14 +75,39 @@ export function createApp (deps: AppDependencies): express.Express {
     config.ServerSecret,
     logger,
     deps.bindingLifecycle,
-    config.PublicBaseUrl
+    config.PublicBaseUrl,
+    deps.bindingLoader
   ))
 
+  // Shared secret-rotation config for HMAC dual-verify across cookie + state surfaces.
+  const secrets = { primary: config.ServerSecret, previous: config.ServerSecretPrevious }
+
   // OAuth routes
-  app.use('/oauth', createOAuthRouter({ config, store, logger }))
+  app.use('/oauth', createOAuthRouter({ config, store, logger, secrets }))
+
+  // Per-user OAuth routes (Phase 4 — cookie-auth + rate-limit + GitLab user lookup).
+  app.use('/user/oauth', createUserOAuthRouter({ config, store, logger, secrets }))
+
+  // User suggestion apply/dismiss endpoints.
+  app.use('/user/api/v1/suggestions', createUserSuggestionsRouter({ config, store, logger, secrets }))
+
+  // B5: cookie-mint endpoint (bearer-protected). Platform integration point.
+  app.use('/user', createUserSessionRouter({ config, logger }))
 
   // Credentials admin routes (access-token + list)
   app.use('/api/v1/credentials', createCredentialsRouter({ config, store, logger }))
+
+  // User UI static files with CSP headers (Bug-6)
+  app.use('/user/ui', express.static(path.join(__dirname, '..', 'public', 'user-ui'), {
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.html')) {
+        res.setHeader(
+          'Content-Security-Policy',
+          "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'"
+        )
+      }
+    }
+  }))
 
   // Error handler middleware — log full err with stack; never leak details to clients.
   app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {

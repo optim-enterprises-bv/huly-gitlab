@@ -1,13 +1,36 @@
-import type { Mixin, Ref } from '@hcengineering/core'
+import type { Doc, Mixin, PersonUuid, Ref } from '@hcengineering/core'
 import type { Issue } from '@hcengineering/tracker'
-import type { MergeStatus } from '../adapter/types'
+import type { ApprovalStatus, MergeStatus, SyncChangedFile, SyncIteration, SyncMRApprovalRule } from '../adapter/types'
+import { MR_CORE_MIXIN, type MRCoreMixinDoc } from './mr-core-mixin'
+import { MR_REVIEW_MIXIN_DOC, type MRReviewMixinDoc } from './mr-review-mixin-doc'
 
 /**
  * Shape of the runtime `gitlab-mr` mixin written onto a tracker.Issue
  * that mirrors a GitLab merge request.
  *
- * Intentionally does NOT include `pipelineStatus` — that field is owned
- * exclusively by PipelineSyncManager (critic C2).
+ * Field-ownership partition (critic C2 + Phase 3 + Phase 4 extension):
+ * Total fields: 16
+ *
+ *   MergeRequestsSyncManager owns:
+ *     sourceBranch, targetBranch, draft, mergedAt, mergeStatus, webUrl,
+ *     gitlabIid, gitlabProjectId,
+ *     approvedBy, approvalsRequired, approvalStatus, diffWebUrl, changedFiles
+ *
+ *   MergeRequestsSyncManager AND reviewer-migration helper (P3-T-09) own:
+ *     reviewers  — MergeRequestsSyncManager writes it on applyRemote;
+ *                  the migration helper back-fills it from Phase 2 label data.
+ *
+ *   MergeRequestsSyncManager owns (Phase 4 EE additions):
+ *     approvalRules  — approval rule definitions for this MR.
+ *     iteration      — GitLab iteration the MR is assigned to (null if unset).
+ *
+ *   EpicsSyncManager owns EXCLUSIVELY (never written by MR manager):
+ *     parentEpicIid  — iid of the parent epic; EpicsSyncManager is SOLE writer.
+ *
+ *   PipelineSyncManager owns EXCLUSIVELY (never written by MR manager):
+ *     pipelineStatus  — NOT a field on this interface by design.
+ *
+ * No manager may write a field owned by another manager.
  */
 export interface MRMixinDoc extends Issue {
   sourceBranch: string
@@ -18,7 +41,84 @@ export interface MRMixinDoc extends Issue {
   webUrl: string
   gitlabIid: number
   gitlabProjectId: number
+
+  // Phase 3 additions — all optional (not present on pre-Phase-3 documents)
+  /** Typed reviewer list. Written by MergeRequestsSyncManager.applyRemote and the reviewer-migration helper (P3-T-09). */
+  reviewers?: PersonUuid[]
+  /** Users who have approved this MR. Written exclusively by MergeRequestsSyncManager. */
+  approvedBy?: PersonUuid[]
+  /** Minimum approvals required. From GitLab approvals.approvals_required. */
+  approvalsRequired?: number
+  /** Derived approval state: 'pending' | 'approved' | 'changes_requested'. */
+  approvalStatus?: ApprovalStatus
+  /** Direct URL to the MR diff view on GitLab. */
+  diffWebUrl?: string
+  /** Files changed in this MR. From getMRChanges. */
+  changedFiles?: SyncChangedFile[]
+
+  // Phase 4 EE additions (owned by MergeRequestsSyncManager):
+  /** Approval rule definitions for this MR. Written exclusively by MergeRequestsSyncManager. */
+  approvalRules?: SyncMRApprovalRule[]
+  /** GitLab iteration assigned to this MR. Null when unset. Written exclusively by MergeRequestsSyncManager. */
+  iteration?: SyncIteration | null
+
+  // Phase 4 cross-manager field (owned by EpicsSyncManager — see epic-mixin.ts):
+  /** iid of the parent epic on GitLab. EpicsSyncManager is SOLE writer of this field. */
+  parentEpicIid?: number
 }
 
 /** Runtime mixin id used to carry GitLab MR fields on a tracker.Issue. */
 export const MR_MIXIN = 'gitlab-mr' as unknown as Ref<Mixin<MRMixinDoc>>
+
+/**
+ * Minimal hierarchy surface needed by readMRMixinAttributes. The real Huly
+ * `Hierarchy` class satisfies this; tests pass a small fake.
+ */
+export interface MRMixinHierarchy {
+  as: <T extends Doc>(doc: Doc, mixinId: Ref<Mixin<T>>) => T
+}
+
+/**
+ * Read MR mixin attributes from EITHER legacy `gitlab-mr` mixin OR the new split
+ * (`gitlab-mr-core` + `gitlab-mr-review`). During mixin-split migration window, BOTH
+ * may be present on the same Issue. Prefer NEW (core+review); fall back to LEGACY.
+ *
+ * When a `hierarchy` is provided (real platform or test fake), mixin attributes are
+ * read via `hierarchy.as<T>(doc, mixinId)` — the correct API on the real platform.
+ * String-key access (`obj[mixinId as string]`) is used as a defensive fallback when
+ * the hierarchy is unavailable (e.g. older test fakes that pre-date this change).
+ *
+ * Returns a unified attribute view that callers can use as if reading from the
+ * legacy `MRMixinDoc` shape.
+ */
+export function readMRMixinAttributes (
+  issue: Doc | null | undefined,
+  hierarchy?: MRMixinHierarchy | null
+): Partial<MRMixinDoc> {
+  if (issue === null || issue === undefined) return {}
+
+  // Prefer hierarchy.as<T>() when available — correct platform API.
+  if (hierarchy != null) {
+    let core: Partial<MRCoreMixinDoc> | undefined
+    let review: Partial<MRReviewMixinDoc> | undefined
+    let legacy: Partial<MRMixinDoc> | undefined
+    try { core = hierarchy.as<MRCoreMixinDoc>(issue, MR_CORE_MIXIN) } catch { /* not present */ }
+    try { review = hierarchy.as<MRReviewMixinDoc>(issue, MR_REVIEW_MIXIN_DOC) } catch { /* not present */ }
+    if (core !== undefined || review !== undefined) {
+      const merged: Record<string, unknown> = { ...(core ?? {}), ...(review ?? {}) }
+      return merged as Partial<MRMixinDoc>
+    }
+    try { legacy = hierarchy.as<MRMixinDoc>(issue, MR_MIXIN) } catch { /* not present */ }
+    if (legacy !== undefined) return legacy
+  }
+
+  // Fallback: string-key access (test fakes and migration shims).
+  const obj = issue as unknown as Record<string, Record<string, unknown> | undefined>
+  const core = obj[MR_CORE_MIXIN as unknown as string]
+  const review = obj[MR_REVIEW_MIXIN_DOC as unknown as string]
+  if (core !== undefined || review !== undefined) {
+    const merged: Record<string, unknown> = { ...(core ?? {}), ...(review ?? {}) }
+    return merged as Partial<MRMixinDoc>
+  }
+  return (obj[MR_MIXIN as unknown as string] ?? {}) as Partial<MRMixinDoc>
+}

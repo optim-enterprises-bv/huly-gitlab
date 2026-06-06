@@ -7,6 +7,7 @@ import { randomBytes, createHmac } from 'node:crypto'
 import { createOAuthRouter } from '../../src/http/oauth'
 import { getCredential } from '../../src/state/credentials'
 import { Store } from '../../src/state/store'
+import { signHmac } from '../../src/util/secret-rotation'
 import type { Logger } from '../../src/logging'
 import type { Config } from '../../src/config'
 
@@ -27,7 +28,7 @@ const OAUTH_REDIRECT_URI = `${PUBLIC_BASE_URL}/oauth/callback`
 const GITLAB_CLIENT_ID = 'test-client-id'
 const GITLAB_CLIENT_SECRET = 'test-client-secret'
 
-function makeConfig (): Config {
+function makeConfig (overrides: Partial<Config> = {}): Config {
   return {
     Port: 3600,
     PublicBaseUrl: PUBLIC_BASE_URL,
@@ -46,7 +47,9 @@ function makeConfig (): Config {
     RateLimit: 25,
     LogLevel: 'error',
     BrandingPath: '',
-    OAuthRedirectUri: OAUTH_REDIRECT_URI
+    OAuthRedirectUri: OAUTH_REDIRECT_URI,
+    CorsAllowedOrigins: [],
+    ...overrides
   }
 }
 
@@ -70,10 +73,10 @@ beforeEach(async () => {
   nock.cleanAll()
 })
 
-function buildApp (): express.Express {
+function buildApp (configOverrides: Partial<Config> = {}): express.Express {
   const app = express()
   app.use(bodyParser.json())
-  app.use('/oauth', createOAuthRouter({ config: makeConfig(), store, logger: makeLogger() }))
+  app.use('/oauth', createOAuthRouter({ config: makeConfig(configOverrides), store, logger: makeLogger() }))
   return app
 }
 
@@ -189,30 +192,35 @@ describe('GET /oauth/start', () => {
 
 describe('GET /oauth/callback', () => {
   async function insertState (
-    state: string,
+    nonce: string,
     expiresAt: Date,
     workspaceUuid = 'ws-cb',
     hulyProjectRef = 'proj-cb',
-    gitlabBaseUrl = GITLAB_BASE
-  ): Promise<void> {
+    gitlabBaseUrl = GITLAB_BASE,
+    secret: string = SERVER_SECRET
+  ): Promise<string> {
     const { ObjectId } = await import('mongodb')
+    const epoch = Date.now()
+    const statePayload = `${workspaceUuid}|${hulyProjectRef}|${nonce}|${epoch}`
+    const state = signHmac(statePayload, { primary: secret })
     await store.oauthStates().insertOne({
       _id: new ObjectId(),
       state,
-      nonce: 'test-nonce',
+      statePayload,
+      nonce,
       codeVerifier: 'test-code-verifier',
       workspaceUuid,
       hulyProjectRef,
       gitlabBaseUrl,
       expiresAt
     })
+    return state
   }
 
   test('valid code+state → 200 JSON with credentialRef stored encrypted', async () => {
     const app = buildApp()
-    const state = 'valid-state-abc123'
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000)
-    await insertState(state, expiresAt)
+    const state = await insertState('nonce-valid', expiresAt)
 
     nock(GITLAB_BASE)
       .post('/oauth/token')
@@ -254,9 +262,8 @@ describe('GET /oauth/callback', () => {
 
   test('expired state → 410', async () => {
     const app = buildApp()
-    const state = 'expired-state-abc'
     const expiresAt = new Date(Date.now() - 1000) // already expired
-    await insertState(state, expiresAt)
+    const state = await insertState('nonce-expired', expiresAt)
 
     const res = await request(app)
       .get('/oauth/callback')
@@ -269,8 +276,7 @@ describe('GET /oauth/callback', () => {
 
   test('GitLab returns 400 on token exchange → 400 with error', async () => {
     const app = buildApp()
-    const state = 'good-state-gitlab-400'
-    await insertState(state, new Date(Date.now() + 5 * 60 * 1000))
+    const state = await insertState('nonce-gitlab-400', new Date(Date.now() + 5 * 60 * 1000))
 
     nock(GITLAB_BASE)
       .post('/oauth/token')
@@ -287,9 +293,8 @@ describe('GET /oauth/callback', () => {
 
   test('state written with expiresAt < now → 410 without calling GitLab', async () => {
     const app = buildApp()
-    const state = 'pre-expired-state'
     // Write a state that is already expired
-    await insertState(state, new Date(Date.now() - 60 * 1000))
+    const state = await insertState('nonce-pre-expired', new Date(Date.now() - 60 * 1000))
 
     const res = await request(app)
       .get('/oauth/callback')
@@ -335,8 +340,7 @@ describe('GET /oauth/callback', () => {
 
   test('HTML success page when Accept header is not application/json', async () => {
     const app = buildApp()
-    const state = 'html-state-abc'
-    await insertState(state, new Date(Date.now() + 5 * 60 * 1000))
+    const state = await insertState('nonce-html', new Date(Date.now() + 5 * 60 * 1000))
 
     nock(GITLAB_BASE)
       .post('/oauth/token')
@@ -352,5 +356,89 @@ describe('GET /oauth/callback', () => {
 
     expect(res.status).toBe(200)
     expect(res.text).toContain('GitLab connected successfully')
+  })
+})
+
+describe('GET /oauth/callback — secret rotation grace period', () => {
+  async function insertStateSignedWith (
+    nonce: string,
+    expiresAt: Date,
+    secret: string,
+    workspaceUuid = 'ws-rot',
+    hulyProjectRef = 'proj-rot',
+    gitlabBaseUrl = GITLAB_BASE
+  ): Promise<string> {
+    const { ObjectId } = await import('mongodb')
+    const epoch = Date.now()
+    const statePayload = `${workspaceUuid}|${hulyProjectRef}|${nonce}|${epoch}`
+    const state = signHmac(statePayload, { primary: secret })
+    await store.oauthStates().insertOne({
+      _id: new ObjectId(),
+      state,
+      statePayload,
+      nonce,
+      codeVerifier: 'test-code-verifier',
+      workspaceUuid,
+      hulyProjectRef,
+      gitlabBaseUrl,
+      expiresAt
+    })
+    return state
+  }
+
+  test('state signed with previous secret is accepted when rotated', async () => {
+    const previousSecret = 'old-secret-value'
+    const newPrimary = 'new-secret-value'
+    const app = buildApp({ ServerSecret: newPrimary, ServerSecretPrevious: previousSecret })
+
+    // State row was created when previousSecret was primary.
+    const state = await insertStateSignedWith('nonce-rot-prev', new Date(Date.now() + 5 * 60 * 1000), previousSecret)
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(200, { access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 7200 })
+
+    const res = await request(app)
+      .get('/oauth/callback')
+      .set('Accept', 'application/json')
+      .query({ code: 'rot-code', state })
+
+    expect(res.status).toBe(200)
+    expect(res.body.credentialRef).toBeDefined()
+  })
+
+  test('state signed with totally unknown secret is rejected (401) even with rotation configured', async () => {
+    const app = buildApp({ ServerSecret: 'primary-x', ServerSecretPrevious: 'previous-y' })
+
+    // Sign with a secret that is NEITHER primary nor previous.
+    const state = await insertStateSignedWith('nonce-rot-bad', new Date(Date.now() + 5 * 60 * 1000), 'attacker-secret')
+
+    const res = await request(app)
+      .get('/oauth/callback')
+      .query({ code: 'bad-code', state })
+
+    // The row exists, so it gets past the 404, but HMAC verification with neither
+    // primary nor previous succeeds → 401.
+    expect(res.status).toBe(401)
+    expect(res.body.error).toBe('invalid_state')
+  })
+
+  test('state signed with new primary verifies cleanly with rotation configured', async () => {
+    const newPrimary = 'shiny-new-primary'
+    const app = buildApp({ ServerSecret: newPrimary, ServerSecretPrevious: 'old-still-around' })
+
+    const state = await insertStateSignedWith('nonce-rot-new', new Date(Date.now() + 5 * 60 * 1000), newPrimary)
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(200, { access_token: 'new-primary-access', expires_in: 7200 })
+
+    const res = await request(app)
+      .get('/oauth/callback')
+      .set('Accept', 'application/json')
+      .query({ code: 'new-primary-code', state })
+
+    expect(res.status).toBe(200)
+    expect(res.body.credentialRef).toBeDefined()
   })
 })

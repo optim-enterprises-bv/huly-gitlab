@@ -1,0 +1,292 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1780724751777,
+  "projectRoot": "/Users/dingo/huly-gitlab",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": ">=22 <23",
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      },
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Makefile"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "express",
+        "version": "4.21.2",
+        "category": "backend"
+      },
+      {
+        "name": "jest",
+        "version": "29.7.0",
+        "category": "testing"
+      }
+    ],
+    "packageManager": "npm",
+    "runtime": "Node.js 2223"
+  },
+  "build": {
+    "buildCommand": "grep -rn '^<<<<<<<\\|^=======$\\|^>>>>>>>' src/ 2>&1 | head -10 && echo \"---tsc---\" && npx tsc --noEmit -p tsconfig.test.json > /tmp/tsc.out 2>&1; echo \"tsc=$?\"; tail -20 /tmp/tsc.out",
+    "testCommand": "npx eslint src/ --ext .ts > /tmp/lint.out 2>&1; echo \"lint=$?\"; tail -10 /tmp/lint.out && echo \"---tests---\" && npm test --silent --forceExit 2>&1 | tail -10",
+    "lintCommand": "npm run lint",
+    "devCommand": "npm run dev",
+    "scripts": {
+      "build": "tsc -p tsconfig.json",
+      "lint": "eslint src --ext .ts",
+      "format": "prettier --write 'src/**/*.ts' 'tests/**/*.ts'",
+      "format:check": "prettier --check 'src/**/*.ts' 'tests/**/*.ts'",
+      "test": "jest --passWithNoTests",
+      "test:coverage": "jest --passWithNoTests --coverage",
+      "test:e2e": "jest --config jest.e2e.config.js --passWithNoTests",
+      "dev": "nodemon --watch src --ext ts --exec 'ts-node src/index.ts'",
+      "bundle": "node esbuild.js",
+      "docker:build": "docker build -t hardcoreeng/huly-gitlab ."
+    }
+  },
+  "conventions": {
+    "namingStyle": "camelCase",
+    "importStyle": "ES modules",
+    "testPattern": "*.test.ts",
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "lib",
+      "public",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "feat/phase1-phase2-integration",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "coverage": {
+      "path": "coverage",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1780724751742,
+      "keyFiles": [
+        "clover.xml",
+        "coverage-final.json",
+        "lcov.info"
+      ]
+    },
+    "docker": {
+      "path": "docker",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1780724751744,
+      "keyFiles": [
+        "docker-compose.dev.yml",
+        "docker-compose.test.yml"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 8,
+      "lastAccessed": 1780724751748,
+      "keyFiles": [
+        "adr-002-phase5-supersedes-adr-001.md",
+        "adr-phase4-final.md",
+        "api.md",
+        "architecture.md",
+        "phase2-runbook.md"
+      ]
+    },
+    "lib": {
+      "path": "lib",
+      "purpose": "Library code",
+      "fileCount": 18,
+      "lastAccessed": 1780724751749,
+      "keyFiles": [
+        "config.d.ts",
+        "config.js",
+        "config.js.map",
+        "config.test.d.ts",
+        "config.test.js"
+      ]
+    },
+    "public": {
+      "path": "public",
+      "purpose": "Public files",
+      "fileCount": 0,
+      "lastAccessed": 1780724751749,
+      "keyFiles": []
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 1,
+      "lastAccessed": 1780724751750,
+      "keyFiles": [
+        "wait-for.sh"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 6,
+      "lastAccessed": 1780724751750,
+      "keyFiles": [
+        "config.test.ts",
+        "config.ts",
+        "index.ts",
+        "logging.test.ts",
+        "logging.ts"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1780724751750,
+      "keyFiles": [
+        "metrics.test.ts"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/http/oauth.ts",
+      "accessCount": 7,
+      "lastAccessed": 1780724905076,
+      "type": "file"
+    },
+    {
+      "path": "src/http/binding.ts",
+      "accessCount": 5,
+      "lastAccessed": 1780724935770,
+      "type": "file"
+    },
+    {
+      "path": "src/state/store.ts",
+      "accessCount": 5,
+      "lastAccessed": 1780729371647,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/mixin-migration.ts",
+      "accessCount": 4,
+      "lastAccessed": 1780724971896,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/reviewer-migration.ts",
+      "accessCount": 4,
+      "lastAccessed": 1780725008291,
+      "type": "file"
+    },
+    {
+      "path": "src/adapter/gitlab-client.ts",
+      "accessCount": 4,
+      "lastAccessed": 1780729490743,
+      "type": "file"
+    },
+    {
+      "path": "src/http/user-oauth.ts",
+      "accessCount": 3,
+      "lastAccessed": 1780724880473,
+      "type": "file"
+    },
+    {
+      "path": "tests/sync/mixin-migration.test.ts",
+      "accessCount": 3,
+      "lastAccessed": 1780724990728,
+      "type": "file"
+    },
+    {
+      "path": "tests/sync/reviewer-migration.test.ts",
+      "accessCount": 3,
+      "lastAccessed": 1780725026207,
+      "type": "file"
+    },
+    {
+      "path": "docs/adr-002-phase5-supersedes-adr-001.md",
+      "accessCount": 3,
+      "lastAccessed": 1780725066604,
+      "type": "file"
+    },
+    {
+      "path": "src/http/auth-middleware.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780724850222,
+      "type": "file"
+    },
+    {
+      "path": "public/user-ui/app.js",
+      "accessCount": 2,
+      "lastAccessed": 1780724857345,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/issues.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780729307656,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/notes.ts",
+      "accessCount": 2,
+      "lastAccessed": 1780729335308,
+      "type": "file"
+    },
+    {
+      "path": "src/http/rate-limit.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780724807487,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/originated-marker.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780724813679,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/mr-core-mixin.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780724819495,
+      "type": "file"
+    },
+    {
+      "path": "src/state/oauth-state.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780724819958,
+      "type": "file"
+    },
+    {
+      "path": "src/sync/mr-review-mixin.ts",
+      "accessCount": 1,
+      "lastAccessed": 1780724837832,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

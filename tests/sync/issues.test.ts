@@ -627,3 +627,44 @@ test('backfill: passes since as updatedAfter to listIssues', async () => {
   await h.manager.backfill(h.ctx, 'binding-1', new Date('2024-06-15T00:00:00Z'))
   expect(listMock).toHaveBeenCalledWith(42, { updatedAfter: '2024-06-15T00:00:00.000Z' })
 })
+
+test('originated-marker: applyRemote create stamps _originated on createDoc attrs', async () => {
+  const h = buildHarness()
+  let capturedAttrs: Record<string, unknown> | undefined
+  const origCreate = h.huly.createDoc.bind(h.huly)
+  jest.spyOn(h.huly, 'createDoc').mockImplementation(async (cls, space, attrs) => {
+    if (String(cls).includes('Issue')) {
+      capturedAttrs = attrs as Record<string, unknown>
+    }
+    return origCreate(cls, space, attrs)
+  })
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncIssue({ title: 'Marker test' }))
+
+  expect(capturedAttrs).toBeDefined()
+  expect(capturedAttrs?._originated).toBe('gitlab')
+})
+
+test('originated-marker: applyRemote update stamps _originated on updateDoc operations', async () => {
+  const h = buildHarness()
+
+  // Seed an existing issue
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncIssue({
+    title: 'v1',
+    updatedAt: '2024-01-01T10:00:00.000Z'
+  }))
+
+  let capturedUpdate: Record<string, unknown> | undefined
+  jest.spyOn(h.huly, 'updateDoc').mockImplementation(async (_cls, _space, _id, update) => {
+    capturedUpdate = update as Record<string, unknown>
+  })
+
+  // Remote update with newer timestamp to trigger updateDoc
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncIssue({
+    title: 'v2',
+    updatedAt: '2024-01-02T10:00:00.000Z'
+  }))
+
+  expect(capturedUpdate).toBeDefined()
+  expect(capturedUpdate?._originated).toBe('gitlab')
+})

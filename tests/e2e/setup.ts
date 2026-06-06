@@ -455,3 +455,771 @@ export async function setupStackForMR (deps: HarnessDeps, args: SeedMRArgs = {})
   const mr = await seedGitLabMR(deps, deps.gitlabBaseUrl, base.gitlabRootToken, base.gitlabProjectId, args)
   return { ...base, ...mr }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: review threads, approvals, diff metadata, reviewer migration
+// ---------------------------------------------------------------------------
+
+export interface SeedDiscussionPosition {
+  baseSha: string
+  startSha: string
+  headSha: string
+  oldPath: string
+  newPath: string
+  positionType: 'text'
+  oldLine?: number
+  newLine?: number
+}
+
+export interface SeedDiscussionArgs {
+  body: string
+  position?: SeedDiscussionPosition
+}
+
+export interface SeedDiscussionResult {
+  discussionId: string
+  noteId: number
+}
+
+export interface SeedDiscussionBody {
+  body: string
+  position?: {
+    base_sha: string
+    start_sha: string
+    head_sha: string
+    old_path: string
+    new_path: string
+    position_type: 'text'
+    old_line?: number
+    new_line?: number
+  }
+}
+
+/** Build the REST POST body for `POST /api/v4/projects/:id/merge_requests/:iid/discussions`. */
+export function buildSeedDiscussionBody (args: SeedDiscussionArgs): SeedDiscussionBody {
+  const body: SeedDiscussionBody = { body: args.body }
+  if (args.position !== undefined) {
+    body.position = {
+      base_sha: args.position.baseSha,
+      start_sha: args.position.startSha,
+      head_sha: args.position.headSha,
+      old_path: args.position.oldPath,
+      new_path: args.position.newPath,
+      position_type: args.position.positionType
+    }
+    if (args.position.oldLine !== undefined) {
+      body.position.old_line = args.position.oldLine
+    }
+    if (args.position.newLine !== undefined) {
+      body.position.new_line = args.position.newLine
+    }
+  }
+  return body
+}
+
+/**
+ * Seed a discussion (thread) on a GitLab merge request. When `position` is
+ * provided the discussion is a line-anchored review comment; otherwise it is
+ * a free-form thread.
+ */
+export async function seedGitLabDiscussion (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  args: SeedDiscussionArgs
+): Promise<SeedDiscussionResult> {
+  const body = buildSeedDiscussionBody(args)
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    }
+  )
+  if (res.status !== 201) {
+    throw new Error(`seedGitLabDiscussion: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { id: string, notes?: Array<{ id: number }> }
+  const firstNote = json.notes?.[0]
+  if (firstNote === undefined) {
+    throw new Error('seedGitLabDiscussion: response missing first note')
+  }
+  return { discussionId: json.id, noteId: firstNote.id }
+}
+
+export interface SeedDiscussionReplyArgs {
+  discussionId: string
+  body: string
+}
+
+/**
+ * Append a reply note to an existing discussion thread. The reply inherits
+ * the parent discussion's position; `position` is not posted on reply notes
+ * (per the GitLab API).
+ */
+export async function seedGitLabDiscussionReply (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  args: SeedDiscussionReplyArgs
+): Promise<{ noteId: number }> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions/${encodeURIComponent(args.discussionId)}/notes`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ body: args.body })
+    }
+  )
+  if (res.status !== 201) {
+    throw new Error(`seedGitLabDiscussionReply: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { id: number }
+  return { noteId: json.id }
+}
+
+/**
+ * Resolve a discussion on a GitLab MR via REST. Used to assert the
+ * `gitlab-review.resolved` mixin flips true on all notes in the thread.
+ */
+export async function resolveGitLabDiscussion (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  discussionId: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions/${encodeURIComponent(discussionId)}?resolved=true`,
+    {
+      method: 'PUT',
+      headers: { 'PRIVATE-TOKEN': rootToken }
+    }
+  )
+  if (res.status !== 200) {
+    throw new Error(`resolveGitLabDiscussion: unexpected status ${res.status}`)
+  }
+}
+
+/**
+ * Approve a merge request as a specific user (via that user's PRIVATE-TOKEN).
+ * The token is the approver's personal access token, not the root token.
+ */
+export async function seedGitLabApprover (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  projectId: number,
+  mrIid: number,
+  approverToken: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approve`,
+    {
+      method: 'POST',
+      headers: { 'PRIVATE-TOKEN': approverToken }
+    }
+  )
+  if (res.status !== 201 && res.status !== 200) {
+    throw new Error(`seedGitLabApprover: unexpected status ${res.status}`)
+  }
+}
+
+/**
+ * Unapprove a merge request as a specific user. Used to assert the
+ * `gitlab-mr.approvedBy` list shrinks.
+ */
+export async function unapproveGitLabMR (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  projectId: number,
+  mrIid: number,
+  approverToken: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/unapprove`,
+    {
+      method: 'POST',
+      headers: { 'PRIVATE-TOKEN': approverToken }
+    }
+  )
+  if (res.status !== 201 && res.status !== 200) {
+    throw new Error(`unapproveGitLabMR: unexpected status ${res.status}`)
+  }
+}
+
+export interface MRApprovalsResponse {
+  approvalsRequired: number
+  approvedBy: string[]
+}
+
+/**
+ * GET the approvals snapshot for an MR. Used by the diff/approval assertion
+ * helpers to cross-check the Huly mirror state against GitLab ground truth.
+ */
+export async function getMRApprovalsFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRApprovalsResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approvals`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRApprovalsFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as {
+    approvals_required: number
+    approved_by?: Array<{ user: { username: string } }>
+  }
+  return {
+    approvalsRequired: body.approvals_required,
+    approvedBy: (body.approved_by ?? []).map((a) => a.user.username)
+  }
+}
+
+export interface MRDiffFile {
+  oldPath: string
+  newPath: string
+  newFile: boolean
+  renamedFile: boolean
+  deletedFile: boolean
+}
+
+export interface MRDiffResponse {
+  files: MRDiffFile[]
+  webUrl: string
+}
+
+/**
+ * GET the changes/diff snapshot for an MR. Used to cross-check the
+ * `gitlab-mr.changedFiles` mirror.
+ */
+export async function getMRDiffFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRDiffResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/changes`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRDiffFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as {
+    web_url: string
+    changes?: Array<{
+      old_path: string
+      new_path: string
+      new_file: boolean
+      renamed_file: boolean
+      deleted_file: boolean
+    }>
+  }
+  return {
+    webUrl: body.web_url,
+    files: (body.changes ?? []).map((c) => ({
+      oldPath: c.old_path,
+      newPath: c.new_path,
+      newFile: c.new_file,
+      renamedFile: c.renamed_file,
+      deletedFile: c.deleted_file
+    }))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// directMixinPatch — harness-only writer for ChatMessage AND Issue mixins
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal transactor interface required by `directMixinPatch*` helpers.
+ *
+ * The real harness binds this to a `@hcengineering/client` connection. Unit
+ * tests inject a mock that records the call shape. This keeps the harness
+ * decoupled from the heavy transactor client at type level.
+ */
+export interface MinimalTransactor {
+  createMixin: (
+    targetRef: string,
+    targetClass: string,
+    space: string,
+    mixin: string,
+    attrs: Record<string, unknown>
+  ) => Promise<void>
+  updateMixin: (
+    targetRef: string,
+    targetClass: string,
+    space: string,
+    mixin: string,
+    attrs: Record<string, unknown>
+  ) => Promise<void>
+}
+
+/** Class id for tracker.Issue — duplicated as a string constant to avoid pulling the heavy core import into the harness. */
+export const HARNESS_ISSUE_CLASS = 'tracker:class:Issue'
+/** Class id for chunter.ChatMessage. */
+export const HARNESS_CHAT_MESSAGE_CLASS = 'chunter:class:ChatMessage'
+
+export interface DirectMixinPatchArgs {
+  targetRef: string
+  space: string
+  mixin: string
+  attrs: Record<string, unknown>
+  mode?: 'create' | 'update'
+}
+
+/**
+ * Patch a runtime mixin onto a tracker.Issue via the transactor. Phase 2
+ * shape; preserved here verbatim so existing call sites keep working.
+ */
+export async function directMixinPatchOnIssue (
+  transactor: MinimalTransactor,
+  args: DirectMixinPatchArgs
+): Promise<void> {
+  const mode = args.mode ?? 'update'
+  if (mode === 'create') {
+    await transactor.createMixin(args.targetRef, HARNESS_ISSUE_CLASS, args.space, args.mixin, args.attrs)
+  } else {
+    await transactor.updateMixin(args.targetRef, HARNESS_ISSUE_CLASS, args.space, args.mixin, args.attrs)
+  }
+}
+
+/**
+ * Patch a runtime mixin onto a chunter.ChatMessage via the transactor.
+ * Phase 3 addition (C18) — Phase 2 harness only supported Issue mixins.
+ */
+export async function directMixinPatchOnChatMessage (
+  transactor: MinimalTransactor,
+  args: DirectMixinPatchArgs
+): Promise<void> {
+  const mode = args.mode ?? 'update'
+  if (mode === 'create') {
+    await transactor.createMixin(args.targetRef, HARNESS_CHAT_MESSAGE_CLASS, args.space, args.mixin, args.attrs)
+  } else {
+    await transactor.updateMixin(args.targetRef, HARNESS_CHAT_MESSAGE_CLASS, args.space, args.mixin, args.attrs)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: migration endpoint client
+// ---------------------------------------------------------------------------
+
+export interface MigrationResponse {
+  status: number
+  body: unknown
+}
+
+/**
+ * POST to the reviewer-label migration endpoint with bearer auth.
+ * Returns the parsed JSON body alongside the status so 409 and 200 paths
+ * can be asserted symmetrically.
+ */
+export async function postMigrateReviewerLabels (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podBaseUrl: string, serverSecret: string, bindingId: string }
+): Promise<MigrationResponse> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}/migrate-reviewer-labels`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${args.serverSecret}` }
+    }
+  )
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}
+
+/**
+ * PATCH a binding's `disabled` flag. Used by the migration runbook to pause
+ * delivery before invoking `migrate-reviewer-labels`.
+ */
+export async function patchBindingDisabled (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podBaseUrl: string, serverSecret: string, bindingId: string, disabled: boolean }
+): Promise<{ status: number }> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${args.serverSecret}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ disabled: args.disabled })
+    }
+  )
+  return { status: res.status }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Path B synthetic tx, EE inspection, multi-instance, user OAuth
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal Huly client interface required by `simulateHulyTxEdit`. The real
+ * harness binds this to a `@hcengineering/client` connection. Tests inject a
+ * mock that records the call shape so the helper stays decoupled from the
+ * heavy transactor client at the type level (mirrors `MinimalTransactor`).
+ */
+export interface MinimalHulyTxClient {
+  updateDoc: (
+    objectClass: string,
+    space: string,
+    objectId: string,
+    operations: Record<string, unknown>
+  ) => Promise<void>
+}
+
+export interface SimulateHulyTxEditArgs {
+  /** Huly doc ref (e.g. mirror Issue ref) to mutate. */
+  issueRef: string
+  /** Space the doc lives in. */
+  space: string
+  /** Flat field name that the engine's classifier picks up (e.g. `title`). */
+  field: string
+  /** New value for the field. */
+  value: unknown
+  /** Optional object class override (defaults to tracker.Issue). */
+  objectClass?: string
+}
+
+/**
+ * Simulate a Huly user editing a mirror Issue field. Drives the same code
+ * path the real Huly UI exercises, which the TxSubscriber observes and
+ * forwards to `engine.enqueueLocalEvent`. Used by the Path B E2E to assert
+ * GitLab REST endpoints are called within the 30s SLA.
+ */
+export async function simulateHulyTxEdit (
+  transactor: MinimalHulyTxClient,
+  args: SimulateHulyTxEditArgs
+): Promise<void> {
+  await transactor.updateDoc(
+    args.objectClass ?? HARNESS_ISSUE_CLASS,
+    args.space,
+    args.issueRef,
+    { [args.field]: args.value }
+  )
+}
+
+export interface MRApprovalRule {
+  id: number
+  name: string
+  approvalsRequired: number
+  approvedBy: string[]
+}
+
+export interface MRApprovalRulesResponse {
+  rules: MRApprovalRule[]
+}
+
+/**
+ * GET the EE approval-rules snapshot for an MR. The endpoint only exists on
+ * GitLab EE; on CE the API returns 404 / 403. Used by the EE E2E to assert
+ * the `gitlab-mr.approvalRules` mixin is populated within 30s.
+ */
+export async function getMRApprovalRulesFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRApprovalRulesResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approval_rules`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRApprovalRulesFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as Array<{
+    id: number
+    name: string
+    approvals_required: number
+    approved_by?: Array<{ username: string }>
+  }>
+  return {
+    rules: body.map((r) => ({
+      id: r.id,
+      name: r.name,
+      approvalsRequired: r.approvals_required,
+      approvedBy: (r.approved_by ?? []).map((u) => u.username)
+    }))
+  }
+}
+
+export interface CreateEpicArgs {
+  title: string
+  description?: string
+  labels?: string[]
+}
+
+export interface CreateEpicResult {
+  epicIid: number
+  groupId: number
+}
+
+/**
+ * Create an epic on a GitLab group (EE-only resource). Used by the EE E2E to
+ * seed parent epics for the mirror-creation assertions.
+ */
+export async function createGitLabEpic (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  groupId: number,
+  args: CreateEpicArgs
+): Promise<CreateEpicResult> {
+  const body: Record<string, unknown> = { title: args.title }
+  if (args.description !== undefined) body.description = args.description
+  if (args.labels !== undefined) body.labels = args.labels.join(',')
+
+  const res = await deps.fetch(`${gitlabBaseUrl}/api/v4/groups/${groupId}/epics`, {
+    method: 'POST',
+    headers: {
+      'PRIVATE-TOKEN': rootToken,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  })
+  if (res.status !== 201) {
+    throw new Error(`createGitLabEpic: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { iid: number, group_id: number }
+  return { epicIid: json.iid, groupId: json.group_id }
+}
+
+export interface LinkUserOAuthArgs {
+  podUrl: string
+  hulyUserCookie: string
+  gitlabBaseUrl: string
+}
+
+export interface LinkUserOAuthResult {
+  startStatus: number
+  callbackStatus: number
+  redirectLocation?: string
+}
+
+/**
+ * Drive the `/user/oauth/start` → `/user/oauth/callback` flow against the pod
+ * with a pre-minted `huly-user` cookie. Returns the observed HTTP statuses
+ * from each leg so the caller can assert the full handshake completes.
+ */
+export async function linkUserOAuth (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: LinkUserOAuthArgs
+): Promise<LinkUserOAuthResult> {
+  const startRes = await deps.fetch(`${args.podUrl}/user/oauth/start`, {
+    method: 'GET',
+    headers: { Cookie: `huly-user=${args.hulyUserCookie}` },
+    redirect: 'manual'
+  })
+  const redirectLocation = (typeof startRes.headers?.get === 'function')
+    ? (startRes.headers.get('location') ?? undefined)
+    : undefined
+
+  let callbackStatus = 0
+  const stateMatch = redirectLocation?.match(/[?&]state=([^&]+)/)
+  if (stateMatch !== null && stateMatch !== undefined) {
+    const state = stateMatch[1]
+    const cbRes = await deps.fetch(
+      `${args.podUrl}/user/oauth/callback?code=test-code&state=${state}`,
+      {
+        method: 'GET',
+        headers: { Cookie: `huly-user=${args.hulyUserCookie}` }
+      }
+    )
+    callbackStatus = cbRes.status
+  }
+
+  return { startStatus: startRes.status, callbackStatus, redirectLocation }
+}
+
+export interface UserOAuthStatusResponse {
+  linked: boolean
+  username?: string
+}
+
+/**
+ * GET the per-user OAuth status. Bearer-protected (SCG-3). Returns the
+ * parsed JSON body normalized to camelCase.
+ */
+export async function getUserOAuthStatus (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podUrl: string, bearer: string }
+): Promise<{ status: number, body: UserOAuthStatusResponse | { error: string } }> {
+  const res = await deps.fetch(`${args.podUrl}/user/oauth/status`, {
+    headers: { Authorization: `Bearer ${args.bearer}` }
+  })
+  const text = await res.text()
+  try {
+    return { status: res.status, body: JSON.parse(text) }
+  } catch {
+    return { status: res.status, body: { error: text } }
+  }
+}
+
+/**
+ * DELETE the per-user credential. Bearer-protected.
+ */
+export async function deleteUserOAuthCredential (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podUrl: string, bearer: string }
+): Promise<{ status: number }> {
+  const res = await deps.fetch(`${args.podUrl}/user/oauth/credential`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${args.bearer}` }
+  })
+  return { status: res.status }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: originated-marker, mixin-split, GraphQL fallback, secret rotation
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a field on a mirror Issue via the transactor to exercise the
+ * originated-marker / echo-storm filter path (P5-T-28).
+ *
+ * The real harness wires `transactor` to a `@hcengineering/client` connection
+ * using the service-account identity so the resulting tx is authored by the
+ * service account. TxSubscriber sees `tx.modifiedBy === serviceAccountPersonId`
+ * and drops the tx via the originated-marker check. Unit tests inject a mock
+ * that records the call shape.
+ */
+export async function triggerHulyTxWrite (
+  transactor: MinimalTransactor,
+  targetRef: string,
+  field: string,
+  value: unknown
+): Promise<void> {
+  await transactor.updateMixin(
+    targetRef,
+    HARNESS_ISSUE_CLASS,
+    targetRef,
+    'gitlab-mr',
+    { [field]: value }
+  )
+}
+
+export interface MixinSplitMigrationArgs {
+  podBaseUrl: string
+  bindingId: string
+  bearer: string
+}
+
+/**
+ * POST to the mixin-split migration endpoint. Returns the parsed JSON body
+ * alongside the HTTP status so 200, 409, and error paths can be asserted.
+ */
+export async function runMixinSplitMigration (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: MixinSplitMigrationArgs
+): Promise<MigrationResponse> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}/migrate-mixin-split`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${args.bearer}` }
+    }
+  )
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}
+
+export interface ForceGraphQLFailureArgs {
+  gitlabBaseUrl: string
+  rootToken: string
+}
+
+/**
+ * Force the GitLab GraphQL endpoint to fail so the pod exercises the REST
+ * fallback path (P5-T-28). On a real stack this disables the GraphQL endpoint
+ * via a feature flag; in unit tests this is a no-op (callers inject a fetch
+ * mock that already returns 500 for /api/graphql).
+ */
+export async function forceGraphQLFailure (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: ForceGraphQLFailureArgs
+): Promise<{ status: number }> {
+  const res = await deps.fetch(
+    `${args.gitlabBaseUrl}/api/v4/features/graphql_toggle`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': args.rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ value: false })
+    }
+  )
+  return { status: res.status }
+}
+
+export interface RotateServerSecretArgs {
+  podUrl: string
+  bearer: string
+  newPrimary: string
+}
+
+export interface RotateServerSecretResponse {
+  status: number
+  body: unknown
+}
+
+/**
+ * Admin call to rotate the pod's signing secret (P5-T-28). The pod promotes
+ * `newPrimary` to the PRIMARY slot and moves the current primary into the
+ * PREVIOUS_SECRET grace window so cookies signed before rotation remain valid.
+ */
+export async function rotateServerSecret (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: RotateServerSecretArgs
+): Promise<RotateServerSecretResponse> {
+  const res = await deps.fetch(`${args.podUrl}/api/v1/admin/rotate-secret`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${args.bearer}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ newPrimary: args.newPrimary })
+  })
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}

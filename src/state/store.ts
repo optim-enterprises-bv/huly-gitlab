@@ -6,7 +6,17 @@ import type { DedupDoc } from './dedup'
 import type { InflightDoc } from './inflight'
 import type { CredentialDoc } from './credentials'
 import type { OAuthStateDoc } from './oauth-state'
+import type { UserCredentialDoc } from './user-credentials'
 import type { AttachmentMirrorDoc } from './attachment-mirror'
+
+export interface DismissedSuggestionDoc {
+  workspaceUuid: string
+  hulyPersonUuid: string
+  bindingId: string
+  mrIid: string
+  noteId: string
+  dismissedAt: Date
+}
 
 export class Store {
   private readonly client: MongoClient
@@ -59,6 +69,14 @@ export class Store {
 
   oauthStates (): Collection<OAuthStateDoc> {
     return this.getDb().collection<OAuthStateDoc>('oauth_state')
+  }
+
+  userCredentials (): Collection<UserCredentialDoc> {
+    return this.getDb().collection<UserCredentialDoc>('user_credentials')
+  }
+
+  dismissedSuggestions (): Collection<DismissedSuggestionDoc> {
+    return this.getDb().collection<DismissedSuggestionDoc>('dismissed_suggestions')
   }
 
   attachmentMirror (): Collection<AttachmentMirrorDoc> {
@@ -116,6 +134,18 @@ export class Store {
     await db.collection('oauth_state').createIndex(
       { state: 1 },
       { unique: true, name: 'oauth_state_unique' }
+    )
+
+    // user_credentials: unique per (workspaceUuid, hulyPersonUuid, gitlabBaseUrl)
+    await db.collection('user_credentials').createIndex(
+      { workspaceUuid: 1, hulyPersonUuid: 1, gitlabBaseUrl: 1 },
+      { unique: true, name: 'user_credentials_workspace_person_baseurl' }
+    )
+
+    // dismissed_suggestions: unique per (workspaceUuid, hulyPersonUuid, bindingId, mrIid, noteId)
+    await db.collection('dismissed_suggestions').createIndex(
+      { workspaceUuid: 1, hulyPersonUuid: 1, bindingId: 1, mrIid: 1, noteId: 1 },
+      { unique: true, name: 'dismissed_suggestions_unique' }
     )
 
     // attachment_mirror: unique per (contentHash, origin) — dedupe key
