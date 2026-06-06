@@ -8,6 +8,7 @@ import type { UserIdentity } from '../huly/users'
 import type { Logger } from '../logging'
 import type { Store } from '../state/store'
 import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
+import { increment, METRIC_NAMES } from '../metrics'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 
@@ -118,6 +119,7 @@ export async function migrateReviewerLabels (
         reviewersResolved++
       } else {
         unresolvedCount++
+        increment(METRIC_NAMES.MIGRATION_REVIEWER_UNRESOLVED)
         logger.warn('reviewer-migration: cannot resolve reviewer to PersonUuid', { username })
       }
     }

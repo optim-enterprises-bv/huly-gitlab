@@ -1,7 +1,7 @@
 import request from 'supertest'
 import express from 'express'
 import bodyParser from 'body-parser'
-import { createWebhookRouter, getConfidentialSkippedCount, getMrSkippedCount, getUnboundPipelineCount } from '../../src/http/webhook'
+import { createWebhookRouter, getConfidentialSkippedCount, getMrSkippedCount, getUnboundPipelineCount, getEpicCeSkippedCount, getPayloadInvalidCount } from '../../src/http/webhook'
 import type { Store } from '../../src/state/store'
 import type { SyncEngine } from '../../src/sync/engine'
 import type { Logger } from '../../src/logging'
@@ -443,5 +443,109 @@ describe('POST /webhook/:bindingId', () => {
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ accepted: false, reason: 'binding disabled' })
     expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
+  })
+
+  // -------------------------------------------------------------------------
+  // P4-T-17: Epic Hook branch (DAG-3 explicit enqueueWebhookEvent assertion)
+  // -------------------------------------------------------------------------
+
+  test('P4-17-1. Valid Epic Hook → 200, enqueueWebhookEvent called with kind=epic (DAG-3)', async () => {
+    const store = makeStore()
+    const engine = makeSyncEngine()
+    const app = buildApp(store, engine)
+
+    const res = await request(app)
+      .post(`/webhook/${validBindingId}`)
+      .set('X-Gitlab-Event', 'Epic Hook')
+      .set('X-Gitlab-Token', WEBHOOK_SECRET)
+      .set('X-Gitlab-Event-Uuid', 'uuid-epic-1')
+      .send({
+        object_attributes: {
+          iid: 5,
+          group_id: 99,
+          action: 'update',
+          updated_at: '2024-05-01T00:00:00Z',
+          confidential: false
+        }
+      })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ accepted: true })
+    expect(engine.enqueueWebhookEvent).toHaveBeenCalledTimes(1)
+    expect(engine.enqueueWebhookEvent).toHaveBeenCalledWith(
+      validBindingId,
+      'epic',
+      expect.objectContaining({
+        object_attributes: expect.objectContaining({ iid: 5, group_id: 99, action: 'update' })
+      }),
+      'uuid-epic-1',
+      '2024-05-01T00:00:00Z'
+    )
+  })
+
+  test('P4-17-2. Epic Hook with confidential=true → 204, NOT enqueued', async () => {
+    const store = makeStore()
+    const engine = makeSyncEngine()
+    const app = buildApp(store, engine)
+
+    const beforeConf = getConfidentialSkippedCount()
+
+    const res = await request(app)
+      .post(`/webhook/${validBindingId}`)
+      .set('X-Gitlab-Event', 'Epic Hook')
+      .set('X-Gitlab-Token', WEBHOOK_SECRET)
+      .send({
+        object_attributes: {
+          iid: 6,
+          group_id: 99,
+          action: 'update',
+          confidential: true
+        }
+      })
+
+    expect(res.status).toBe(204)
+    expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
+    expect(getConfidentialSkippedCount()).toBe(beforeConf + 1)
+  })
+
+  test('P4-17-3. Confidential Epic Hook event header → 204, NOT enqueued, metric incremented', async () => {
+    const store = makeStore()
+    const engine = makeSyncEngine()
+    const app = buildApp(store, engine)
+
+    const beforeConf = getConfidentialSkippedCount()
+
+    const res = await request(app)
+      .post(`/webhook/${validBindingId}`)
+      .set('X-Gitlab-Event', 'Confidential Epic Hook')
+      .set('X-Gitlab-Token', WEBHOOK_SECRET)
+      .send({ object_attributes: { iid: 7, group_id: 99 } })
+
+    expect(res.status).toBe(204)
+    expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
+    expect(getConfidentialSkippedCount()).toBe(beforeConf + 1)
+  })
+
+  test('P4-17-4. Epic Hook with malformed payload (missing object_attributes.iid) → 400, NOT enqueued, payload invalid metric incremented', async () => {
+    const store = makeStore()
+    const engine = makeSyncEngine()
+    const app = buildApp(store, engine)
+
+    const beforeInvalid = getPayloadInvalidCount()
+
+    const res = await request(app)
+      .post(`/webhook/${validBindingId}`)
+      .set('X-Gitlab-Event', 'Epic Hook')
+      .set('X-Gitlab-Token', WEBHOOK_SECRET)
+      .send({
+        object_attributes: {
+          group_id: 99,
+          action: 'update'
+        }
+      })
+
+    expect(res.status).toBe(400)
+    expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
+    expect(getPayloadInvalidCount()).toBe(beforeInvalid + 1)
   })
 })

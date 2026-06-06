@@ -1,6 +1,7 @@
 import type { Ref, Space, TxOperations } from '@hcengineering/core'
 import tracker, { type Milestone } from '@hcengineering/tracker'
 import type { SyncMilestone } from '../adapter/types'
+import { BiDirectionalCache } from './bi-directional-cache'
 
 /**
  * Minimal GitLab client surface used by MilestoneCache.
@@ -17,15 +18,18 @@ export interface MilestoneGitLabClient {
  * Per-binding cache of GitLab milestones and Huly Milestone refs.
  */
 export class MilestoneCache {
-  private readonly remoteByTitle = new Map<string, SyncMilestone>()
-  private readonly localByLabel = new Map<string, Ref<Milestone>>()
+  private readonly remoteByTitle: BiDirectionalCache<string, SyncMilestone>
+  private readonly localByLabel: BiDirectionalCache<string, Ref<Milestone>>
   private remoteLoaded = false
   private localLoaded = false
 
   constructor (
     private readonly gitlabProjectId: number | string,
     private readonly hulyProjectRef: Ref<Space>
-  ) {}
+  ) {
+    this.remoteByTitle = new BiDirectionalCache({ loadAll: async () => [] })
+    this.localByLabel = new BiDirectionalCache({ loadAll: async () => [] })
+  }
 
   async ensureRemoteMilestone (
     client: MilestoneGitLabClient,
@@ -34,14 +38,14 @@ export class MilestoneCache {
   ): Promise<SyncMilestone> {
     await this.primeRemote(client)
     const key = title.toLowerCase()
-    const existing = this.remoteByTitle.get(key)
+    const existing = await this.remoteByTitle.get(key)
     if (existing !== undefined) return existing
 
     const body: { title: string, description?: string } = { title }
     if (description !== undefined) body.description = description
 
     const created = await client.createMilestone(this.gitlabProjectId, body)
-    this.remoteByTitle.set(key, created)
+    this.remoteByTitle.put(key, created)
     return created
   }
 
@@ -52,7 +56,7 @@ export class MilestoneCache {
   ): Promise<Ref<Milestone>> {
     await this.primeLocal(ops)
     const key = label.toLowerCase()
-    const existing = this.localByLabel.get(key)
+    const existing = await this.localByLabel.get(key)
     if (existing !== undefined) return existing
 
     const attrs: Partial<Milestone> = { label }
@@ -62,41 +66,37 @@ export class MilestoneCache {
       this.hulyProjectRef,
       attrs
     )
-    this.localByLabel.set(key, ref)
+    this.localByLabel.put(key, ref)
     return ref
   }
 
   primeRemoteSync (milestones: readonly SyncMilestone[]): void {
-    for (const m of milestones) {
-      this.remoteByTitle.set(m.title.toLowerCase(), m)
-    }
+    this.remoteByTitle.primeSync(milestones.map(m => ({ key: m.title.toLowerCase(), value: m })))
     this.remoteLoaded = true
   }
 
   primeLocalSync (entries: ReadonlyArray<{ label: string, ref: Ref<Milestone> }>): void {
-    for (const e of entries) {
-      this.localByLabel.set(e.label.toLowerCase(), e.ref)
-    }
+    this.localByLabel.primeSync(entries.map(e => ({ key: e.label.toLowerCase(), value: e.ref })))
     this.localLoaded = true
   }
 
   private async primeRemote (client: MilestoneGitLabClient): Promise<void> {
     if (this.remoteLoaded) return
     const ms = await client.listMilestones(this.gitlabProjectId)
-    for (const m of ms) {
-      this.remoteByTitle.set(m.title.toLowerCase(), m)
-    }
+    this.remoteByTitle.primeSync(ms.map(m => ({ key: m.title.toLowerCase(), value: m })))
     this.remoteLoaded = true
   }
 
   private async primeLocal (ops: TxOperations): Promise<void> {
     if (this.localLoaded) return
     const found = await ops.findAll<Milestone>(tracker.class.Milestone, {})
+    const entries: Array<{ key: string, value: Ref<Milestone> }> = []
     for (const m of found) {
       if (m.space === this.hulyProjectRef) {
-        this.localByLabel.set(m.label.toLowerCase(), m._id)
+        entries.push({ key: m.label.toLowerCase(), value: m._id })
       }
     }
+    this.localByLabel.primeSync(entries)
     this.localLoaded = true
   }
 }

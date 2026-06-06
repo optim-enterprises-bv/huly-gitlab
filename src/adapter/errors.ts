@@ -48,6 +48,17 @@ export class ConfidentialMergeRequestError extends Error {
   }
 }
 
+export class ConfidentialEpicError extends Error {
+  readonly iid: number
+  readonly groupId: number
+  constructor (iid: number, groupId: number) {
+    super(`Confidential epic !${iid} in group ${groupId} cannot be synced`)
+    this.name = 'ConfidentialEpicError'
+    this.iid = iid
+    this.groupId = groupId
+  }
+}
+
 export class ApprovalActionError extends Error {
   readonly kind: 'approve' | 'unapprove'
   /**

@@ -88,4 +88,32 @@ describe('buildWebhookPayload', () => {
     expect(body.url).toBe(url)
     expect(body.token).toBe(token)
   })
+
+  test('5. epic_events honored when passed in eventFlags', () => {
+    const body = buildWebhookPayload({
+      url: 'https://h/x',
+      token: 't',
+      eventFlags: { epic_events: true }
+    })
+
+    expect(body.epic_events).toBe(true)
+    expect(body.confidential_epic_events).toBe(false)
+  })
+
+  test('6. confidential_epic_events always false even if caller passes true', () => {
+    const malicious: Record<string, boolean> = {
+      epic_events: true,
+      confidential_epic_events: true
+    }
+
+    const body = buildWebhookPayload({
+      url: 'https://h/x',
+      token: 't',
+      eventFlags: malicious as unknown as Parameters<typeof buildWebhookPayload>[0]['eventFlags']
+    })
+
+    expect(body.epic_events).toBe(true)
+    // Critical: confidential_epic_events is hardcoded false
+    expect(body.confidential_epic_events).toBe(false)
+  })
 })

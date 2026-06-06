@@ -33,5 +33,11 @@ export const METRIC_NAMES = {
   REVIEW_PARENT_MISSING: 'review.parent.missing',
   REVIEW_POSITION_MALFORMED: 'review.position.malformed',
   DISCUSSION_POSITION_UNSUPPORTED: 'discussion.position.unsupported',
-  MIGRATION_REVIEWER_UNRESOLVED: 'migration.reviewer.unresolved'
+  MIGRATION_REVIEWER_UNRESOLVED: 'migration.reviewer.unresolved',
+  TX_SUBSCRIPTION_ECHO_DROPPED: 'tx.subscription.echo.dropped',
+  TX_SUBSCRIPTION_BUFFER_OVERFLOW: 'tx.subscription.buffer.overflow',
+  WEBHOOK_EPIC_CE_SKIPPED: 'epic_hook.ce_skipped',
+  WEBHOOK_PAYLOAD_INVALID: 'webhook.payload.invalid',
+  EPIC_EE_SKIPPED: 'epic.ee.skipped',
+  EPIC_CHILD_DEFERRED: 'epic.child.deferred'
 } as const

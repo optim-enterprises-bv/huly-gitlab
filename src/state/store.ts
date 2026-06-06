@@ -6,6 +6,7 @@ import type { DedupDoc } from './dedup'
 import type { InflightDoc } from './inflight'
 import type { CredentialDoc } from './credentials'
 import type { OAuthStateDoc } from './oauth-state'
+import type { UserCredentialDoc } from './user-credentials'
 
 export class Store {
   private readonly client: MongoClient
@@ -60,6 +61,10 @@ export class Store {
     return this.getDb().collection<OAuthStateDoc>('oauth_state')
   }
 
+  userCredentials (): Collection<UserCredentialDoc> {
+    return this.getDb().collection<UserCredentialDoc>('user_credentials')
+  }
+
   private async createIndexes (): Promise<void> {
     const db = this.getDb()
 
@@ -111,6 +116,12 @@ export class Store {
     await db.collection('oauth_state').createIndex(
       { state: 1 },
       { unique: true, name: 'oauth_state_unique' }
+    )
+
+    // user_credentials: unique per (workspaceUuid, hulyPersonUuid, gitlabBaseUrl)
+    await db.collection('user_credentials').createIndex(
+      { workspaceUuid: 1, hulyPersonUuid: 1, gitlabBaseUrl: 1 },
+      { unique: true, name: 'user_credentials_workspace_person_baseurl' }
     )
   }
 }

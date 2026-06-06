@@ -40,9 +40,23 @@ Phase 3 adds code review primitives to MR mirrors: review threads as GitLab disc
 - **Typed Reviewers Field**: MR reviewers replace Phase 2's synthetic `gitlab:reviewer:*` labels with a typed `reviewers` array of PersonUuids. A one-shot `POST /api/v1/bindings/:id/migrate-reviewer-labels` endpoint converts existing labels for Phase 2 bindings.
 - **Suggestion Blocks Passthrough**: Suggestion comments preserve GitLab's `<<<<<<< SUGGEST` markdown blocks verbatim (no Huly UI affordance in Phase 3).
 
-## Phase 1 + Phase 2 + Phase 3 Limitations
+## Phase 4: EE features + multi-instance + per-user OAuth + Path B closure (FINAL)
 
-The following features are **not** included in this release and are targeted for Phase 4 or later:
+Phase 4 closes Path B (TxMixin subscription wires Huly UI mutations to GitLab), adds EE approval rules + iterations + epics, multi-instance binding support, per-user OAuth credential store with HTML UI, and completes the integration roadmap.
+
+**Phase 4 Features:**
+
+- **Path B Closure - TxSubscriber**: A new `TxSubscriber` hooks the per-workspace Huly `Client` and translates `TxMixin`/`TxCUD`/`TxRemoveDoc` events touching `MR_MIXIN` / `MR_REVIEW_MIXIN` / mirror `tracker.class.Issue` docs into flat `change` envelopes sent to `SyncEngine.enqueueLocalEvent`. Circular-tx storm prevention filters out events authored by the pod's service account and stamps a transient `_originated: 'gitlab'` marker as defense-in-depth.
+- **EE Approval Rules**: GitLab Enterprise Edition approval rules (rule-based required approvers, eligible_approvers) sync bidirectionally on MR mirrors. Community Edition silently returns empty rule list.
+- **EE Iterations**: GitLab iterations (sprints) assigned to issues and MRs. Iterations sync bidirectionally. Community Edition returns empty list.
+- **EE Epics with Parent-Child Hierarchy**: GitLab epics mirror to Huly Issues carrying a `gitlab-epic` mixin. Epic child issues receive a `parentEpicIid` field (populated exclusively by EpicsSyncManager). Cross-project epic children are skipped (per-binding scope).
+- **Multi-instance Support**: A single Huly workspace can bind to multiple GitLab instances. Per-binding `gitLabClient` is constructed from `credential.gitlabBaseUrl`. Idmap `gitlabId` strings are prefixed with a stable 8-hex hash of baseUrl when multi-instance is detected (defense-in-depth against duplicate project IDs across instances).
+- **Per-user OAuth Credential Store**: New `src/state/user-credentials.ts` stores per-user GitLab access tokens in AES-256-GCM encryption, keyed by `(workspaceUuid, hulyPersonUuid, gitlabBaseUrl)`. Includes username captured at OAuth callback.
+- **Minimal OAuth UI**: Vanilla HTML+CSS+JS UI at `/user/ui/` allows Huly users to self-link per-user OAuth credentials, view status, and unlink. Bearer tokens arrive via `postMessage` from the embedding Huly parent window or `sessionStorage`; query-string bearer is rejected; CSP headers prevent inline-script exfiltration.
+
+## Phase 1 + Phase 2 + Phase 3 + Phase 4 Limitations
+
+The following features are **not** included in this release:
 
 ### Carried forward from Phase 1–2
 
@@ -64,8 +78,17 @@ The following features are **not** included in this release and are targeted for
 - **Approval Status Default**: The `approvalStatus` field defaults to `'pending'` when `approvalsRequired=0` (i.e., no approval rule configured on GitLab). This is expected for CE instances.
 - **Migration Requires Binding Pause**: The Phase 2 → Phase 3 reviewer-label migration endpoint (`POST /api/v1/bindings/:id/migrate-reviewer-labels`) requires the operator to pause the binding via `PATCH /api/v1/bindings/:id {disabled: true}` before running migration, then re-enable afterward. This prevents sync writes during label conversion.
 - **Suggestion Comments Markdown Passthrough**: Suggestion blocks (`<<<<<<< SUGGEST ... >>>>>>>> SUGGEST`) in review comments pass through as raw markdown. No Huly UI affordance for inline apply/dismiss; users must manually apply suggestions on GitLab.
-- **EE Approval Rules Not Synced**: Enterprise Edition approval rules (rule-based required approvers) are not synced. The simple CE approval count (`approvalsRequired`) is synced.
 - **Full Diff Body Not Synced**: The complete git diff content is not mirrored to Huly. Only metadata is synced: file paths, additions/deletions count, change status (added/modified/deleted/renamed), and a link to the diff on GitLab (`diffWebUrl`).
+
+### Phase 4 Remaining Limitations (No Phase 5 planned)
+
+Phase 4 is the FINAL phase of this integration. The following are deferred indefinitely:
+
+- **Cookie Format ServerSecret Rotation**: The Huly user cookie uses a single shared ServerSecret with HMAC validation. Rotation requires pod downtime. Multi-secret rotation with gradual migration is not planned.
+- **GraphQL Adapter**: The integration continues to use REST API + capability detection. GraphQL adapter migration is not planned.
+- **Image/File-Level Discussion Annotations**: Review comments support text position only. Image and file-level discussion annotations are not planned.
+- **Suggestion Comments Advanced Affordances**: Suggestion blocks pass through as markdown only. No Huly UI for inline apply/dismiss is planned.
+- **Mixin Field Count Unification**: The `gitlab-mr` mixin remains at 16 fields. Splitting into specialized mixins (e.g., `gitlab-mr-approval`, `gitlab-mr-iteration`) is not planned.
 
 ## Requirements
 

@@ -1,6 +1,6 @@
 import { GraphQLClient } from 'graphql-request'
 import type { Logger } from '../logging'
-import { ApprovalActionError, AuthError, ConfidentialIssueError, ConfidentialMergeRequestError, GitLabApiError, NotFoundError } from './errors'
+import { ApprovalActionError, AuthError, ConfidentialEpicError, ConfidentialIssueError, ConfidentialMergeRequestError, GitLabApiError, NotFoundError } from './errors'
 import { withRateLimitRetry, type RateLimitHeaders } from './rate-limit'
 import { validateGitLabBaseUrl } from '../util/url-validation'
 import * as metrics from '../metrics'
@@ -10,11 +10,14 @@ import type {
   Capabilities,
   MergeStatus,
   SyncChangedFile,
+  SyncEpic,
   SyncIssue,
+  SyncIteration,
   SyncLabel,
   SyncMergeRequest,
   SyncMilestone,
   SyncMRApprovals,
+  SyncMRApprovalRule,
   SyncMRChanges,
   SyncNote,
   SyncPipeline,
@@ -147,7 +150,8 @@ interface RawMergeRequest {
   merged_at?: string | null
   head_pipeline?: { status: string } | null
   labels: string[]
-  milestone?: { iid: number, title: string } | null
+  milestone?: { iid: number, title: string, iteration_id?: number | null, group_id?: number | null } | null
+  iteration?: { id: number, group_id?: number | null } | null
   assignees?: RawUser[]
   reviewers?: RawUser[]
   author: RawUser
@@ -213,6 +217,62 @@ interface RawChange {
 interface RawChangesResponse {
   web_url?: string
   changes?: RawChange[]
+}
+
+interface RawApprovalRule {
+  id: number
+  name: string
+  rule_type: string
+  eligible_approvers?: RawUser[]
+  approvals_required: number
+  approved_by?: Array<{ user?: RawUser } | RawUser>
+}
+
+interface RawIteration {
+  id: number
+  iid?: number
+  title: string
+  description?: string | null
+  state: number | string
+  start_date?: string | null
+  due_date?: string | null
+  web_url: string
+}
+
+interface RawEpic {
+  id: number
+  iid: number
+  group_id: number
+  title: string
+  description?: string | null
+  state: string
+  web_url: string
+  author: RawUser
+  created_at: string
+  updated_at: string
+  confidential?: boolean
+}
+
+interface RawEpicIssue {
+  id: number
+  iid: number
+  project_id: number
+}
+
+interface RawNamespace {
+  id: number
+  full_path: string
+  kind?: string
+}
+
+interface RawProjectWithNamespace extends RawProject {
+  namespace?: RawNamespace
+}
+
+interface RawGroup {
+  id: number
+  parent_id?: number | null
+  full_path?: string
 }
 
 function mapMergeStatus (raw: string): MergeStatus {
@@ -477,11 +537,94 @@ function deriveApprovalStatus (approvals: SyncMRApprovals): ApprovalStatus {
   return 'pending'
 }
 
+function mapApprovalRuleType (raw: string): SyncMRApprovalRule['ruleType'] {
+  if (raw === 'regular' || raw === 'code_owner' || raw === 'any_approver' || raw === 'report_approver') {
+    return raw
+  }
+  return 'regular'
+}
+
+function mapApprovalRule (raw: RawApprovalRule): SyncMRApprovalRule {
+  const approvedBy: SyncUser[] = []
+  for (const entry of raw.approved_by ?? []) {
+    const wrapped = (entry as { user?: RawUser }).user
+    const userObj: RawUser | undefined = wrapped ?? (entry as RawUser)
+    if (userObj?.id !== undefined) {
+      approvedBy.push(mapUser(userObj))
+    }
+  }
+  return {
+    id: raw.id,
+    name: raw.name,
+    ruleType: mapApprovalRuleType(raw.rule_type),
+    eligibleApprovers: (raw.eligible_approvers ?? []).map(mapUser),
+    approvalsRequired: raw.approvals_required,
+    approvedBy
+  }
+}
+
+function mapIterationState (raw: number | string): SyncIteration['state'] {
+  // GitLab API returns numeric state: 1=upcoming, 2=started, 3=closed
+  if (raw === 1 || raw === '1' || raw === 'upcoming') return 'upcoming'
+  if (raw === 2 || raw === '2' || raw === 'started' || raw === 'current') return 'started'
+  if (raw === 3 || raw === '3' || raw === 'closed') return 'closed'
+  return 'upcoming'
+}
+
+function mapIteration (raw: RawIteration): SyncIteration {
+  return {
+    id: String(raw.id),
+    title: raw.title,
+    startDate: raw.start_date != null ? new Date(raw.start_date) : new Date(0),
+    dueDate: raw.due_date != null ? new Date(raw.due_date) : new Date(0),
+    state: mapIterationState(raw.state),
+    webUrl: raw.web_url
+  }
+}
+
+function mapEpicState (raw: string): SyncEpic['state'] {
+  return raw === 'closed' ? 'closed' : 'opened'
+}
+
+function mapEpic (raw: RawEpic, childIssueIids: number[] = []): SyncEpic {
+  return {
+    iid: raw.iid,
+    groupId: raw.group_id,
+    title: raw.title,
+    description: raw.description ?? '',
+    state: mapEpicState(raw.state),
+    webUrl: raw.web_url,
+    childIssueIids,
+    author: mapUser(raw.author),
+    createdAt: new Date(raw.created_at),
+    updatedAt: new Date(raw.updated_at)
+  }
+}
+
+interface ApprovalRuleCacheEntry {
+  value: SyncMRApprovalRule[]
+  expiresAt: number
+}
+
+interface TopLevelGroupCacheEntry {
+  groupId: number
+  expiresAt: number
+}
+
+const APPROVAL_RULES_CACHE_TTL_MS = 10 * 1000
+const APPROVAL_RULES_CACHE_CAPACITY = 256
+const TOP_LEVEL_GROUP_CACHE_TTL_MS = 60 * 60 * 1000
+
 export class GitLabClient {
   private readonly baseUrl: string
   private readonly token: string
   private readonly logger: Logger
   private _capabilities: Capabilities | null = null
+  // P4-R3: short-TTL LRU cache for getMRApprovalRules — bounded by capacity.
+  // Map preserves insertion order; we evict the oldest entry when over capacity.
+  private readonly approvalRulesCache = new Map<string, ApprovalRuleCacheEntry>()
+  // Bug-1: cache of top-level group id per project for 1 hour.
+  private readonly topLevelGroupCache = new Map<number, TopLevelGroupCacheEntry>()
 
   constructor (opts: GitLabClientOptions) {
     try {
@@ -492,6 +635,52 @@ export class GitLabClient {
     this.baseUrl = opts.baseUrl.replace(/\/$/, '')
     this.token = opts.token
     this.logger = opts.logger
+  }
+
+  /**
+   * Capability gate: returns true on EE, false on CE. When capabilities have not
+   * yet been detected (null), this conservatively returns false so EE-only methods
+   * return empty results until detectCapabilities() runs.
+   */
+  private ensureEE (): boolean {
+    return this._capabilities?.edition === 'ee'
+  }
+
+  private now (): number {
+    return Date.now()
+  }
+
+  private approvalRulesCacheKey (projectId: number | string, mrIid: number): string {
+    return `${String(projectId)}:${mrIid}`
+  }
+
+  private approvalRulesCacheGet (key: string): SyncMRApprovalRule[] | null {
+    const entry = this.approvalRulesCache.get(key)
+    if (entry === undefined) return null
+    if (this.now() >= entry.expiresAt) {
+      this.approvalRulesCache.delete(key)
+      return null
+    }
+    // refresh LRU position
+    this.approvalRulesCache.delete(key)
+    this.approvalRulesCache.set(key, entry)
+    return entry.value
+  }
+
+  private approvalRulesCacheSet (key: string, value: SyncMRApprovalRule[]): void {
+    if (this.approvalRulesCache.has(key)) {
+      this.approvalRulesCache.delete(key)
+    }
+    this.approvalRulesCache.set(key, { value, expiresAt: this.now() + APPROVAL_RULES_CACHE_TTL_MS })
+    while (this.approvalRulesCache.size > APPROVAL_RULES_CACHE_CAPACITY) {
+      const oldestKey = this.approvalRulesCache.keys().next().value
+      if (oldestKey === undefined) break
+      this.approvalRulesCache.delete(oldestKey)
+    }
+  }
+
+  private invalidateApprovalRulesCache (projectId: number | string, mrIid: number): void {
+    this.approvalRulesCache.delete(this.approvalRulesCacheKey(projectId, mrIid))
   }
 
   get capabilities (): Capabilities | null {
@@ -909,26 +1098,34 @@ export class GitLabClient {
   }
 
   /**
-   * Fetch a single MR with Phase 3 composite enrichment.
+   * Fetch a single MR with Phase 3 + Phase 4 composite enrichment.
    *
-   * In Phase 3 this issues THREE HTTP requests instead of one:
+   * On CE this issues THREE HTTP requests:
    *   1. GET /merge_requests/:iid       — base MR (mandatory; populates `reviewers`)
    *   2. GET /merge_requests/:iid/approvals — populates approvedBy/approvalsRequired/approvalStatus
    *   3. GET /merge_requests/:iid/changes    — populates diffWebUrl/changedFiles
    *
-   * Calls 2 + 3 run in parallel via Promise.allSettled. If either auxiliary call
+   * On EE this issues UP TO FIVE HTTP requests (Phase 4 P4-T-03):
+   *   4. GET /merge_requests/:iid/approval_rules — populates approvalRules
+   *   5. GET /groups/:groupId/iterations/:iterationId — populates iteration
+   *      (only when the MR's iteration_id is set on either `iteration` or
+   *      `milestone.iteration_id`)
+   *
+   * Calls 2-5 run in parallel via Promise.allSettled. If any auxiliary call
    * rejects (5xx or network error), the corresponding fields are LEFT UNDEFINED
    * (NOT defaulted to []) and the `mr.composite.partial` metric is incremented.
    * The base MR fetch is mandatory — a non-2xx there throws normally.
    *
-   * 404 inside getMRApprovals / getMRChanges is treated as "endpoint missing on
-   * legacy CE projects": those helpers return safe defaults (empty arrays, 0
-   * required, derived diffWebUrl) with the metric incremented; getMergeRequest
-   * still populates the fields with those defaults.
+   * 404 inside getMRApprovals / getMRChanges / getMRApprovalRules is treated as
+   * "endpoint missing on legacy CE projects": those helpers return safe defaults
+   * (empty arrays, 0 required, derived diffWebUrl) with the metric incremented.
    *
-   * Cost: 3 HTTP requests per call vs 1 in Phase 2. `listMergeRequests` does NOT
-   * fan out — it returns minimal MRs with Phase 3 fields left undefined to avoid
-   * an N+1 explosion.
+   * AC-1: the raw `epic_iid` field on the MR payload is IGNORED — parentEpicIid
+   * is exclusively written by EpicsSyncManager via child-issue propagation.
+   *
+   * Cost: 3 HTTP requests per call on CE; up to 5 on EE. `listMergeRequests`
+   * does NOT fan out — it returns minimal MRs with composite fields left
+   * undefined to avoid an N+1 explosion.
    */
   async getMergeRequest (projectId: number | string, mrIid: number): Promise<SyncMergeRequest> {
     const raw = await this.request<RawMergeRequest>('GET', `/api/v4/projects/${projectId}/merge_requests/${mrIid}`)
@@ -937,10 +1134,38 @@ export class GitLabClient {
     }
     const mr = mapMergeRequest(raw, true)
 
-    const [approvalsResult, changesResult] = await Promise.allSettled([
+    const isEE = this.ensureEE()
+    // Derive iteration coordinates from the MR payload. Two GitLab variants:
+    //   - top-level `iteration: { id, group_id }`
+    //   - milestone-embedded `milestone.iteration_id` + `milestone.group_id`
+    let iterationId: number | null = null
+    let iterationGroupId: number | null = null
+    if (raw.iteration != null && typeof raw.iteration.id === 'number') {
+      iterationId = raw.iteration.id
+      iterationGroupId = raw.iteration.group_id ?? null
+    } else if (raw.milestone != null && typeof raw.milestone.iteration_id === 'number') {
+      iterationId = raw.milestone.iteration_id
+      iterationGroupId = raw.milestone.group_id ?? null
+    }
+
+    const tasks: Array<Promise<unknown>> = [
       this.getMRApprovals(projectId, mrIid),
       this.getMRChanges(projectId, mrIid, mr.webUrl)
-    ])
+    ]
+    let approvalRulesIdx = -1
+    let iterationIdx = -1
+    if (isEE) {
+      approvalRulesIdx = tasks.length
+      tasks.push(this.getMRApprovalRules(projectId, mrIid))
+      if (iterationId !== null && iterationGroupId !== null) {
+        iterationIdx = tasks.length
+        tasks.push(this.getIteration(iterationGroupId, iterationId))
+      }
+    }
+
+    const settled = await Promise.allSettled(tasks)
+    const approvalsResult = settled[0] as PromiseSettledResult<SyncMRApprovals>
+    const changesResult = settled[1] as PromiseSettledResult<SyncMRChanges>
 
     if (approvalsResult.status === 'fulfilled') {
       mr.approvedBy = approvalsResult.value.approvedBy
@@ -957,6 +1182,26 @@ export class GitLabClient {
     } else {
       metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
       this.logger.warn('mr.composite.partial', { projectId, mrIid, source: 'changes', error: String(changesResult.reason) })
+    }
+
+    if (approvalRulesIdx !== -1) {
+      const rulesResult = settled[approvalRulesIdx] as PromiseSettledResult<SyncMRApprovalRule[]>
+      if (rulesResult.status === 'fulfilled') {
+        mr.approvalRules = rulesResult.value
+      } else {
+        metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+        this.logger.warn('mr.composite.partial', { projectId, mrIid, source: 'approval_rules', error: String(rulesResult.reason) })
+      }
+    }
+
+    if (iterationIdx !== -1) {
+      const iterResult = settled[iterationIdx] as PromiseSettledResult<SyncIteration | null>
+      if (iterResult.status === 'fulfilled') {
+        mr.iteration = iterResult.value
+      } else {
+        metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+        this.logger.warn('mr.composite.partial', { projectId, mrIid, source: 'iteration', error: String(iterResult.reason) })
+      }
     }
 
     return mr
@@ -1068,6 +1313,7 @@ export class GitLabClient {
               const t = mapDiscussion(d, projectIdNum, mrIid)
               if (t === null) {
                 this.logger.info('discussion.position.unsupported', { projectId, mrIid, discussionId: d.id })
+                metrics.increment(METRIC_NAMES.DISCUSSION_POSITION_UNSUPPORTED)
                 continue
               }
               mapped.push(t)
@@ -1160,6 +1406,7 @@ export class GitLabClient {
         {},
         actorToken
       )
+      this.invalidateApprovalRulesCache(projectId, mrIid)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       throw new ApprovalActionError('approve', String(projectId), mrIid, message)
@@ -1186,6 +1433,7 @@ export class GitLabClient {
         {},
         actorToken
       )
+      this.invalidateApprovalRulesCache(projectId, mrIid)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       throw new ApprovalActionError('unapprove', String(projectId), mrIid, message)
@@ -1320,6 +1568,316 @@ export class GitLabClient {
 
   async getVersion (): Promise<{ version: string, revision: string }> {
     return await this.request<{ version: string, revision: string }>('GET', '/api/v4/version')
+  }
+
+  /**
+   * EE-only: list approval rules for an MR.
+   *
+   * GET /api/v4/projects/:id/merge_requests/:mrIid/approval_rules
+   *
+   * - CE (capabilities.edition !== 'ee'): returns `[]` silently; no HTTP call.
+   * - EE 404: returns `[]` + increments `mr.composite.partial` (legacy CE-style
+   *   404 on EE instance, treated as "no rules configured").
+   * - EE 5xx: propagates as GitLabApiError (caller handles via Promise.allSettled
+   *   in composite path).
+   *
+   * P4-R3 mitigation: results are cached in a bounded in-memory LRU with a 10s
+   * TTL keyed on `(projectId, mrIid)`. The cache is invalidated on any
+   * approveMR/unapproveMR call so subsequent reads see fresh approver state.
+   */
+  async getMRApprovalRules (projectId: number | string, mrIid: number): Promise<SyncMRApprovalRule[]> {
+    if (!this.ensureEE()) {
+      return []
+    }
+    const cacheKey = this.approvalRulesCacheKey(projectId, mrIid)
+    const cached = this.approvalRulesCacheGet(cacheKey)
+    if (cached !== null) {
+      return cached
+    }
+    try {
+      const raw = await this.request<RawApprovalRule[]>(
+        'GET',
+        `/api/v4/projects/${projectId}/merge_requests/${mrIid}/approval_rules`
+      )
+      const rules = raw.map(mapApprovalRule)
+      this.approvalRulesCacheSet(cacheKey, rules)
+      return rules
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        metrics.increment(METRIC_NAMES.MR_COMPOSITE_PARTIAL)
+        this.logger.info('mr.composite.partial', { projectId, mrIid, source: 'approval_rules', reason: '404' })
+        // Negative cache the empty result so repeated 404s do not refire the request.
+        this.approvalRulesCacheSet(cacheKey, [])
+        return []
+      }
+      throw err
+    }
+  }
+
+  /**
+   * EE-only: list iterations for a (top-level) group.
+   *
+   * GET /api/v4/groups/:groupId/iterations
+   * Paginated via X-Next-Page. CE returns `[]` silently.
+   */
+  async listIterations (
+    groupId: number | string,
+    opts: { updatedAfter?: Date } = {}
+  ): Promise<SyncIteration[]> {
+    if (!this.ensureEE()) {
+      return []
+    }
+    const results: SyncIteration[] = []
+    let nextPage: string | null = '1'
+
+    while (nextPage !== null && nextPage !== '') {
+      const rawUrl = new URL(`${this.baseUrl}/api/v4/groups/${groupId}/iterations`)
+      rawUrl.searchParams.set('per_page', '100')
+      rawUrl.searchParams.set('page', nextPage)
+      if (opts.updatedAfter !== undefined) {
+        rawUrl.searchParams.set('updated_after', opts.updatedAfter.toISOString())
+      }
+
+      const urlStr = rawUrl.toString()
+      const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token }
+
+      let pageItems: SyncIteration[] = []
+      let pageNext: string | null = null
+
+      await withRateLimitRetry(async () => {
+        const res = await fetch(urlStr, { headers })
+        const rlHeaders: RateLimitHeaders = {
+          'retry-after': res.headers.get('retry-after') ?? undefined,
+          'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+          'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+        }
+        return {
+          status: res.status,
+          headers: rlHeaders,
+          body: async () => {
+            if (res.status >= 400) {
+              const text = await res.text()
+              throw new GitLabApiError(`GitLab API error ${res.status}: ${text}`, res.status, text)
+            }
+            const raw = await res.json() as RawIteration[]
+            pageItems = raw.map(mapIteration)
+            const nextHeader = res.headers.get('x-next-page')
+            pageNext = (nextHeader !== null && nextHeader !== '') ? nextHeader : null
+          }
+        }
+      })
+
+      results.push(...pageItems)
+      nextPage = pageNext
+    }
+
+    return results
+  }
+
+  /**
+   * EE-only: fetch a single iteration. CE returns null; 404 returns null.
+   */
+  async getIteration (groupId: number | string, iterationId: number | string): Promise<SyncIteration | null> {
+    if (!this.ensureEE()) {
+      return null
+    }
+    try {
+      const raw = await this.request<RawIteration>(
+        'GET',
+        `/api/v4/groups/${groupId}/iterations/${iterationId}`
+      )
+      return mapIteration(raw)
+    } catch (err) {
+      if (err instanceof NotFoundError) {
+        return null
+      }
+      throw err
+    }
+  }
+
+  /**
+   * EE-only: list epics for a (top-level) group.
+   *
+   * GET /api/v4/groups/:groupId/epics
+   * Paginated via X-Next-Page. CE returns `[]` silently.
+   *
+   * `childIssueIids` is NOT populated here — callers (EpicsSyncManager) compose
+   * it via `listEpicIssues` per epic.
+   */
+  async listEpics (
+    groupId: number | string,
+    opts: { updatedAfter?: Date } = {}
+  ): Promise<SyncEpic[]> {
+    if (!this.ensureEE()) {
+      return []
+    }
+    const results: SyncEpic[] = []
+    let nextPage: string | null = '1'
+
+    while (nextPage !== null && nextPage !== '') {
+      const rawUrl = new URL(`${this.baseUrl}/api/v4/groups/${groupId}/epics`)
+      rawUrl.searchParams.set('per_page', '100')
+      rawUrl.searchParams.set('page', nextPage)
+      if (opts.updatedAfter !== undefined) {
+        rawUrl.searchParams.set('updated_after', opts.updatedAfter.toISOString())
+      }
+
+      const urlStr = rawUrl.toString()
+      const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token }
+
+      let pageItems: SyncEpic[] = []
+      let pageNext: string | null = null
+
+      await withRateLimitRetry(async () => {
+        const res = await fetch(urlStr, { headers })
+        const rlHeaders: RateLimitHeaders = {
+          'retry-after': res.headers.get('retry-after') ?? undefined,
+          'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+          'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+        }
+        return {
+          status: res.status,
+          headers: rlHeaders,
+          body: async () => {
+            if (res.status >= 400) {
+              const text = await res.text()
+              throw new GitLabApiError(`GitLab API error ${res.status}: ${text}`, res.status, text)
+            }
+            const raw = await res.json() as RawEpic[]
+            pageItems = raw.map((e) => mapEpic(e))
+            const nextHeader = res.headers.get('x-next-page')
+            pageNext = (nextHeader !== null && nextHeader !== '') ? nextHeader : null
+          }
+        }
+      })
+
+      results.push(...pageItems)
+      nextPage = pageNext
+    }
+
+    return results
+  }
+
+  /**
+   * EE-only: fetch a single epic by iid within a (top-level) group.
+   *
+   * Throws ConfidentialEpicError when the epic has confidential:true.
+   */
+  async getEpic (groupId: number | string, epicIid: number): Promise<SyncEpic> {
+    if (!this.ensureEE()) {
+      // EE-only method invoked on CE — caller misuse; return a placeholder via
+      // throw so the contract stays explicit. The composite/backfill paths must
+      // capability-gate before calling.
+      throw new GitLabApiError('getEpic invoked on a non-EE instance', 0)
+    }
+    const raw = await this.request<RawEpic>(
+      'GET',
+      `/api/v4/groups/${groupId}/epics/${epicIid}`
+    )
+    if (raw.confidential === true) {
+      const groupIdNum = typeof groupId === 'number' ? groupId : parseInt(String(groupId), 10)
+      throw new ConfidentialEpicError(epicIid, groupIdNum)
+    }
+    return mapEpic(raw)
+  }
+
+  /**
+   * EE-only: list child issues of an epic.
+   *
+   * GET /api/v4/groups/:groupId/epics/:epicIid/issues
+   * Returns child issue iids + their project ids so EpicsSyncManager can
+   * filter cross-project issues (Phase 4 per-binding scope limitation).
+   */
+  async listEpicIssues (
+    groupId: number | string,
+    epicIid: number
+  ): Promise<{ iids: number[], projectIds: number[] }> {
+    if (!this.ensureEE()) {
+      return { iids: [], projectIds: [] }
+    }
+    const iids: number[] = []
+    const projectIds: number[] = []
+    let nextPage: string | null = '1'
+
+    while (nextPage !== null && nextPage !== '') {
+      const rawUrl = new URL(`${this.baseUrl}/api/v4/groups/${groupId}/epics/${epicIid}/issues`)
+      rawUrl.searchParams.set('per_page', '100')
+      rawUrl.searchParams.set('page', nextPage)
+
+      const urlStr = rawUrl.toString()
+      const headers: Record<string, string> = { 'PRIVATE-TOKEN': this.token }
+
+      let pageNext: string | null = null
+
+      await withRateLimitRetry(async () => {
+        const res = await fetch(urlStr, { headers })
+        const rlHeaders: RateLimitHeaders = {
+          'retry-after': res.headers.get('retry-after') ?? undefined,
+          'ratelimit-remaining': res.headers.get('ratelimit-remaining') ?? undefined,
+          'ratelimit-reset': res.headers.get('ratelimit-reset') ?? undefined
+        }
+        return {
+          status: res.status,
+          headers: rlHeaders,
+          body: async () => {
+            if (res.status >= 400) {
+              const text = await res.text()
+              throw new GitLabApiError(`GitLab API error ${res.status}: ${text}`, res.status, text)
+            }
+            const raw = await res.json() as RawEpicIssue[]
+            for (const row of raw) {
+              iids.push(row.iid)
+              projectIds.push(row.project_id)
+            }
+            const nextHeader = res.headers.get('x-next-page')
+            pageNext = (nextHeader !== null && nextHeader !== '') ? nextHeader : null
+          }
+        }
+      })
+
+      nextPage = pageNext
+    }
+
+    return { iids, projectIds }
+  }
+
+  /**
+   * Bug-1 fix: epics live at the TOP-LEVEL group, not the immediate sub-group.
+   * Walk the project's namespace chain upward via parent_id to find the root
+   * group id. Cached per project for 1 hour.
+   *
+   * Throws GitLabApiError when the project's namespace is a user namespace
+   * (epics require a group namespace).
+   */
+  async resolveTopLevelGroupForProject (projectId: number | string): Promise<number> {
+    const numericId = typeof projectId === 'number' ? projectId : parseInt(String(projectId), 10)
+    const cached = this.topLevelGroupCache.get(numericId)
+    if (cached !== undefined && this.now() < cached.expiresAt) {
+      return cached.groupId
+    }
+
+    const project = await this.request<RawProjectWithNamespace>('GET', `/api/v4/projects/${projectId}`)
+    if (project.namespace === undefined) {
+      throw new GitLabApiError(`project ${projectId} has no namespace`, 0)
+    }
+    if (project.namespace.kind === 'user') {
+      throw new GitLabApiError(`project ${projectId} is in a user namespace; epics require a group`, 0)
+    }
+
+    let currentGroupId = project.namespace.id
+    // Walk upward via parent_id; bound the loop to defend against cycles.
+    for (let depth = 0; depth < 32; depth++) {
+      const group = await this.request<RawGroup>('GET', `/api/v4/groups/${currentGroupId}`)
+      if (group.parent_id === null || group.parent_id === undefined) {
+        this.topLevelGroupCache.set(numericId, {
+          groupId: currentGroupId,
+          expiresAt: this.now() + TOP_LEVEL_GROUP_CACHE_TTL_MS
+        })
+        return currentGroupId
+      }
+      currentGroupId = group.parent_id
+    }
+    throw new GitLabApiError(`namespace walk exceeded depth for project ${projectId}`, 0)
   }
 }
 

@@ -638,6 +638,217 @@ See [Phase 3 Migration Runbook](docs/phase3-runbook.md) for step-by-step instruc
 
 ---
 
+## Phase 4 Additions (FINAL)
+
+### TxSubscriber Path B Flow
+
+Path B closure wires Huly client mutations to GitLab via a subscription to the per-workspace Huly Client's transaction stream:
+
+```mermaid
+sequenceDiagram
+    participant HulyUI as Huly UI<br/>(Browser)
+    participant HulyClient as HulyClient<br/>(transactor)
+    participant TxSubscriber as TxSubscriber<br/>subscription
+    participant EchoFilter as Echo Filter<br/>(storm prevention)
+    participant TxBuffer as Cold-start Buffer
+    participant SyncEngine as SyncEngine
+    participant Adapter as GitLabAdapter
+    participant GitLab as GitLab API
+    
+    HulyUI->>HulyClient: updateMixin(issueRef,<br/>gitlab-mr, {approvalStatus...})
+    HulyClient->>HulyClient: TxMixin event<br/>(createdBy: hulyPersonUuid)
+    HulyClient->>TxSubscriber: notify handler
+    
+    TxSubscriber->>TxSubscriber: Extract MR_MIXIN +<br/>flat change keys
+    TxSubscriber->>EchoFilter: Check tx.createdBy ==<br/>serviceAccountPersonUuid?
+    
+    alt Self-authored (MR-2)
+        EchoFilter->>EchoFilter: Drop + metric<br/>tx.filter.self_authored
+    else Not self
+        EchoFilter->>TxBuffer: Buffer if engine<br/>not ready (MR-1)
+        TxBuffer->>SyncEngine: enqueueLocalEvent<br/>after engine.start()
+        SyncEngine->>SyncEngine: Conflict check:<br/>LWW vs GitLab
+        SyncEngine->>Adapter: approveMR / unapprove
+        Adapter->>GitLab: PATCH approval
+        GitLab-->>Adapter: 200
+        Adapter-->>SyncEngine: done
+        SyncEngine->>SyncEngine: Stamp tx marker<br/>_originated: 'gitlab'
+    end
+```
+
+**Defense-in-depth (MR-2):** TxSubscriber filters out events authored by the pod's service-account PersonUuid (resolved at subscriber start via `resolveServiceAccountUser`). Additionally, `applyRemote` paths stamp a transient `_originated: 'gitlab'` marker on the attributes dict for outbound `createDoc`/`updateMixin` calls; the subscription can use this marker as a second-layer echo-storm prevention without reading service-account identity.
+
+**Cold-start buffering (MR-1):** TxSubscriber begins accepting events immediately on subscription (even before `engine.start()` completes). Events received during startup are buffered (FIFO, bounded 1024 entries) and drained into `enqueueLocalEvent` AFTER engine.start() resolves. Overflow increments `tx.subscription.buffer.overflow` metric and drops oldest events.
+
+**Lifecycle:** TxSubscriber is started on first `BindingLoader.loadFor*` per workspace; cached for 30-min TTL. Stopped on cache eviction or pod shutdown (via SIGTERM iteration in `src/index.ts`). All lifecycle wiring lives in P4-T-19 (not the core TxSubscriber class in P4-T-09).
+
+### Per-user OAuth Flow
+
+```mermaid
+sequenceDiagram
+    participant HulyUI as Huly UI<br/>(Browser)
+    participant Parent as Parent Huly<br/>window
+    participant UIServer as /user/ui<br/>HTML + JS
+    participant OAuth as /user/oauth<br/>routes
+    participant GitLab as GitLab OAuth
+    participant MongoDB as user_credentials<br/>store
+    
+    HulyUI->>UIServer: GET /user/ui/<br/>(from iframe)
+    UIServer-->>HulyUI: HTML + CSP header<br/>(no inline scripts)
+    
+    HulyUI->>HulyUI: Click "Link GitLab"
+    HulyUI->>OAuth: GET /user/oauth/start<br/>(cookie: huly-user,<br/>PKCE state)
+    
+    OAuth->>OAuth: Validate cookie<br/>Extract hulyPersonUuid
+    OAuth->>OAuth: Generate PKCE state<br/>+ challenge
+    OAuth-->>HulyUI: 302 redirect to<br/>GitLab authorize
+    
+    HulyUI->>GitLab: /oauth/authorize?<br/>state=PKCE_state
+    GitLab->>HulyUI: Grant permission UI
+    HulyUI->>GitLab: Approve
+    
+    GitLab->>OAuth: GET /user/oauth/callback<br/>?code=...&state=...
+    OAuth->>OAuth: Verify PKCE state
+    OAuth->>GitLab: Exchange code<br/>for access_token
+    OAuth->>GitLab: GET /api/v4/user<br/>(capture username)
+    OAuth->>MongoDB: putUserCredential<br/>(encrypt + store)
+    OAuth-->>UIServer: 200 + navigate to /user/ui/status
+    
+    UIServer-->>HulyUI: Status: "Linked as<br/>@username"
+    HulyUI->>HulyUI: Click "Unlink"
+    HulyUI->>OAuth: DELETE /user/oauth/credential<br/>(cookie-protected)
+    OAuth->>MongoDB: deleteUserCredential
+    OAuth-->>HulyUI: 200
+    UIServer-->>HulyUI: Status: "Not linked"
+```
+
+**Bearer transport (Bug-6):** Bearer tokens MUST arrive via `postMessage` from the embedding Huly parent window OR read from `sessionStorage` (set by the parent). Query-string bearer is REJECTED by the UI layer. CSP headers (`Content-Security-Policy: default-src 'none'; script-src 'wasm-unsafe-eval'`) on `/user/ui/*` prevent inline-script bearer exfiltration and external resource fetches.
+
+**Cookie authentication (Bug-3):** The `huly-user` cookie uses a JSON+HMAC format: `${base64(json{hulyPersonUuid})}.${hmacSHA256(json, ServerSecret)}`. Single-secret HMAC validation (rotation requires pod restart).
+
+**Rate limiting:** `/user/oauth/start` is rate-limited per IP (token bucket, default 5 req/min).
+
+### Epic Webhook & Sync Flow
+
+```mermaid
+sequenceDiagram
+    participant GitLab
+    participant Webhook as POST /webhook/:bindingId
+    participant Router as Webhook Router<br/>(Epic branch)
+    participant SyncEngine as SyncEngine
+    participant EpicsManager as EpicsSyncManager
+    participant IDMap as IDMap
+    participant Adapter as GitLabAdapter
+    participant HulyClient as HulyClient
+    
+    GitLab->>Webhook: Epic Hook<br/>(epic_iid, group_id,<br/>action: open/close)
+    Webhook->>Router: Route by event type
+    Router->>Router: Detect epic_hook
+    Router->>SyncEngine: dispatch epic event
+    
+    SyncEngine->>EpicsManager: applyRemote(binding,<br/>syncEpic)
+    
+    alt EE capability
+        EpicsManager->>Adapter: resolveTopLevelGroupForProject<br/>(Bug-1 resolution)
+        Adapter-->>EpicsManager: topLevelGroupId
+        
+        EpicsManager->>Adapter: listEpicIssues<br/>(topGroupId, epicIid)
+        Adapter-->>EpicsManager: [childIid, ...]
+        
+        EpicsManager->>IDMap: findByGitlab<br/>(kind='epic',<br/>gitlabId)
+        IDMap-->>EpicsManager: Issue ref or null
+        
+        alt Mirror exists
+            EpicsManager->>HulyClient: updateMixin<br/>(issueRef,<br/>gitlab-epic,<br/>childIssueIids)
+        else First time
+            EpicsManager->>HulyClient: createDoc Issue<br/>+ createMixin<br/>gitlab-epic
+        end
+        
+        EpicsManager->>EpicsManager: For each childIid:<br/>findByGitlab child
+        EpicsManager->>HulyClient: updateMixin child<br/>(gitlab-mr or issue,<br/>parentEpicIid)<br/>(AC-1: EpicsSyncManager<br/>sole writer)
+        
+    else CE
+        EpicsManager->>EpicsManager: Return silently<br/>(ee.feature.skipped)
+    end
+    
+    EpicsManager-->>Webhook: 200
+```
+
+**Top-level group resolution (Bug-1):** Epics live on the top-level group, not the immediate sub-group. `resolveTopLevelGroupForProject` walks from project → namespace → iterates parents via `GET /api/v4/groups/:id` until `parent_id === null`. Result cached 1 hour per projectId.
+
+**Field ownership (AC-1):** `EpicsSyncManager` EXCLUSIVELY owns the `gitlab-epic` mixin and is the SOLE writer of `parentEpicIid` (on child Issue mirrors via child-issue propagation). `MergeRequestsSyncManager` does NOT touch `parentEpicIid` on `gitlab-mr` — AC-1 single-writer invariant enforced by test assertions.
+
+### Multi-instance Idmap Prefix
+
+When a workspace binds to multiple GitLab instances, idmap `gitlabId` strings are prefixed with a stable 8-hex hash of `gitlabBaseUrl` (TG-4 defense-in-depth against duplicate project IDs across instances):
+
+```
+prefixGitlabIdForMultiInstance(baseUrl: string, raw: string, isMultiInstanceWorkspace: boolean): string
+  - isMultiInstanceWorkspace=false → return raw (no prefix; zero behavior change in single-instance workspaces)
+  - isMultiInstanceWorkspace=true  → return `${sha256(baseUrl).slice(0,8)}:${raw}`
+```
+
+**Example:**
+- Workspace W binds to `https://gitlab.example.com` (project 42) and `https://gitlab-internal.company.com` (project 42, same ID)
+- `isMultiInstanceWorkspace=true` detected on second binding
+- idmap rows for first instance use prefix from `sha256('https://gitlab.example.com')` = `a1b2c3d4:42:7` (epic) or `a1b2c3d4:42` (merge request)
+- idmap rows for second instance use prefix from `sha256('https://gitlab-internal.company.com')` = `e5f6g7h8:42:7`
+- Collision-free even though both instances have project ID 42
+
+**Single-instance workspaces** remain unprefixed (no retroactive migration required; Phase 4 limitation documented in runbook).
+
+### Field Ownership: Phase 4 Mixin Partition
+
+The `gitlab-mr` mixin now has 16 fields across four managers:
+
+| Field | Manager | Phase | Read-Only |
+|-------|---------|-------|-----------|
+| `sourceBranch` | MergeRequestsSyncManager | 2 | Yes |
+| `targetBranch` | MergeRequestsSyncManager | 2 | Yes |
+| `draft` | MergeRequestsSyncManager | 2 | Yes |
+| `mergedAt` | MergeRequestsSyncManager | 2 | No |
+| `mergeStatus` | MergeRequestsSyncManager | 2 | Yes |
+| `webUrl` | MergeRequestsSyncManager | 2 | Yes |
+| `pipelineStatus` | PipelineSyncManager | 2 | Yes |
+| `reviewers` | MergeRequestsSyncManager | 3 | No |
+| `approvedBy` | MergeRequestsSyncManager | 3 | No |
+| `approvalsRequired` | MergeRequestsSyncManager | 3 | Yes |
+| `approvalStatus` | MergeRequestsSyncManager | 3 | Yes |
+| `diffWebUrl` | MergeRequestsSyncManager | 3 | Yes |
+| `changedFiles` | MergeRequestsSyncManager | 3 | Yes |
+| `approvalRules` | MergeRequestsSyncManager | 4 | Yes |
+| `iteration` | MergeRequestsSyncManager | 4 | No |
+| `parentEpicIid` | EpicsSyncManager | 4 | No |
+
+**AC-1 Invariant:** `parentEpicIid` is NEVER written by `MergeRequestsSyncManager` or any other manager. Only `EpicsSyncManager` writes this field (via child-issue propagation when processing an epic). Test assertions verify this partition.
+
+**Phase 4 extensions:** `approvalRules` and `iteration` are written only by `MergeRequestsSyncManager` from composite `getMRApprovalRules` + `getIteration` calls on EE. `parentEpicIid` is written only by `EpicsSyncManager` during child-issue propagation.
+
+### State Collections — Phase 4 Widening
+
+**idmap.kind additions:**
+- `'epic'` — Maps GitLab epic `(groupId, epicIid)` to Huly Issue mirror. **Compound key:** `"${groupId}:${epicIid}"`. Uses multi-instance prefix when applicable (TG-4).
+- `'iteration'` — Maps GitLab iteration `iterationId` to `null` (no Huly doc; used for cursor-state only).
+- `'approval_rule'` — Maps GitLab approval rule `(projectId, mrIid, ruleId)` to `null` (used for idempotency only).
+
+**cursors.kind additions:**
+- `'epics'` — Backfill cursor for `listEpics`; stores `max(updated_at)` of processed epics per binding.
+- `'iterations'` — Backfill cursor for `listIterations`; stores `max(updated_at)` of processed iterations per binding.
+
+**user_credentials collection (NEW):**
+- `_id: ObjectId`
+- `workspaceUuid: string`
+- `hulyPersonUuid: string`
+- `gitlabBaseUrl: string`
+- `username: string` — GitLab username (SCG-2; captured at OAuth callback)
+- `ciphertext, iv, tag` — AES-256-GCM encrypted access token
+- `createdAt, expiresAt` — timestamps
+- `refreshTokenCiphertext, iv, tag` — optional refresh token (same encryption)
+- `expired: boolean` — permanence flag (refresh failures set this)
+- **Unique index:** `{workspaceUuid, hulyPersonUuid, gitlabBaseUrl}`
+
+---
+
 ## Phase 3 Planning Notes
 
 - **Cursor split:** Split `'notes'` into `'issue_notes'` + `'mr_notes'` if backfill metrics show contention.

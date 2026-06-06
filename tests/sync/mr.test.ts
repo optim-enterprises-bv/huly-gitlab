@@ -7,7 +7,13 @@ import type { Store } from '../../src/state/store'
 import type { Logger } from '../../src/logging'
 import type { IdMapDoc } from '../../src/state/idmap'
 import type { CursorDoc } from '../../src/state/cursors'
-import type { SyncMergeRequest, SyncMilestone, SyncUser as AdapterUser } from '../../src/adapter/types'
+import type {
+  SyncIteration,
+  SyncMergeRequest,
+  SyncMRApprovalRule,
+  SyncMilestone,
+  SyncUser as AdapterUser
+} from '../../src/adapter/types'
 import { UserIdentity } from '../../src/huly/users'
 import { LabelCache } from '../../src/sync/label-cache'
 import { MilestoneCache } from '../../src/sync/milestone-cache'
@@ -1075,4 +1081,259 @@ test('P3-15. C10 race: local approvedBy=2 BUT older than 30s window → take rem
 
   const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
   expect(mixin.approvedBy).toEqual(['person-remote1'])
+})
+
+// ---------------------------------------------------------------------------
+// Phase 4 (P4-T-08) — EE field extensions: approvalRules, iteration; AC-1
+// single-writer invariant for parentEpicIid; Bug-4 CE regression.
+// ---------------------------------------------------------------------------
+
+function makeApprovalRule (overrides: Partial<SyncMRApprovalRule> = {}): SyncMRApprovalRule {
+  return {
+    id: 1,
+    name: 'Default',
+    ruleType: 'regular',
+    eligibleApprovers: [],
+    approvalsRequired: 1,
+    approvedBy: [],
+    ...overrides
+  }
+}
+
+function makeIteration (overrides: Partial<SyncIteration> = {}): SyncIteration {
+  return {
+    id: 'gid://gitlab/Iteration/1',
+    title: 'Sprint 1',
+    startDate: new Date('2024-04-01T00:00:00.000Z'),
+    dueDate: new Date('2024-04-14T00:00:00.000Z'),
+    state: 'started',
+    webUrl: 'https://gitlab.example/groups/g/-/iterations/1',
+    ...overrides
+  }
+}
+
+test('P4-1. applyRemote writes approvalRules mixin field with EE rule data', async () => {
+  const h = buildHarness()
+  const rules: SyncMRApprovalRule[] = [
+    makeApprovalRule({
+      id: 11,
+      name: 'Backend',
+      ruleType: 'regular',
+      eligibleApprovers: [makeUser(601), makeUser(602)],
+      approvalsRequired: 2,
+      approvedBy: [makeUser(601)]
+    }),
+    makeApprovalRule({
+      id: 12,
+      name: 'Code owners',
+      ruleType: 'code_owner',
+      eligibleApprovers: [makeUser(603)],
+      approvalsRequired: 1,
+      approvedBy: [makeUser(603)]
+    })
+  ]
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 601,
+    approvalRules: rules
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  const written = mixin.approvalRules as SyncMRApprovalRule[]
+  expect(written).toHaveLength(2)
+  expect(written[0].id).toBe(11)
+  expect(written[0].name).toBe('Backend')
+  expect(written[0].ruleType).toBe('regular')
+  expect(written[0].approvalsRequired).toBe(2)
+  expect(written[0].approvedBy.map((u) => u.id)).toEqual([601])
+  expect(written[0].eligibleApprovers.map((u) => u.id)).toEqual([601, 602])
+  expect(written[1].id).toBe(12)
+  expect(written[1].ruleType).toBe('code_owner')
+})
+
+test('P4-2. approvalStatus="approved" when every EE rule meets its threshold', async () => {
+  const h = buildHarness()
+  const rules: SyncMRApprovalRule[] = [
+    makeApprovalRule({
+      id: 21, name: 'A', approvalsRequired: 1, approvedBy: [makeUser(701)]
+    }),
+    makeApprovalRule({
+      id: 22, name: 'B', approvalsRequired: 2, approvedBy: [makeUser(702), makeUser(703)]
+    })
+  ]
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 602,
+    approvalRules: rules
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalStatus).toBe('approved')
+})
+
+test('P4-3. approvalStatus="pending" when any EE rule under-approved', async () => {
+  const h = buildHarness()
+  const rules: SyncMRApprovalRule[] = [
+    makeApprovalRule({
+      id: 31, name: 'A', approvalsRequired: 1, approvedBy: [makeUser(801)]
+    }),
+    makeApprovalRule({
+      id: 32, name: 'B', approvalsRequired: 2, approvedBy: [makeUser(802)]
+    })
+  ]
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 603,
+    approvalRules: rules
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalStatus).toBe('pending')
+})
+
+test('P4-4. Bug-4 CE regression: approvalRules=undefined uses Phase 3 CE derivation (approved)', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:901', 'person-ce-a' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 604,
+    approvedBy: [makeUser(901)],
+    approvalsRequired: 1
+    // approvalRules intentionally omitted (CE path)
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalRules).toBeUndefined()
+  expect(mixin.approvalStatus).toBe('approved')
+})
+
+test('P4-5. Bug-4 CE regression: empty approvalRules array falls back to CE derivation', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:1001', 'person-ce-b' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 605,
+    approvedBy: [makeUser(1001)],
+    approvalsRequired: 2,
+    approvalRules: [] // EE returns []; CE falls through
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  // Empty rules array is written as-is (B2: defined input is materialized).
+  expect(mixin.approvalRules).toEqual([])
+  // Status falls back to Phase 3 CE derivation: 1 approver < 2 required.
+  expect(mixin.approvalStatus).toBe('pending')
+})
+
+test('P4-6. applyRemote writes iteration mixin field from syncMR.iteration', async () => {
+  const h = buildHarness()
+  const iteration = makeIteration({
+    id: 'gid://gitlab/Iteration/77',
+    title: 'Sprint 77',
+    state: 'started'
+  })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 606,
+    iteration
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  const written = mixin.iteration as SyncIteration | null
+  expect(written).not.toBeNull()
+  expect(written?.id).toBe('gid://gitlab/Iteration/77')
+  expect(written?.title).toBe('Sprint 77')
+  expect(written?.state).toBe('started')
+})
+
+test('P4-7. iteration=null clears the field (explicit null write)', async () => {
+  const h = buildHarness()
+  // First create with an iteration.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 607,
+    iteration: makeIteration()
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  expect((h.huly.getMixin(issueRef as unknown as string) ?? {}).iteration).toBeTruthy()
+
+  // Now apply with iteration explicitly null.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 607,
+    iteration: null,
+    updatedAt: new Date('2024-05-01T10:00:00.000Z')
+  }))
+  // The last updateMixin call MUST carry an explicit iteration: null.
+  const last = h.huly.updateMixinCalls[h.huly.updateMixinCalls.length - 1]
+  expect(Object.keys(last.attributes)).toContain('iteration')
+  expect(last.attributes.iteration).toBeNull()
+})
+
+test('P4-8. AC-1 single-writer: applyRemote NEVER writes parentEpicIid mixin field', async () => {
+  const h = buildHarness()
+  // Synthetic input: a SyncMergeRequest with a stray parentEpicIid attached.
+  // The adapter type does not declare this field, so we coerce via cast to
+  // exercise the runtime guard.
+  const synthetic = makeSyncMR({
+    iid: 608,
+    approvalRules: [makeApprovalRule({ id: 41 })],
+    iteration: makeIteration()
+  }) as unknown as Record<string, unknown>
+  synthetic.parentEpicIid = 7
+  await h.manager.applyRemote(h.ctx, 'binding-1', synthetic as unknown as SyncMergeRequest)
+
+  // Run an update to flush the updateMixin path as well.
+  const updated = makeSyncMR({
+    iid: 608,
+    title: 'changed',
+    updatedAt: new Date('2024-06-01T10:00:00.000Z'),
+    approvalRules: [makeApprovalRule({ id: 41, approvedBy: [makeUser(101)] })]
+  }) as unknown as Record<string, unknown>
+  updated.parentEpicIid = 9
+  await h.manager.applyRemote(h.ctx, 'binding-1', updated as unknown as SyncMergeRequest)
+
+  for (const call of h.huly.createMixinCalls) {
+    expect(Object.keys(call.attributes)).not.toContain('parentEpicIid')
+  }
+  for (const call of h.huly.updateMixinCalls) {
+    expect(Object.keys(call.attributes)).not.toContain('parentEpicIid')
+  }
+})
+
+test('P4-9. Phase 3 baseline regression: rules+approvedBy both undefined → existing behavior unchanged', async () => {
+  const h = buildHarness()
+  // No EE fields, no approvedBy/approvalsRequired — pure Phase 2 shape.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 609,
+    title: 'baseline'
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvalRules).toBeUndefined()
+  expect(mixin.iteration).toBeUndefined()
+  expect(mixin.approvalStatus).toBeUndefined()
+  expect(mixin.approvedBy).toBeUndefined()
+  expect(mixin.approvalsRequired).toBeUndefined()
+  // createMixin attributes also do NOT include these keys.
+  const createAttrs = h.huly.createMixinCalls[0].attributes
+  expect(Object.keys(createAttrs)).not.toContain('approvalRules')
+  expect(Object.keys(createAttrs)).not.toContain('iteration')
+  expect(Object.keys(createAttrs)).not.toContain('approvalStatus')
+  expect(Object.keys(createAttrs)).not.toContain('parentEpicIid')
+})
+
+test('P4-10. CE approvalStatus derivation matches Phase 3 (Bug-4 explicit regression replay)', async () => {
+  // Replay of Phase 3 case P3-2 fixture against the new rule-aware path:
+  // when approvalRules is undefined (CE), the result MUST be identical.
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:301', 'person-a1' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 610,
+    approvedBy: [makeUser(301)],
+    approvalsRequired: 1
+  }))
+  const issueRef = Array.from(h.huly.issues.keys())[0]
+  const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
+  expect(mixin.approvedBy).toEqual(['person-a1'])
+  expect(mixin.approvalsRequired).toBe(1)
+  expect(mixin.approvalStatus).toBe('approved')
 })

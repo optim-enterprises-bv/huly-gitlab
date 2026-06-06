@@ -874,3 +874,225 @@ export async function patchBindingDisabled (
   )
   return { status: res.status }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: Path B synthetic tx, EE inspection, multi-instance, user OAuth
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal Huly client interface required by `simulateHulyTxEdit`. The real
+ * harness binds this to a `@hcengineering/client` connection. Tests inject a
+ * mock that records the call shape so the helper stays decoupled from the
+ * heavy transactor client at the type level (mirrors `MinimalTransactor`).
+ */
+export interface MinimalHulyTxClient {
+  updateDoc: (
+    objectClass: string,
+    space: string,
+    objectId: string,
+    operations: Record<string, unknown>
+  ) => Promise<void>
+}
+
+export interface SimulateHulyTxEditArgs {
+  /** Huly doc ref (e.g. mirror Issue ref) to mutate. */
+  issueRef: string
+  /** Space the doc lives in. */
+  space: string
+  /** Flat field name that the engine's classifier picks up (e.g. `title`). */
+  field: string
+  /** New value for the field. */
+  value: unknown
+  /** Optional object class override (defaults to tracker.Issue). */
+  objectClass?: string
+}
+
+/**
+ * Simulate a Huly user editing a mirror Issue field. Drives the same code
+ * path the real Huly UI exercises, which the TxSubscriber observes and
+ * forwards to `engine.enqueueLocalEvent`. Used by the Path B E2E to assert
+ * GitLab REST endpoints are called within the 30s SLA.
+ */
+export async function simulateHulyTxEdit (
+  transactor: MinimalHulyTxClient,
+  args: SimulateHulyTxEditArgs
+): Promise<void> {
+  await transactor.updateDoc(
+    args.objectClass ?? HARNESS_ISSUE_CLASS,
+    args.space,
+    args.issueRef,
+    { [args.field]: args.value }
+  )
+}
+
+export interface MRApprovalRule {
+  id: number
+  name: string
+  approvalsRequired: number
+  approvedBy: string[]
+}
+
+export interface MRApprovalRulesResponse {
+  rules: MRApprovalRule[]
+}
+
+/**
+ * GET the EE approval-rules snapshot for an MR. The endpoint only exists on
+ * GitLab EE; on CE the API returns 404 / 403. Used by the EE E2E to assert
+ * the `gitlab-mr.approvalRules` mixin is populated within 30s.
+ */
+export async function getMRApprovalRulesFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRApprovalRulesResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approval_rules`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRApprovalRulesFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as Array<{
+    id: number
+    name: string
+    approvals_required: number
+    approved_by?: Array<{ username: string }>
+  }>
+  return {
+    rules: body.map((r) => ({
+      id: r.id,
+      name: r.name,
+      approvalsRequired: r.approvals_required,
+      approvedBy: (r.approved_by ?? []).map((u) => u.username)
+    }))
+  }
+}
+
+export interface CreateEpicArgs {
+  title: string
+  description?: string
+  labels?: string[]
+}
+
+export interface CreateEpicResult {
+  epicIid: number
+  groupId: number
+}
+
+/**
+ * Create an epic on a GitLab group (EE-only resource). Used by the EE E2E to
+ * seed parent epics for the mirror-creation assertions.
+ */
+export async function createGitLabEpic (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  groupId: number,
+  args: CreateEpicArgs
+): Promise<CreateEpicResult> {
+  const body: Record<string, unknown> = { title: args.title }
+  if (args.description !== undefined) body.description = args.description
+  if (args.labels !== undefined) body.labels = args.labels.join(',')
+
+  const res = await deps.fetch(`${gitlabBaseUrl}/api/v4/groups/${groupId}/epics`, {
+    method: 'POST',
+    headers: {
+      'PRIVATE-TOKEN': rootToken,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  })
+  if (res.status !== 201) {
+    throw new Error(`createGitLabEpic: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { iid: number, group_id: number }
+  return { epicIid: json.iid, groupId: json.group_id }
+}
+
+export interface LinkUserOAuthArgs {
+  podUrl: string
+  hulyUserCookie: string
+  gitlabBaseUrl: string
+}
+
+export interface LinkUserOAuthResult {
+  startStatus: number
+  callbackStatus: number
+  redirectLocation?: string
+}
+
+/**
+ * Drive the `/user/oauth/start` → `/user/oauth/callback` flow against the pod
+ * with a pre-minted `huly-user` cookie. Returns the observed HTTP statuses
+ * from each leg so the caller can assert the full handshake completes.
+ */
+export async function linkUserOAuth (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: LinkUserOAuthArgs
+): Promise<LinkUserOAuthResult> {
+  const startRes = await deps.fetch(`${args.podUrl}/user/oauth/start`, {
+    method: 'GET',
+    headers: { Cookie: `huly-user=${args.hulyUserCookie}` },
+    redirect: 'manual'
+  })
+  const redirectLocation = (typeof startRes.headers?.get === 'function')
+    ? (startRes.headers.get('location') ?? undefined)
+    : undefined
+
+  let callbackStatus = 0
+  const stateMatch = redirectLocation?.match(/[?&]state=([^&]+)/)
+  if (stateMatch !== null && stateMatch !== undefined) {
+    const state = stateMatch[1]
+    const cbRes = await deps.fetch(
+      `${args.podUrl}/user/oauth/callback?code=test-code&state=${state}`,
+      {
+        method: 'GET',
+        headers: { Cookie: `huly-user=${args.hulyUserCookie}` }
+      }
+    )
+    callbackStatus = cbRes.status
+  }
+
+  return { startStatus: startRes.status, callbackStatus, redirectLocation }
+}
+
+export interface UserOAuthStatusResponse {
+  linked: boolean
+  username?: string
+}
+
+/**
+ * GET the per-user OAuth status. Bearer-protected (SCG-3). Returns the
+ * parsed JSON body normalized to camelCase.
+ */
+export async function getUserOAuthStatus (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podUrl: string, bearer: string }
+): Promise<{ status: number, body: UserOAuthStatusResponse | { error: string } }> {
+  const res = await deps.fetch(`${args.podUrl}/user/oauth/status`, {
+    headers: { Authorization: `Bearer ${args.bearer}` }
+  })
+  const text = await res.text()
+  try {
+    return { status: res.status, body: JSON.parse(text) }
+  } catch {
+    return { status: res.status, body: { error: text } }
+  }
+}
+
+/**
+ * DELETE the per-user credential. Bearer-protected.
+ */
+export async function deleteUserOAuthCredential (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podUrl: string, bearer: string }
+): Promise<{ status: number }> {
+  const res = await deps.fetch(`${args.podUrl}/user/oauth/credential`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${args.bearer}` }
+  })
+  return { status: res.status }
+}

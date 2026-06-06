@@ -5,11 +5,13 @@ import type { SyncNote, SyncReviewPosition, SyncReviewThread, SyncUser as Adapte
 import { gfmMarkdownToMarkup, markupToGfmMarkdown } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { getCursor, setCursor } from '../state/cursors'
+import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import { resolveIssueRef, type BindingResolverInput } from './issues'
+import { markAndRetry, NOTE_RETRY_FLAG, REVIEW_RETRY_FLAG } from './deferred-parent'
 
 /**
  * Internal envelope carrying the note data plus its parent noteable iid.
@@ -177,6 +179,12 @@ export interface NotesBindingContext {
   gitlabClient: NoteGitLabClient
   userIdentity: UserIdentity
   gitlabBaseUrl: string
+  /**
+   * B1: true when ≥ 2 distinct GitLab base URLs are registered for this
+   * workspace. When true, idmap gitlabId values are prefixed via
+   * `prefixGitlabIdForMultiInstance` (TG-4 defense-in-depth).
+   */
+  isMultiInstanceWorkspace?: boolean
 }
 
 /**
@@ -359,7 +367,10 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
 
         // Resolve parent MR to check if it is mirrored yet.
         // Defense-in-depth for confidential MR notes (critic B3).
-        const parentGitlabId = `${bctx.gitlabProjectId}:${parsed.noteableIid}`
+        const parentGitlabId = prefixGitlabIdForMultiInstance(
+          { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+          `${bctx.gitlabProjectId}:${parsed.noteableIid}`
+        )
         const parentMapping = await findByGitlab(
           ctx.store.idmap(),
           bctx.workspaceUuid,
@@ -368,9 +379,10 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
         )
 
         if (parentMapping === null) {
-          // C14 — _reviewRetried flag: survive deferred re-enqueue cycle.
-          const retryFlag = rawRecord._reviewRetried === true || rawRecord._noteRetried === true
-          if (!retryFlag) {
+          // C14 — _reviewRetried / _noteRetried flag: survive deferred re-enqueue cycle.
+          // We normalise both legacy flags into REVIEW_RETRY_FLAG before calling markAndRetry.
+          if (rawRecord[NOTE_RETRY_FLAG] === true) rawRecord[REVIEW_RETRY_FLAG] = true
+          if (markAndRetry(rawRecord, REVIEW_RETRY_FLAG)) {
             ctx.logger.debug('NotesSyncManager: review note parent MR not yet synced — deferring', {
               binding,
               noteableIid: parsed.noteableIid,
@@ -379,7 +391,7 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
             await this.enqueueRecord(
               binding,
               'note',
-              { ...rawRecord, _reviewRetried: true },
+              { ...rawRecord },
               `deferred:review:${bctx.gitlabProjectId}:${parsed.noteableIid}:${parsed.note.id}`,
               parsed.note.updatedAt
             )
@@ -441,7 +453,11 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
     if (note.system) return
 
     const bctx = await this.deps.loadBinding(binding)
-    const resolver: BindingResolverInput = { gitlabProjectId: bctx.gitlabProjectId }
+    const resolver: BindingResolverInput = {
+      gitlabProjectId: bctx.gitlabProjectId,
+      gitlabBaseUrl: bctx.gitlabBaseUrl,
+      isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true
+    }
 
     // Resolve parent ref — Issue or MR-mirror Issue.
     // noteableType defaults to 'Issue' (critic C1); MR notes use 'merge_request' idmap kind.
@@ -452,7 +468,10 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
       // MR notes: look up parent via merge_request idmap entry.
       // Defense-in-depth for confidential MR notes (critic B3): if MR is not yet mapped,
       // the note is deferred once then dropped — same pattern as Issue notes.
-      const gitlabId = `${bctx.gitlabProjectId}:${noteableIid}`
+      const gitlabId = prefixGitlabIdForMultiInstance(
+        { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+        `${bctx.gitlabProjectId}:${noteableIid}`
+      )
       const mapping = await findByGitlab(ctx.store.idmap(), bctx.workspaceUuid, 'merge_request', gitlabId)
       issueRef = mapping !== null ? mapping.hulyRef as Ref<Issue> : undefined
     } else {
@@ -464,8 +483,7 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
     }
 
     if (issueRef === undefined) {
-      const retryFlag = rawRecord._noteRetried === true
-      if (!retryFlag) {
+      if (markAndRetry(rawRecord, NOTE_RETRY_FLAG)) {
         ctx.logger.debug('NotesSyncManager: parent not yet synced — deferring', {
           binding,
           noteableType,
@@ -475,7 +493,7 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
         await this.enqueueRecord(
           binding,
           'note',
-          { ...rawRecord, _noteRetried: true },
+          { ...rawRecord },
           `deferred:${bctx.gitlabProjectId}:${noteableIid}:${note.id}`,
           note.updatedAt
         )
@@ -490,7 +508,10 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
       return
     }
 
-    const gitlabId = `${bctx.gitlabProjectId}:${note.id}`
+    const gitlabId = prefixGitlabIdForMultiInstance(
+      { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+      `${bctx.gitlabProjectId}:${note.id}`
+    )
     const existing = await findByGitlab(ctx.store.idmap(), bctx.workspaceUuid, 'note', gitlabId)
 
     const refUrl = `${bctx.gitlabBaseUrl.replace(/\/$/, '')}/${bctx.gitlabProjectPath}/-/issues`
@@ -640,11 +661,15 @@ export class NotesSyncManager implements SyncManager<Record<string, unknown>> {
       } else {
         created = await bctx.gitlabClient.createNote(bctx.gitlabProjectId, resolvedIid, { body })
       }
+      const createdGitlabId = prefixGitlabIdForMultiInstance(
+        { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+        `${bctx.gitlabProjectId}:${created.id}`
+      )
       await upsertIdMap(
         ctx.store.idmap(),
         bctx.workspaceUuid,
         'note',
-        `${bctx.gitlabProjectId}:${created.id}`,
+        createdGitlabId,
         HULY_CLASS_CHAT_MESSAGE,
         hulyRef
       )
@@ -786,17 +811,24 @@ function stripDocPrefix (doc: string): string {
 }
 
 function parseNoteId (gitlabId: string): number | null {
-  const colon = gitlabId.indexOf(':')
+  // B1: multi-instance keys are `${hash8}:${projectId}:${noteId}`; single-instance
+  // keys are `${projectId}:${noteId}`. noteId is always the LAST `:`-separated segment.
+  const colon = gitlabId.lastIndexOf(':')
   if (colon < 0) return null
   const n = Number.parseInt(gitlabId.slice(colon + 1), 10)
   return Number.isFinite(n) ? n : null
 }
 
 function parseProjectIid (gitlabId: string): { projectId: number, iid: number } | null {
-  const colon = gitlabId.indexOf(':')
-  if (colon < 0) return null
-  const pid = Number.parseInt(gitlabId.slice(0, colon), 10)
-  const iid = Number.parseInt(gitlabId.slice(colon + 1), 10)
+  // B1: multi-instance keys are `${hash8}:${projectId}:${iid}`; single-instance
+  // keys are `${projectId}:${iid}`. Strip any 8-hex-prefix before parsing.
+  const parts = gitlabId.split(':')
+  if (parts.length < 2) return null
+  // Trailing two segments are always projectId, iid
+  const iidStr = parts[parts.length - 1]
+  const pidStr = parts[parts.length - 2]
+  const pid = Number.parseInt(pidStr, 10)
+  const iid = Number.parseInt(iidStr, 10)
   if (!Number.isFinite(pid) || !Number.isFinite(iid)) return null
   return { projectId: pid, iid }
 }

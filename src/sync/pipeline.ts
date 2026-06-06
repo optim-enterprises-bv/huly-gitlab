@@ -5,6 +5,7 @@ import { findByGitlab } from '../state/idmap'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
 import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
+import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 
 export function getPipelineLruDropCount (): number {
@@ -21,12 +22,21 @@ export function getUnboundPipelineCount (): number {
 
 /**
  * Context loaded per binding — everything PipelineSyncManager needs.
+ *
+ * B1: `gitlabBaseUrl` + `isMultiInstanceWorkspace` are optional because most
+ * single-instance deployments never set them; when present they trigger
+ * `prefixGitlabIdForMultiInstance` on the parent-MR idmap lookup to prevent
+ * TG-4 cross-instance project-ID collisions.
  */
 export interface PipelineBindingContext {
   workspaceUuid: string
   gitlabProjectId: number
   hulyProjectRef: Ref<Space>
   hulyClient: TxOperations
+  /** Absolute base URL of the GitLab instance backing this binding. */
+  gitlabBaseUrl?: string
+  /** True when ≥ 2 distinct gitlabBaseUrl values exist for this workspace. */
+  isMultiInstanceWorkspace?: boolean
 }
 
 export interface PipelineSyncManagerDeps {
@@ -83,7 +93,14 @@ export class PipelineSyncManager implements SyncManager<SyncPipeline> {
     // Resolve the MR to its Huly Issue ref via the idmap.
     // MergeRequestsSyncManager writes idmap with `${gitlabProjectId}:${mrIid}` —
     // the lookup MUST use the same format or it will always miss.
-    const gitlabId = `${bctx.gitlabProjectId}:${syncPipeline.mergeRequestIid}`
+    // B1: when multi-instance, both writer and reader prefix with the baseUrl hash.
+    const gitlabId = prefixGitlabIdForMultiInstance(
+      {
+        isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true,
+        gitlabBaseUrl: bctx.gitlabBaseUrl ?? ''
+      },
+      `${bctx.gitlabProjectId}:${syncPipeline.mergeRequestIid}`
+    )
     const mrRef = await findByGitlab(
       ctx.store.idmap(),
       bctx.workspaceUuid,

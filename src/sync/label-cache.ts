@@ -2,6 +2,7 @@ import type { Ref, Space, TxOperations } from '@hcengineering/core'
 import tags, { type TagElement } from '@hcengineering/tags'
 import tracker, { type Issue } from '@hcengineering/tracker'
 import type { SyncLabel } from '../adapter/types'
+import { BiDirectionalCache } from './bi-directional-cache'
 
 /**
  * Minimal GitLab client surface used by LabelCache.
@@ -25,15 +26,18 @@ export interface LabelGitLabClient {
  * The cache is keyed by lowercase label name to be case-insensitive on lookups.
  */
 export class LabelCache {
-  private readonly remoteByName = new Map<string, SyncLabel>()
-  private readonly localByName = new Map<string, Ref<TagElement>>()
+  private readonly remoteByName: BiDirectionalCache<string, SyncLabel>
+  private readonly localByName: BiDirectionalCache<string, Ref<TagElement>>
   private remoteLoaded = false
   private localLoaded = false
 
   constructor (
     private readonly gitlabProjectId: number | string,
     private readonly hulyProjectRef: Ref<Space>
-  ) {}
+  ) {
+    this.remoteByName = new BiDirectionalCache({ loadAll: async () => [] })
+    this.localByName = new BiDirectionalCache({ loadAll: async () => [] })
+  }
 
   /**
    * Get-or-create a GitLab label by name. Reuses the per-binding cache after the first
@@ -46,11 +50,11 @@ export class LabelCache {
   ): Promise<SyncLabel> {
     await this.primeRemote(client)
     const key = name.toLowerCase()
-    const existing = this.remoteByName.get(key)
+    const existing = await this.remoteByName.get(key)
     if (existing !== undefined) return existing
 
     const created = await client.createLabel(this.gitlabProjectId, { name, color })
-    this.remoteByName.set(key, created)
+    this.remoteByName.put(key, created)
     return created
   }
 
@@ -64,7 +68,7 @@ export class LabelCache {
   ): Promise<Ref<TagElement>> {
     await this.primeLocal(ops)
     const key = name.toLowerCase()
-    const existing = this.localByName.get(key)
+    const existing = await this.localByName.get(key)
     if (existing !== undefined) return existing
 
     const ref = await ops.createDoc<TagElement>(
@@ -76,7 +80,7 @@ export class LabelCache {
         color
       }
     )
-    this.localByName.set(key, ref)
+    this.localByName.put(key, ref)
     return ref
   }
 
@@ -84,25 +88,19 @@ export class LabelCache {
    * Test helper: seed cache without hitting any backing store.
    */
   primeRemoteSync (labels: readonly SyncLabel[]): void {
-    for (const l of labels) {
-      this.remoteByName.set(l.name.toLowerCase(), l)
-    }
+    this.remoteByName.primeSync(labels.map(l => ({ key: l.name.toLowerCase(), value: l })))
     this.remoteLoaded = true
   }
 
   primeLocalSync (entries: ReadonlyArray<{ name: string, ref: Ref<TagElement> }>): void {
-    for (const e of entries) {
-      this.localByName.set(e.name.toLowerCase(), e.ref)
-    }
+    this.localByName.primeSync(entries.map(e => ({ key: e.name.toLowerCase(), value: e.ref })))
     this.localLoaded = true
   }
 
   private async primeRemote (client: LabelGitLabClient): Promise<void> {
     if (this.remoteLoaded) return
     const labels = await client.listLabels(this.gitlabProjectId)
-    for (const l of labels) {
-      this.remoteByName.set(l.name.toLowerCase(), l)
-    }
+    this.remoteByName.primeSync(labels.map(l => ({ key: l.name.toLowerCase(), value: l })))
     this.remoteLoaded = true
   }
 
@@ -110,12 +108,13 @@ export class LabelCache {
     if (this.localLoaded) return
     const found = await ops.findAll<TagElement>(tags.class.TagElement, {})
     const issueClassRef = String(tracker.class.Issue)
+    const entries: Array<{ key: string, value: Ref<TagElement> }> = []
     for (const t of found) {
-      // Scope to issues on this project. Ref is a branded string at runtime.
       if (String(t.targetClass) === issueClassRef) {
-        this.localByName.set(t.title.toLowerCase(), t._id)
+        entries.push({ key: t.title.toLowerCase(), value: t._id })
       }
     }
+    this.localByName.primeSync(entries)
     this.localLoaded = true
   }
 }
