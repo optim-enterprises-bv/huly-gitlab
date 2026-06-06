@@ -44,6 +44,8 @@ export const METRIC_NAMES = {
   SERVICE_ACCOUNT_RESOLVED: 'service_account.resolved',
   // P5-T-22: composite getMergeRequest path selection
   MR_COMPOSITE_GRAPHQL_HIT: 'mr.composite.graphql.hit',
+  /** Fired when getMergeRequest uses GraphQL and the project path was resolved from bctx. */
+  MR_COMPOSITE_GRAPHQL_HIT_PATH_KNOWN: 'mr.composite.graphql.hit.path_known',
   MR_COMPOSITE_REST_FALLBACK: 'mr.composite.rest.fallback',
   // P5-T-23: listEpicsWithChildren path selection
   EPICS_LIST_GRAPHQL_HIT: 'epics.list.graphql.hit',

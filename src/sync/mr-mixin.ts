@@ -1,8 +1,8 @@
 import type { Doc, Mixin, PersonUuid, Ref } from '@hcengineering/core'
 import type { Issue } from '@hcengineering/tracker'
 import type { ApprovalStatus, MergeStatus, SyncChangedFile, SyncIteration, SyncMRApprovalRule } from '../adapter/types'
-import { MR_CORE_MIXIN } from './mr-core-mixin'
-import { MR_REVIEW_MIXIN_DOC } from './mr-review-mixin-doc'
+import { MR_CORE_MIXIN, type MRCoreMixinDoc } from './mr-core-mixin'
+import { MR_REVIEW_MIXIN_DOC, type MRReviewMixinDoc } from './mr-review-mixin-doc'
 
 /**
  * Shape of the runtime `gitlab-mr` mixin written onto a tracker.Issue
@@ -71,24 +71,52 @@ export interface MRMixinDoc extends Issue {
 export const MR_MIXIN = 'gitlab-mr' as unknown as Ref<Mixin<MRMixinDoc>>
 
 /**
+ * Minimal hierarchy surface needed by readMRMixinAttributes. The real Huly
+ * `Hierarchy` class satisfies this; tests pass a small fake.
+ */
+export interface MRMixinHierarchy {
+  as<T extends Doc>(doc: Doc, mixinId: Ref<Mixin<T>>): T
+}
+
+/**
  * Read MR mixin attributes from EITHER legacy `gitlab-mr` mixin OR the new split
  * (`gitlab-mr-core` + `gitlab-mr-review`). During mixin-split migration window, BOTH
  * may be present on the same Issue. Prefer NEW (core+review); fall back to LEGACY.
  *
+ * When a `hierarchy` is provided (real platform or test fake), mixin attributes are
+ * read via `hierarchy.as<T>(doc, mixinId)` — the correct API on the real platform.
+ * String-key access (`obj[mixinId as string]`) is used as a defensive fallback when
+ * the hierarchy is unavailable (e.g. older test fakes that pre-date this change).
+ *
  * Returns a unified attribute view that callers can use as if reading from the
  * legacy `MRMixinDoc` shape.
  */
-export function readMRMixinAttributes (issue: Doc | null | undefined): Partial<MRMixinDoc> {
+export function readMRMixinAttributes (
+  issue: Doc | null | undefined,
+  hierarchy?: MRMixinHierarchy | null
+): Partial<MRMixinDoc> {
   if (issue === null || issue === undefined) return {}
-  const obj = issue as unknown as Record<string, Record<string, unknown> | undefined>
 
+  // Prefer hierarchy.as<T>() when available — correct platform API.
+  if (hierarchy != null) {
+    let core: Partial<MRCoreMixinDoc> | undefined
+    let review: Partial<MRReviewMixinDoc> | undefined
+    let legacy: Partial<MRMixinDoc> | undefined
+    try { core = hierarchy.as<MRCoreMixinDoc>(issue, MR_CORE_MIXIN) } catch { /* not present */ }
+    try { review = hierarchy.as<MRReviewMixinDoc>(issue, MR_REVIEW_MIXIN_DOC) } catch { /* not present */ }
+    if (core !== undefined || review !== undefined) {
+      return { ...(core ?? {}), ...(review ?? {}) } as Partial<MRMixinDoc>
+    }
+    try { legacy = hierarchy.as<MRMixinDoc>(issue, MR_MIXIN) } catch { /* not present */ }
+    if (legacy !== undefined) return legacy
+  }
+
+  // Fallback: string-key access (test fakes and migration shims).
+  const obj = issue as unknown as Record<string, Record<string, unknown> | undefined>
   const core = obj[MR_CORE_MIXIN as unknown as string]
   const review = obj[MR_REVIEW_MIXIN_DOC as unknown as string]
   if (core !== undefined || review !== undefined) {
-    const merged: Partial<MRMixinDoc> = { ...(core ?? {}), ...(review ?? {}) }
-    return merged
+    return { ...(core ?? {}), ...(review ?? {}) } as Partial<MRMixinDoc>
   }
-
-  const legacy: Partial<MRMixinDoc> = (obj[MR_MIXIN as unknown as string] ?? {}) as Partial<MRMixinDoc>
-  return legacy
+  return (obj[MR_MIXIN as unknown as string] ?? {}) as Partial<MRMixinDoc>
 }
