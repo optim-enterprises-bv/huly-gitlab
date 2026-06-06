@@ -8,6 +8,15 @@ import type { CredentialDoc } from './credentials'
 import type { OAuthStateDoc } from './oauth-state'
 import type { UserCredentialDoc } from './user-credentials'
 
+export interface DismissedSuggestionDoc {
+  workspaceUuid: string
+  hulyPersonUuid: string
+  bindingId: string
+  mrIid: string
+  noteId: string
+  dismissedAt: Date
+}
+
 export class Store {
   private readonly client: MongoClient
   private db: Db | null = null
@@ -63,6 +72,10 @@ export class Store {
 
   userCredentials (): Collection<UserCredentialDoc> {
     return this.getDb().collection<UserCredentialDoc>('user_credentials')
+  }
+
+  dismissedSuggestions (): Collection<DismissedSuggestionDoc> {
+    return this.getDb().collection<DismissedSuggestionDoc>('dismissed_suggestions')
   }
 
   private async createIndexes (): Promise<void> {
@@ -122,6 +135,12 @@ export class Store {
     await db.collection('user_credentials').createIndex(
       { workspaceUuid: 1, hulyPersonUuid: 1, gitlabBaseUrl: 1 },
       { unique: true, name: 'user_credentials_workspace_person_baseurl' }
+    )
+
+    // dismissed_suggestions: unique per (workspaceUuid, hulyPersonUuid, bindingId, mrIid, noteId)
+    await db.collection('dismissed_suggestions').createIndex(
+      { workspaceUuid: 1, hulyPersonUuid: 1, bindingId: 1, mrIid: 1, noteId: 1 },
+      { unique: true, name: 'dismissed_suggestions_unique' }
     )
   }
 }

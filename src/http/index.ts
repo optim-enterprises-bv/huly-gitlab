@@ -16,6 +16,7 @@ import { createBindingRouter } from './binding'
 import { createOAuthRouter } from './oauth'
 import { createUserOAuthRouter } from './user-oauth'
 import { createUserSessionRouter } from './user-session'
+import { createUserSuggestionsRouter } from './user-suggestions'
 import { createCredentialsRouter } from '../auth'
 
 export interface AppDependencies {
@@ -86,6 +87,9 @@ export function createApp (deps: AppDependencies): express.Express {
 
   // Per-user OAuth routes (Phase 4 — cookie-auth + rate-limit + GitLab user lookup).
   app.use('/user/oauth', createUserOAuthRouter({ config, store, logger, secrets }))
+
+  // User suggestion apply/dismiss endpoints.
+  app.use('/user/api/v1/suggestions', createUserSuggestionsRouter({ config, store, logger, secrets }))
 
   // B5: cookie-mint endpoint (bearer-protected). Platform integration point.
   app.use('/user', createUserSessionRouter({ config, logger }))
