@@ -115,7 +115,8 @@ services:
       test: ["CMD", "rpk", "cluster", "info", "-X", "user=${REDPANDA_ADMIN_USER:-admin}", "-X", "pass=${REDPANDA_ADMIN_PWD:-redpanda-admin-secret}"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 30
+      start_period: 90s
 
   # ------------------------------------------------------------------
   # Huly services — image tags from huly-selfhost/compose.yml
