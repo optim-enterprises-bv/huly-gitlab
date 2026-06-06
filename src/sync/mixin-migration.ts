@@ -47,6 +47,8 @@ export interface MixinSplitMigrationResult {
   reviewWritten: number
   /** MRs where legacy attrs couldn't be split (missing required core fields). Rare. */
   unresolvedCount: number
+  /** MRs where the post-strip verification found residual legacy keys. */
+  stripFailed?: number
   /** Set when the backfill drain wait timed out before the strip step ran. */
   drainTimedOut?: boolean
   /** Set to false when the migration was aborted due to a precondition failure. */
@@ -231,8 +233,9 @@ export async function migrateMixinSplit (
     //    The Huly platform's `updateMixin` writes the supplied attribute map; setting each field to
     //    `undefined` removes it from the persisted mixin shape. This is the closest portable analogue
     //    to a true remove-mixin op which the platform vendor.d.ts does not yet expose.
+    const legacyKeys = Object.keys(legacyAttrs)
     const stripAttrs: Record<string, unknown> = {}
-    for (const k of Object.keys(legacyAttrs)) {
+    for (const k of legacyKeys) {
       stripAttrs[k] = undefined
     }
     await hulyClient.updateMixin<Issue, MRMixinDoc>(
@@ -242,6 +245,25 @@ export async function migrateMixinSplit (
       MR_MIXIN,
       stripAttrs as unknown as Partial<MRMixinDoc>
     )
+
+    // 4a. Post-strip verification: re-read the doc and assert all legacy keys are absent.
+    const verifyDoc = await hulyClient.findOne<Issue>(tracker.class.Issue, { _id: issueRef })
+    const verifyObj = verifyDoc as unknown as Record<string, unknown> | undefined
+    const verifyMixin = verifyObj?.[MR_MIXIN as unknown as string] as Record<string, unknown> | undefined
+    const failedKeys = legacyKeys.filter((k) => {
+      if (verifyMixin === undefined) return false
+      return verifyMixin[k] !== undefined
+    })
+    if (failedKeys.length > 0) {
+      logger.warn('mixin-migration: post-strip verification failed; legacy keys still present', {
+        gitlabId: entry.gitlabId,
+        failedKeys
+      })
+      result.stripFailed = (result.stripFailed ?? 0) + 1
+      // Continue processing remaining docs; operator must investigate.
+      continue
+    }
+
     result.legacyStripped++
 
     if (wroteCore || wroteReview) {

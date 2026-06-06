@@ -464,6 +464,79 @@ describe('migrateMixinSplit', () => {
     expect(hulyClient.updateMixinCalls.length).toBe(0)
   })
 
+  // Case 8: post-strip verification success — re-read confirms legacy keys absent
+  it('post-strip verification: re-read confirms legacy keys are absent', async () => {
+    const binding = makeBinding(42)
+    const issueRef = 'huly-mr-verify-ok'
+
+    const idmapCol = makeIdMapCol([makeIdMapEntry('ws-1', 42, 1, issueRef)])
+    const bindingsCol = makeBindingsCol([binding])
+
+    const legacyAttrs = fullLegacyMixinAttrs()
+    const issueDocs = new Map<string, Record<string, unknown>>([[
+      issueRef,
+      makeIssueDoc(issueRef, { [MR_MIXIN as unknown as string]: legacyAttrs })
+    ]])
+    const hulyClient = makeHulyClient(issueDocs)
+
+    const result = await migrateMixinSplit(
+      { store: makeStore(idmapCol, bindingsCol), hulyClient, logger: makeLogger(), ...NO_DRAIN_DEPS },
+      binding
+    )
+
+    expect(result.legacyStripped).toBe(1)
+    expect(result.stripFailed).toBeUndefined()
+
+    // The fake updateMixin deletes keys with undefined values, so the re-read should show no legacy keys.
+    const docAfter = issueDocs.get(issueRef)
+    const legacyMixinAfter = docAfter?.[MR_MIXIN as unknown as string] as Record<string, unknown> | undefined
+    if (legacyMixinAfter !== undefined) {
+      for (const k of Object.keys(legacyAttrs)) {
+        expect(legacyMixinAfter[k]).toBeUndefined()
+      }
+    }
+  })
+
+  // Case 9: post-strip verification failure — fake leaves legacy key, expects strip_failed
+  it('post-strip verification failure: stripFailed incremented when legacy key survives', async () => {
+    const binding = makeBinding(42)
+    const issueRef = 'huly-mr-verify-fail'
+
+    const idmapCol = makeIdMapCol([makeIdMapEntry('ws-1', 42, 1, issueRef)])
+    const bindingsCol = makeBindingsCol([binding])
+
+    const legacyAttrs = fullLegacyMixinAttrs()
+    const issueDocs = new Map<string, Record<string, unknown>>([[
+      issueRef,
+      makeIssueDoc(issueRef, { [MR_MIXIN as unknown as string]: legacyAttrs })
+    ]])
+
+    // Build a client whose updateMixin does NOT actually clear the legacy keys,
+    // simulating a platform that ignores undefined-value strips.
+    const realClient = makeHulyClient(issueDocs)
+    const brokenClient = {
+      ...realClient,
+      updateMixin: async (
+        objectId: string,
+        objectClass: unknown,
+        objectSpace: unknown,
+        mixin: unknown,
+        attributes: Record<string, unknown>
+      ): Promise<void> => {
+        // Record the call but do NOT modify the doc — keys survive.
+        realClient.updateMixinCalls.push({ id: String(objectId), mixin: String(mixin), attrs: attributes })
+      }
+    } as unknown as typeof realClient
+
+    const result = await migrateMixinSplit(
+      { store: makeStore(idmapCol, bindingsCol), hulyClient: brokenClient, logger: makeLogger(), ...NO_DRAIN_DEPS },
+      binding
+    )
+
+    expect(result.stripFailed).toBe(1)
+    expect(result.legacyStripped).toBe(0)
+  })
+
   // Case 7 (B4): backfill drain timeout returns partial result without stripping
   it('B4 — backfill drain timeout: returns drainTimedOut=true and skips strip', async () => {
     const binding = makeBinding(42, 'ws-1', 'project-ref-1', { backfillInFlight: true } as Partial<BindingDoc>)
