@@ -1046,6 +1046,71 @@ test('getMRChanges: happy path returns diffWebUrl and changedFiles', async () =>
 })
 
 // ---------------------------------------------------------------------------
+// Item-10b. getMRChanges: diff body populated from `diff` field; 64KB cap
+// ---------------------------------------------------------------------------
+test('getMRChanges: diff field populated as diffBody when under DIFF_BODY_MAX_BYTES', async () => {
+  const smallDiff = '@@ -1 +1 @@\n-old\n+new\n'
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/changes')
+    .reply(200, {
+      web_url: 'http://gitlab.test/ns/proj/-/merge_requests/10',
+      changes: [
+        {
+          old_path: 'a.ts', new_path: 'a.ts',
+          new_file: false, deleted_file: false, renamed_file: false,
+          diff: smallDiff
+        }
+      ]
+    })
+
+  const client = makeClient()
+  const changes = await client.getMRChanges(1, 10)
+  expect(changes.changedFiles[0].diffBody).toBe(smallDiff)
+  expect(changes.changedFiles[0].diffOverflow).toBeUndefined()
+})
+
+test('getMRChanges: diff body truncated at DIFF_BODY_MAX_BYTES with diffOverflow=true', async () => {
+  // Generate a diff that exceeds 64KB
+  const line = '@@ -1 +1 @@\n' + 'x'.repeat(100) + '\n'
+  const bigDiff = line.repeat(Math.ceil((64 * 1024) / line.length) + 10)
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/changes')
+    .reply(200, {
+      web_url: 'http://gitlab.test/ns/proj/-/merge_requests/10',
+      changes: [
+        {
+          old_path: 'big.ts', new_path: 'big.ts',
+          new_file: false, deleted_file: false, renamed_file: false,
+          diff: bigDiff
+        }
+      ]
+    })
+
+  const client = makeClient()
+  const changes = await client.getMRChanges(1, 10)
+  const file = changes.changedFiles[0]
+  expect(file.diffOverflow).toBe(true)
+  expect(Buffer.byteLength(file.diffBody ?? '', 'utf8')).toBeLessThanOrEqual(64 * 1024)
+})
+
+test('getMRChanges: null/empty diff field leaves diffBody unset', async () => {
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/changes')
+    .reply(200, {
+      web_url: 'http://gitlab.test/ns/proj/-/merge_requests/10',
+      changes: [
+        { old_path: 'a.ts', new_path: 'a.ts', new_file: false, deleted_file: false, renamed_file: false, diff: '' },
+        { old_path: 'b.ts', new_path: 'b.ts', new_file: false, deleted_file: false, renamed_file: false, diff: null }
+      ]
+    })
+
+  const client = makeClient()
+  const changes = await client.getMRChanges(1, 10)
+  expect(changes.changedFiles[0].diffBody).toBeUndefined()
+  expect(changes.changedFiles[1].diffBody).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
 // P3-T-03 / 13. getMRChanges: 404 returns empty + derived diffWebUrl + metric
 // ---------------------------------------------------------------------------
 test('getMRChanges: 404 returns defaults using fallbackWebUrl and increments metric', async () => {

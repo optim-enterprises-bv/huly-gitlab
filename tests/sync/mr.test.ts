@@ -12,6 +12,7 @@ import type {
   SyncMergeRequest,
   SyncMRApprovalRule,
   SyncMilestone,
+  SyncProject,
   SyncUser as AdapterUser
 } from '../../src/adapter/types'
 import { UserIdentity } from '../../src/huly/users'
@@ -265,6 +266,9 @@ interface FakeGitLab {
   unapproveMR: jest.Mock
   getMRApprovals: jest.Mock
   getMRChanges: jest.Mock
+  // Task 2: lazy project path resolution + composite MR fetch.
+  getProject: jest.Mock
+  getMergeRequest: jest.Mock
 }
 
 function makeGitLab (overrides: Partial<FakeGitLab> = {}): FakeGitLab {
@@ -285,6 +289,20 @@ function makeGitLab (overrides: Partial<FakeGitLab> = {}): FakeGitLab {
     unapproveMR: jest.fn().mockResolvedValue(undefined),
     getMRApprovals: jest.fn().mockResolvedValue({ approvedBy: [], approvalsRequired: 0 }),
     getMRChanges: jest.fn().mockResolvedValue({ diffWebUrl: '', changedFiles: [] }),
+    getProject: jest.fn().mockResolvedValue({
+      id: 42,
+      name: 'proj',
+      nameWithNamespace: 'group/proj',
+      path: 'proj',
+      pathWithNamespace: 'group/proj',
+      description: null,
+      webUrl: 'https://gitlab.example/group/proj',
+      visibility: 'private',
+      defaultBranch: 'main',
+      createdAt: '2024-01-01T00:00:00Z',
+      lastActivityAt: '2024-01-01T00:00:00Z'
+    } as SyncProject),
+    getMergeRequest: jest.fn().mockResolvedValue({} as SyncMergeRequest),
     createMilestone: jest.fn().mockImplementation(async (_pid, body) => ({
       id: 88,
       iid: 1,

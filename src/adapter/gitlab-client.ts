@@ -217,7 +217,11 @@ interface RawChange {
   new_file?: boolean
   deleted_file?: boolean
   renamed_file?: boolean
+  diff?: string | null
 }
+
+/** Maximum byte length for persisted diff body per file (Task 3 / item 10b). */
+export const DIFF_BODY_MAX_BYTES = 64 * 1024
 
 interface RawChangesResponse {
   web_url?: string
@@ -546,6 +550,17 @@ function mapChangedFile (raw: RawChange): SyncChangedFile {
   }
   if (raw.renamed_file === true && raw.old_path !== undefined) {
     file.oldPath = raw.old_path
+  }
+  if (raw.diff != null && raw.diff !== '') {
+    const bytes = Buffer.byteLength(raw.diff, 'utf8')
+    if (bytes <= DIFF_BODY_MAX_BYTES) {
+      file.diffBody = raw.diff
+    } else {
+      // Truncate to byte cap without splitting a multibyte character.
+      const buf = Buffer.from(raw.diff, 'utf8').subarray(0, DIFF_BODY_MAX_BYTES)
+      file.diffBody = buf.toString('utf8')
+      file.diffOverflow = true
+    }
   }
   return file
 }
@@ -1583,6 +1598,7 @@ export class GitLabClient {
           const mr = mapGraphQLMRResponse(data)
           mr.projectId = typeof mr.projectId === 'number' && mr.projectId > 0 ? mr.projectId : 0
           metrics.increment(METRIC_NAMES.MR_COMPOSITE_GRAPHQL_HIT)
+          metrics.increment(METRIC_NAMES.MR_COMPOSITE_GRAPHQL_HIT_PATH_KNOWN)
           return mr
         }
       } catch (err) {

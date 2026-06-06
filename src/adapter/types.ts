@@ -49,6 +49,10 @@ export interface SyncChangedFile {
   additions: number
   deletions: number
   status: 'added' | 'modified' | 'deleted' | 'renamed'
+  /** Raw unified diff text for this file, populated by getMRChanges. */
+  diffBody?: string
+  /** True when diffBody was truncated at DIFF_BODY_MAX_BYTES. */
+  diffOverflow?: boolean
 }
 
 export type SyncReviewPosition =

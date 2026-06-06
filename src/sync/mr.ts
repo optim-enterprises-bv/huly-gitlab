@@ -132,6 +132,14 @@ export interface MRBindingContext {
    * between GitLab instances (TG-4 defense-in-depth).
    */
   isMultiInstanceWorkspace?: boolean
+  /**
+   * Task 2: Optional pre-resolved project full path (e.g. "group/project").
+   * When present, getMergeRequest / listMergeRequestsWithApprovals / listEpicsWithChildren
+   * can engage the single-roundtrip GraphQL path instead of falling back to REST due
+   * to a numeric projectId. Lazily populated on first composite call via getProject REST.
+   * Cached here to avoid repeat lookups within the same binding lifetime.
+   */
+  resolvedProjectPath?: string
 }
 
 /** Loader callback — engine returns the per-binding context. */
@@ -179,6 +187,10 @@ export interface MRGitLabClient {
     mrIid: number,
     fallbackWebUrl?: string
   ) => Promise<SyncMRChanges>
+  /** Task 2: resolve project by numeric id to get the full path. */
+  getProject: GitLabClient['getProject']
+  /** Task 2: single-roundtrip composite MR fetch (uses GraphQL when path known). */
+  getMergeRequest: GitLabClient['getMergeRequest']
 }
 
 export interface UpdateMRBody {
@@ -668,5 +680,32 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
       out.push(ref)
     }
     return out
+  }
+}
+
+/**
+ * Task 2: lazily resolve the GitLab project full path (e.g. "group/project")
+ * from the numeric `bctx.gitlabProjectId` via a REST `getProject` call. The
+ * result is cached on `bctx.resolvedProjectPath` so subsequent calls within
+ * the same binding context are free.
+ *
+ * Callers pass the resolved path to `getMergeRequest`, `listMergeRequestsWithApprovals`,
+ * and `listEpicsWithChildren` so those methods can engage the single-roundtrip
+ * GraphQL path instead of falling back to REST (which requires a string project path).
+ *
+ * If the REST call fails, returns the numeric id cast to string as a safe fallback
+ * (the downstream methods will still work via the REST composite path).
+ */
+export async function resolveProjectPath (bctx: MRBindingContext): Promise<string> {
+  if (bctx.resolvedProjectPath !== undefined) {
+    return bctx.resolvedProjectPath
+  }
+  try {
+    const project = await bctx.gitlabClient.getProject(bctx.gitlabProjectId)
+    bctx.resolvedProjectPath = project.pathWithNamespace
+    return bctx.resolvedProjectPath
+  } catch {
+    // Fallback: return numeric id as string (GraphQL gate won't fire but REST still works)
+    return String(bctx.gitlabProjectId)
   }
 }

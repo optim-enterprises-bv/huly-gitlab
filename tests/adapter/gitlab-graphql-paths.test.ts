@@ -164,6 +164,7 @@ test('getMergeRequest: GraphQL preferred when capability=true; mapped to SyncMer
   expect(mr.reviewers).toHaveLength(1)
   expect(mr.labels).toEqual(['bug', 'p1'])
   expect(metrics.get(METRIC_NAMES.MR_COMPOSITE_GRAPHQL_HIT)).toBe(1)
+  expect(metrics.get(METRIC_NAMES.MR_COMPOSITE_GRAPHQL_HIT_PATH_KNOWN)).toBe(1)
   expect(metrics.get(METRIC_NAMES.MR_COMPOSITE_REST_FALLBACK)).toBe(0)
 })
 
