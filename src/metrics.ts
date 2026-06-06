@@ -50,5 +50,7 @@ export const METRIC_NAMES = {
   EPICS_LIST_REST_FALLBACK: 'epics.list.rest.fallback',
   // P5-T-24: listMergeRequestsWithApprovals path selection
   MR_LIST_GRAPHQL_HIT: 'mr.list.graphql.hit',
-  MR_LIST_REST_FALLBACK: 'mr.list.rest.fallback'
+  MR_LIST_REST_FALLBACK: 'mr.list.rest.fallback',
+  // P5-T-21: GraphQL capability cache negative hit
+  GRAPHQL_CAPABILITY_NEGATIVE_CACHE_HIT: 'graphql.capability.negative_cache.hit'
 } as const
