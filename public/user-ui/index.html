@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-ancestors 'self';">
+  <title>Huly GitLab — Link your account</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Huly GitLab</h1>
+      <p class="subtitle">Link your GitLab account</p>
+    </header>
+
+    <main>
+      <section id="status-section" class="status-section">
+        <h2>Account Status</h2>
+        <div id="status-display" class="status-display">
+          <p>Loading status...</p>
+        </div>
+      </section>
+
+      <section id="form-section" class="form-section">
+        <h2>Link Account</h2>
+        <form id="link-form">
+          <div class="form-group">
+            <label for="gitlab-url">GitLab Instance URL:</label>
+            <input
+              type="url"
+              id="gitlab-url"
+              name="gitlabBaseUrl"
+              placeholder="https://gitlab.example.com"
+              required
+            >
+          </div>
+          <button type="submit" id="link-button" class="btn btn-primary">Link</button>
+        </form>
+      </section>
+
+      <div id="error-message" class="error-message" style="display: none;"></div>
+    </main>
+
+    <footer>
+      <p>&copy; 2026 Huly. GitLab OAuth linking.</p>
+    </footer>
+  </div>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

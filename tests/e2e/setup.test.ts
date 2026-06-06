@@ -27,10 +27,17 @@ import {
   patchBindingDisabled,
   directMixinPatchOnChatMessage,
   directMixinPatchOnIssue,
+  simulateHulyTxEdit,
+  getMRApprovalRulesFromGitLab,
+  createGitLabEpic,
+  linkUserOAuth,
+  getUserOAuthStatus,
+  deleteUserOAuthCredential,
   HARNESS_CHAT_MESSAGE_CLASS,
   HARNESS_ISSUE_CLASS,
   type HarnessDeps,
-  type MinimalTransactor
+  type MinimalTransactor,
+  type MinimalHulyTxClient
 } from './setup'
 import { makeDockerMock } from './fakes/docker-mock'
 import { makeFetchMock } from './fakes/http-mock'
@@ -520,6 +527,144 @@ describe('harness primitives', () => {
       attrs: { draft: true }
     })
     expect(calls[0]?.args[1]).toBe(HARNESS_ISSUE_CLASS)
+  })
+
+  test('simulateHulyTxEdit forwards to transactor.updateDoc with Issue class by default', async () => {
+    const calls: Array<{ cls: string, space: string, id: string, ops: Record<string, unknown> }> = []
+    const fakeClient: MinimalHulyTxClient = {
+      updateDoc: async (cls, space, id, ops) => {
+        calls.push({ cls, space, id, ops })
+      }
+    }
+    await simulateHulyTxEdit(fakeClient, {
+      issueRef: 'issue-7',
+      space: 'space-7',
+      field: 'title',
+      value: 'new title'
+    })
+    expect(calls).toEqual([
+      { cls: HARNESS_ISSUE_CLASS, space: 'space-7', id: 'issue-7', ops: { title: 'new title' } }
+    ])
+  })
+
+  test('simulateHulyTxEdit honors objectClass override (e.g. ChatMessage)', async () => {
+    const calls: string[] = []
+    const fakeClient: MinimalHulyTxClient = {
+      updateDoc: async (cls) => {
+        calls.push(cls)
+      }
+    }
+    await simulateHulyTxEdit(fakeClient, {
+      issueRef: 'msg-1',
+      space: 's',
+      field: 'message',
+      value: 'edited body',
+      objectClass: HARNESS_CHAT_MESSAGE_CLASS
+    })
+    expect(calls).toEqual([HARNESS_CHAT_MESSAGE_CLASS])
+  })
+
+  test('getMRApprovalRulesFromGitLab GETs /approval_rules and maps response to camelCase', async () => {
+    const http = makeFetchMock()
+    http.on('/approval_rules', {
+      status: 200,
+      body: [
+        { id: 1, name: 'security', approvals_required: 1, approved_by: [{ username: 'sec-lead' }] },
+        { id: 2, name: 'qa', approvals_required: 2, approved_by: [] }
+      ]
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await getMRApprovalRulesFromGitLab(deps, 'http://gitlab.test:8929', 'rt', 9, 4)
+    expect(result.rules).toEqual([
+      { id: 1, name: 'security', approvalsRequired: 1, approvedBy: ['sec-lead'] },
+      { id: 2, name: 'qa', approvalsRequired: 2, approvedBy: [] }
+    ])
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/projects/9/merge_requests/4/approval_rules')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers['PRIVATE-TOKEN']).toBe('rt')
+  })
+
+  test('getMRApprovalRulesFromGitLab throws on non-200 response (EE-only endpoint on CE)', async () => {
+    const http = makeFetchMock()
+    http.on('/approval_rules', { status: 404, body: { error: 'not found' } })
+    const deps = buildDeps({ fetch: http.fetch })
+    await expect(
+      getMRApprovalRulesFromGitLab(deps, 'http://gitlab.test:8929', 'rt', 1, 1)
+    ).rejects.toThrow(/unexpected status 404/)
+  })
+
+  test('createGitLabEpic POSTs to /groups/:id/epics with title + optional labels CSV', async () => {
+    const http = makeFetchMock()
+    http.on('/epics', { status: 201, body: { iid: 88, group_id: 12 } })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await createGitLabEpic(deps, 'http://gitlab.test:8929', 'rt', 12, {
+      title: 'e2e-epic',
+      labels: ['priority::1', 'team::core']
+    })
+    expect(result).toEqual({ epicIid: 88, groupId: 12 })
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://gitlab.test:8929/api/v4/groups/12/epics')
+    expect(call.init?.method).toBe('POST')
+    const body = JSON.parse(call.init?.body as string)
+    expect(body).toEqual({ title: 'e2e-epic', labels: 'priority::1,team::core' })
+  })
+
+  test('linkUserOAuth follows the /start redirect into /callback with extracted state', async () => {
+    const http = makeFetchMock()
+    http.on('/user/oauth/start', {
+      status: 302,
+      body: '',
+      text: ''
+    })
+    http.on('/user/oauth/callback', { status: 200, body: { ok: true } })
+    const deps = buildDeps({ fetch: http.fetch })
+    // We can't easily set Location headers through the fetch-mock, so the test
+    // asserts the no-state branch returns startStatus only with callbackStatus=0.
+    const result = await linkUserOAuth(deps, {
+      podUrl: 'http://pod.test:3600',
+      hulyUserCookie: 'json-hmac-cookie',
+      gitlabBaseUrl: 'http://gitlab.test:8929'
+    })
+    expect(result.startStatus).toBe(302)
+    expect(result.callbackStatus).toBe(0)
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/user/oauth/start')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers.Cookie).toBe('huly-user=json-hmac-cookie')
+  })
+
+  test('getUserOAuthStatus parses linked=true JSON body and surfaces the username field (SCG-2)', async () => {
+    const http = makeFetchMock()
+    http.on('/user/oauth/status', {
+      status: 200,
+      body: { linked: true, username: 'alice' }
+    })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await getUserOAuthStatus(deps, {
+      podUrl: 'http://pod.test:3600',
+      bearer: 'tok-x'
+    })
+    expect(result.status).toBe(200)
+    expect(result.body).toEqual({ linked: true, username: 'alice' })
+    const headers = http.invocations[0].init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer tok-x')
+  })
+
+  test('deleteUserOAuthCredential DELETEs /user/oauth/credential with bearer auth', async () => {
+    const http = makeFetchMock()
+    http.on('/user/oauth/credential', { status: 204, body: '' })
+    const deps = buildDeps({ fetch: http.fetch })
+    const result = await deleteUserOAuthCredential(deps, {
+      podUrl: 'http://pod.test:3600',
+      bearer: 'tok-x'
+    })
+    expect(result.status).toBe(204)
+    const call = http.invocations[0]
+    expect(call.url).toBe('http://pod.test:3600/user/oauth/credential')
+    expect(call.init?.method).toBe('DELETE')
+    const headers = call.init?.headers as Record<string, string>
+    expect(headers.Authorization).toBe('Bearer tok-x')
   })
 
   test('isRealStackEnabled and isSoakEnabled honor env vars', () => {

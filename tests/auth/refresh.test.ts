@@ -4,8 +4,10 @@ import { ObjectId } from 'mongodb'
 import { randomBytes } from 'node:crypto'
 import { OAuthRefresher } from '../../src/auth/refresh'
 import { putCredential, getCredential } from '../../src/state/credentials'
+import { putUserCredential, getUserCredential } from '../../src/state/user-credentials'
 import { Store } from '../../src/state/store'
 import type { Logger } from '../../src/logging'
+import type { WorkspaceUuid, PersonUuid } from '@hcengineering/core'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -37,6 +39,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await store.credentials().deleteMany({})
+  await store.userCredentials().deleteMany({})
   nock.cleanAll()
 })
 
@@ -197,6 +200,84 @@ describe('OAuthRefresher.refresh()', () => {
     expect(doc).not.toBeNull()
     // Must NOT be marked expired for network errors
     expect(doc?.expired).not.toBe(true)
+  })
+
+  // ---------------------------------------------------------------------------
+  // B2 — per-user OAuth refresh tests
+  // ---------------------------------------------------------------------------
+
+  const WS = 'ws-refresh' as WorkspaceUuid
+  const PERSON = 'person-refresh' as PersonUuid
+
+  async function insertUserOAuthCredential (
+    expiresAt: Date,
+    accessToken = 'user-access-initial',
+    refreshToken: string | undefined = 'user-refresh-initial'
+  ): Promise<void> {
+    await putUserCredential(store.userCredentials(), ENCRYPTION_KEY, {
+      workspaceUuid: WS,
+      hulyPersonUuid: PERSON,
+      gitlabBaseUrl: GITLAB_BASE,
+      username: 'alice',
+      accessToken,
+      refreshToken,
+      expiresAt
+    })
+  }
+
+  test('B2: per-user credential expiring within 5min is rotated via rotateUserCredential', async () => {
+    const refresher = makeRefresher()
+    const expiresAt = new Date(Date.now() + 2 * 60 * 1000)
+    await insertUserOAuthCredential(expiresAt)
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(200, {
+        access_token: 'user-access-rotated',
+        refresh_token: 'user-refresh-rotated',
+        expires_in: 7200
+      })
+
+    await refresher.refresh()
+
+    const got = await getUserCredential(store.userCredentials(), ENCRYPTION_KEY, WS, PERSON, GITLAB_BASE)
+    expect(got).not.toBeNull()
+    expect(got?.token).toBe('user-access-rotated')
+    // Verify expiresAt advanced by ~2 hours
+    const newExpiresMs = got!.expiresAt!.getTime()
+    expect(newExpiresMs - Date.now()).toBeGreaterThan(60 * 60 * 1000)
+  })
+
+  test('B2: per-user 5xx → NOT marked expired (transient)', async () => {
+    const refresher = makeRefresher()
+    const expiresAt = new Date(Date.now() + 60 * 1000)
+    await insertUserOAuthCredential(expiresAt)
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(503, { error: 'service_unavailable' })
+
+    await refresher.refresh()
+
+    const doc = await store.userCredentials().findOne({ workspaceUuid: WS, hulyPersonUuid: PERSON })
+    expect(doc).not.toBeNull()
+    expect(doc?.expired).not.toBe(true)
+  })
+
+  test('B2: per-user 400 invalid_grant → marked expired (permanent)', async () => {
+    const refresher = makeRefresher()
+    const expiresAt = new Date(Date.now() + 60 * 1000)
+    await insertUserOAuthCredential(expiresAt)
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(400, { error: 'invalid_grant' })
+
+    await refresher.refresh()
+
+    const doc = await store.userCredentials().findOne({ workspaceUuid: WS, hulyPersonUuid: PERSON })
+    expect(doc).not.toBeNull()
+    expect(doc?.expired).toBe(true)
   })
 
   test('two consecutive refreshes succeed without state leakage', async () => {

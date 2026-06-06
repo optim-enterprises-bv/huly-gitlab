@@ -4,7 +4,7 @@ import { type Collection, type ObjectId } from 'mongodb'
  * Frozen kind contract — consumed by Wave C (T-07 SyncManager, T-10, T-11).
  * Do not add kinds without updating Wave C tasks.
  */
-export type GitlabKind = 'issue' | 'note' | 'user' | 'label' | 'milestone' | 'project' | 'merge_request' | 'pipeline' | 'review_thread'
+export type GitlabKind = 'issue' | 'note' | 'user' | 'label' | 'milestone' | 'project' | 'merge_request' | 'pipeline' | 'review_thread' | 'epic' | 'iteration' | 'approval_rule'
 
 export interface IdMapDoc {
   _id: ObjectId

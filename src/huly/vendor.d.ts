@@ -5,6 +5,13 @@
 
 declare module '@hcengineering/core' {
   export type PersonUuid = string & { __personUuid: never }
+  /**
+   * Transaction author identifier on the platform wire format.
+   * At runtime it is a string sharing format with `PersonUuid`; the brand
+   * is kept distinct so callers do not mix accounting-domain person UUIDs
+   * with the per-tx author id surfaced on `Doc.modifiedBy`.
+   */
+  export type PersonId = string & { __personId: never }
   export type WorkspaceUuid = string & { __workspaceUuid: never }
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   export type Ref<_T> = string & { __ref: never }
@@ -70,7 +77,49 @@ declare module '@hcengineering/core' {
     warn (msg: string, extra?: Record<string, unknown>): void
   }
 
+  /**
+   * Base Tx type. Carries author identity on `modifiedBy` (inherited from `Doc`).
+   * P4-T-09 TxSubscriber compares `modifiedBy` as a string (cast) when filtering
+   * self-authored events; see `.omc/specs/p4-t-01b-tx-subscription-api.md`.
+   */
+  export interface Tx extends Doc {
+    objectSpace: Ref<Space>
+    meta?: Record<string, string | number | boolean>
+  }
+
+  export interface TxCUD<T extends Doc> extends Tx {
+    objectId: Ref<T>
+    objectClass: Ref<Class<T>>
+    attachedTo?: Ref<Doc>
+    attachedToClass?: Ref<Class<Doc>>
+    collection?: string
+  }
+
+  export interface TxCreateDoc<T extends Doc> extends TxCUD<T> {
+    attributes: Partial<T>
+  }
+
+  export interface TxUpdateDoc<T extends Doc> extends TxCUD<T> {
+    operations: Partial<T>
+    retrieve?: boolean
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-empty-interface
+  export interface TxRemoveDoc<T extends Doc> extends TxCUD<T> {}
+
+  export interface TxMixin<D extends Doc, M extends D> extends TxCUD<D> {
+    mixin: Ref<Mixin<M>>
+    attributes: MixinUpdate<D, M>
+  }
+
+  export type TxHandler = (...tx: Tx[]) => void
+
   export interface Client {
+    /**
+     * P4-T-01b Path A: optional subscription hook called by ClientImpl
+     * after every applied tx (`updateFromRemote`). TxSubscriber assigns this.
+     */
+    notify?: (...tx: Tx[]) => void
     findOne: <T extends Doc>(
       _class: Ref<Class<T>>,
       query: Partial<T>

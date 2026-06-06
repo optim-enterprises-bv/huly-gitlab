@@ -83,10 +83,15 @@ export class BindingLifecycleService {
     }
 
     try {
+      const eventFlags: Record<string, boolean> = { ...PHASE2_EVENT_FLAGS }
+      // Add epic_events for EE
+      if (client.capabilities?.edition === 'ee') {
+        eventFlags.epic_events = true
+      }
       const hook = await registerProjectWebhook(client, binding.gitlabProjectId, {
         url: webhookUrl,
         token: secretCred.plaintext,
-        eventFlags: { ...PHASE2_EVENT_FLAGS }
+        eventFlags: eventFlags as typeof PHASE2_EVENT_FLAGS & { epic_events?: boolean }
       })
 
       await updateBinding(this.store.bindings(), bindingId, {
@@ -160,10 +165,15 @@ export class BindingLifecycleService {
     const webhookUrl = `${publicBaseUrl}/webhook/${bindingId}`
 
     try {
+      const eventFlags: Record<string, boolean> = { ...PHASE2_EVENT_FLAGS }
+      // Add epic_events for EE
+      if (client.capabilities?.edition === 'ee') {
+        eventFlags.epic_events = true
+      }
       const hook = await registerProjectWebhook(client, binding.gitlabProjectId, {
         url: webhookUrl,
         token: newSecret,
-        eventFlags: { ...PHASE2_EVENT_FLAGS }
+        eventFlags: eventFlags as typeof PHASE2_EVENT_FLAGS & { epic_events?: boolean }
       })
 
       await updateBinding(this.store.bindings(), bindingId, {
@@ -242,6 +252,11 @@ export class BindingLifecycleService {
     const webhookUrl = `${publicBaseUrl}/webhook/${bindingId}`
 
     try {
+      const eventFlags: Record<string, boolean> = { ...PHASE2_EVENT_FLAGS }
+      // Add epic_events for EE
+      if (client.capabilities?.edition === 'ee') {
+        eventFlags.epic_events = true
+      }
       const hook = await updateProjectWebhookEventFlags(
         client,
         binding.gitlabProjectId,
@@ -249,7 +264,7 @@ export class BindingLifecycleService {
         {
           url: webhookUrl,
           token: secretCred.plaintext,
-          eventFlags: { ...PHASE2_EVENT_FLAGS }
+          eventFlags: eventFlags as typeof PHASE2_EVENT_FLAGS & { epic_events?: boolean }
         }
       )
 

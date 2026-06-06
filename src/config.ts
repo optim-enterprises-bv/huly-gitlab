@@ -18,9 +18,19 @@ interface Config {
   BrandingPath: string
   OAuthRedirectUri: string
   CorsAllowedOrigins: string[]
+  /**
+   * B7: Express `trust proxy` setting. Required when running behind a reverse
+   * proxy/load balancer for `req.ip` to reflect the real client IP and for
+   * `req.protocol`/`X-Forwarded-*` headers to be honored. Recommended values:
+   *   - 'loopback' / '127.0.0.1' for a local dev nginx
+   *   - '1' for a single hop (most cloud LBs)
+   *   - 'uniquelocal' for private-IP trust
+   * Unset → Express default (false). Set via `TRUST_PROXY` env.
+   */
+  TrustProxy?: string
 }
 
-const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri'>, string> = {
+const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri' | 'TrustProxy'>, string> = {
   Port: 'PORT',
   PublicBaseUrl: 'PUBLIC_BASE_URL',
   AccountsURL: 'ACCOUNTS_URL',
@@ -78,6 +88,8 @@ export function loadConfig (): Config {
   const corsAllowedOrigins = corsAllowedOriginsStr.length > 0
     ? corsAllowedOriginsStr.split(',').map((x) => x.trim()).filter((x) => x !== '')
     : []
+  const trustProxyRaw = process.env.TRUST_PROXY
+  const trustProxy = trustProxyRaw !== undefined && trustProxyRaw !== '' ? trustProxyRaw : undefined
 
   // Validate CredentialEncryptionKey is 32 bytes when base64-decoded
   let decoded: Buffer
@@ -112,7 +124,8 @@ export function loadConfig (): Config {
     LogLevel: logLevel,
     BrandingPath: brandingPath,
     OAuthRedirectUri: `${publicBaseUrl}/oauth/callback`,
-    CorsAllowedOrigins: corsAllowedOrigins
+    CorsAllowedOrigins: corsAllowedOrigins,
+    TrustProxy: trustProxy
   }
 }
 

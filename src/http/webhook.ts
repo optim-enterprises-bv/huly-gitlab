@@ -23,9 +23,18 @@ export function getUnboundPipelineCount (): number {
   return metrics.get(METRIC_NAMES.WEBHOOK_UNBOUND_PIPELINE)
 }
 
+export function getEpicCeSkippedCount (): number {
+  return metrics.get(METRIC_NAMES.WEBHOOK_EPIC_CE_SKIPPED)
+}
+
+export function getPayloadInvalidCount (): number {
+  return metrics.get(METRIC_NAMES.WEBHOOK_PAYLOAD_INVALID)
+}
+
 const CONFIDENTIAL_HOOKS = new Set([
   'Confidential Issue Hook',
-  'Confidential Note Hook'
+  'Confidential Note Hook',
+  'Confidential Epic Hook'
 ])
 
 const MR_EVENT_HEADER = 'Merge Request Hook'
@@ -223,6 +232,31 @@ export function createWebhookRouter (
 
       // Other noteable_type values (Snippet, Commit, etc.) — accept silently
       logger.debug('webhook: note with unhandled noteable_type', { bindingId, eventUuid, noteableType })
+      res.status(200).json({ accepted: true })
+      return
+    }
+
+    if (eventHeader === 'Epic Hook') {
+      const oa = payload.object_attributes as Record<string, unknown> | undefined
+
+      // Validate required fields
+      if (oa?.iid == null || oa?.group_id == null) {
+        logger.debug('webhook: Epic Hook with missing object_attributes.iid or group_id — dropping', { bindingId, eventUuid })
+        metrics.increment(METRIC_NAMES.WEBHOOK_PAYLOAD_INVALID)
+        res.status(400).json({ error: 'invalid payload: missing object_attributes.iid or group_id' })
+        return
+      }
+
+      // Defense-in-depth: skip confidential epics
+      if (oa?.confidential === true) {
+        logger.info('webhook: confidential epic — dropping', { bindingId, eventUuid })
+        metrics.increment(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
+        res.status(204).end()
+        return
+      }
+
+      const version = (oa?.updated_at as string | undefined) ?? String(Date.now())
+      await syncEngine.enqueueWebhookEvent(bindingId, 'epic', payload as Record<string, unknown>, eventUuid, version)
       res.status(200).json({ accepted: true })
       return
     }

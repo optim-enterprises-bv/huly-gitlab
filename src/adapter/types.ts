@@ -96,6 +96,37 @@ export interface SyncMRApprovals {
 
 export type SyncPipelineStatus = 'pending' | 'running' | 'success' | 'failed' | 'canceled'
 
+export interface SyncMRApprovalRule {
+  id: number
+  name: string
+  ruleType: 'regular' | 'any_approver' | 'code_owner' | 'report_approver'
+  eligibleApprovers: SyncUser[]
+  approvalsRequired: number
+  approvedBy: SyncUser[]
+}
+
+export interface SyncIteration {
+  id: string
+  title: string
+  startDate: Date
+  dueDate: Date
+  state: 'upcoming' | 'started' | 'closed'
+  webUrl: string
+}
+
+export interface SyncEpic {
+  iid: number
+  groupId: number
+  title: string
+  description: string
+  state: 'opened' | 'closed'
+  webUrl: string
+  childIssueIids: number[]
+  author: SyncUser
+  createdAt: Date
+  updatedAt: Date
+}
+
 export interface SyncMergeRequest {
   iid: number
   projectId: number
@@ -127,6 +158,8 @@ export interface SyncMergeRequest {
   approvalStatus?: ApprovalStatus
   diffWebUrl?: string
   changedFiles?: SyncChangedFile[]
+  approvalRules?: SyncMRApprovalRule[]
+  iteration?: SyncIteration | null
 }
 
 export interface SyncPipeline {

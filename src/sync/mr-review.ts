@@ -8,11 +8,13 @@ import type {
 import { gfmMarkdownToMarkup } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
+import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
 import { MR_REVIEW_MIXIN, type MRReviewMixinDoc } from './mr-review-mixin'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
+import { markAndRetry, REVIEW_RETRY_FLAG } from './deferred-parent'
 
 const HULY_CLASS_CHAT_MESSAGE = 'chunter.class.ChatMessage'
 
@@ -32,6 +34,15 @@ export interface MRReviewBindingContext {
   gitlabClient: MRReviewGitLabClient
   userIdentity: UserIdentity
   gitlabBaseUrl: string
+  /**
+   * B1: true when ≥ 2 distinct GitLab base URLs are registered for this
+   * workspace. When true, the `merge_request` idmap lookup for the parent
+   * MR is prefixed via `prefixGitlabIdForMultiInstance` to avoid TG-4
+   * cross-instance collisions. Review-thread idmap keys
+   * (`${discussionId}:${noteId}`) are intrinsically discussion-scoped and
+   * therefore not affected.
+   */
+  isMultiInstanceWorkspace?: boolean
 }
 
 /**
@@ -134,7 +145,10 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
     const bctx = await this.deps.loadBinding(binding)
 
     // Resolve parent MR — Huly Issue ref via 'merge_request' idmap.
-    const parentGitlabId = `${bctx.gitlabProjectId}:${syncThread.mergeRequestIid}`
+    const parentGitlabId = prefixGitlabIdForMultiInstance(
+      { isMultiInstanceWorkspace: bctx.isMultiInstanceWorkspace === true, gitlabBaseUrl: bctx.gitlabBaseUrl },
+      `${bctx.gitlabProjectId}:${syncThread.mergeRequestIid}`
+    )
     const parentMapping = await findByGitlab(
       ctx.store.idmap(),
       bctx.workspaceUuid,
@@ -143,8 +157,8 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
     )
 
     if (parentMapping === null) {
-      const retryFlag = (syncThread as unknown as Record<string, unknown>)._reviewRetried === true
-      if (!retryFlag) {
+      const threadRecord = syncThread as unknown as Record<string, unknown>
+      if (markAndRetry(threadRecord, REVIEW_RETRY_FLAG)) {
         ctx.logger.debug('ReviewThreadsSyncManager: parent MR not yet synced — deferring', {
           binding,
           projectId: bctx.gitlabProjectId,
@@ -154,7 +168,7 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
         await this.enqueueRecord(
           binding,
           'review',
-          { ...(syncThread as unknown as Record<string, unknown>), _reviewRetried: true },
+          { ...threadRecord },
           `deferred:review:${bctx.gitlabProjectId}:${syncThread.mergeRequestIid}:${syncThread.discussionId}`,
           syncThread.updatedAt.toISOString()
         )
@@ -343,8 +357,15 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
       return
     }
 
-    const actorToken = change.actorToken as string | undefined
+    // SCG-1 provenance guard: the legacy Phase 3 path used to read an actor
+    // token off the change envelope. That carry path is now FORBIDDEN —
+    // synthetic envelope tokens MUST be ignored. Actor tokens come exclusively
+    // from the workspace+person scoped resolver
+    // (`bctx.credentials.resolveActorToken`), wired in P4-T-10. Until that
+    // lands, the service-account path is used (resolveDiscussion receives
+    // undefined). See plan §P4-T-08 SCG-1.
     const resolved = change.resolved === true
+    const actorToken: string | undefined = undefined
 
     await bctx.gitlabClient.resolveDiscussion(
       bctx.gitlabProjectId,

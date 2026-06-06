@@ -229,6 +229,20 @@ describe('Cursors upsert', () => {
     const result = await getCursor(store.cursors(), 'bind-5', 'reviews')
     expect(result?.getTime()).toBe(ts.getTime())
   })
+
+  it('upserts and retrieves an epics cursor', async () => {
+    const ts = new Date('2025-08-01T00:00:00Z')
+    await setCursor(store.cursors(), 'bind-6', 'epics', ts)
+    const result = await getCursor(store.cursors(), 'bind-6', 'epics')
+    expect(result?.getTime()).toBe(ts.getTime())
+  })
+
+  it('upserts and retrieves an iterations cursor', async () => {
+    const ts = new Date('2025-09-01T00:00:00Z')
+    await setCursor(store.cursors(), 'bind-6', 'iterations', ts)
+    const result = await getCursor(store.cursors(), 'bind-6', 'iterations')
+    expect(result?.getTime()).toBe(ts.getTime())
+  })
 })
 
 describe('IdMap bidirectional lookup', () => {
@@ -320,6 +334,39 @@ describe('IdMap bidirectional lookup', () => {
     expect(byHuly).not.toBeNull()
     expect(byHuly?.gitlabId).toBe('disc-abc')
     expect(byHuly?.gitlabKind).toBe('review_thread')
+  })
+
+  it('upserts epic kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-ep', 'epic', '7', 'tracker.class.Epic', 'huly-epic-7')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-ep', 'epic', '7')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-epic-7')
+    expect(byGitlab?.gitlabKind).toBe('epic')
+    const byHuly = await findByHuly(store.idmap(), 'ws-ep', 'tracker.class.Epic', 'huly-epic-7')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('7')
+  })
+
+  it('upserts iteration kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-it', 'iteration', '55', 'tracker.class.Sprint', 'huly-iter-55')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-it', 'iteration', '55')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-iter-55')
+    expect(byGitlab?.gitlabKind).toBe('iteration')
+    const byHuly = await findByHuly(store.idmap(), 'ws-it', 'tracker.class.Sprint', 'huly-iter-55')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('55')
+  })
+
+  it('upserts approval_rule kind and round-trips by both directions', async () => {
+    await upsertIdMap(store.idmap(), 'ws-ar', 'approval_rule', '12', 'tracker.class.ApprovalRule', 'huly-ar-12')
+    const byGitlab = await findByGitlab(store.idmap(), 'ws-ar', 'approval_rule', '12')
+    expect(byGitlab).not.toBeNull()
+    expect(byGitlab?.hulyRef).toBe('huly-ar-12')
+    expect(byGitlab?.gitlabKind).toBe('approval_rule')
+    const byHuly = await findByHuly(store.idmap(), 'ws-ar', 'tracker.class.ApprovalRule', 'huly-ar-12')
+    expect(byHuly).not.toBeNull()
+    expect(byHuly?.gitlabId).toBe('12')
   })
 })
 
