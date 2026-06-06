@@ -6,6 +6,7 @@ import type { DedupDoc } from './dedup'
 import type { InflightDoc } from './inflight'
 import type { CredentialDoc } from './credentials'
 import type { OAuthStateDoc } from './oauth-state'
+import type { AttachmentMirrorDoc } from './attachment-mirror'
 
 export class Store {
   private readonly client: MongoClient
@@ -60,6 +61,10 @@ export class Store {
     return this.getDb().collection<OAuthStateDoc>('oauth_state')
   }
 
+  attachmentMirror (): Collection<AttachmentMirrorDoc> {
+    return this.getDb().collection<AttachmentMirrorDoc>('attachment_mirror')
+  }
+
   private async createIndexes (): Promise<void> {
     const db = this.getDb()
 
@@ -111,6 +116,12 @@ export class Store {
     await db.collection('oauth_state').createIndex(
       { state: 1 },
       { unique: true, name: 'oauth_state_unique' }
+    )
+
+    // attachment_mirror: unique per (contentHash, origin) — dedupe key
+    await db.collection('attachment_mirror').createIndex(
+      { contentHash: 1, origin: 1 },
+      { unique: true, name: 'attachment_mirror_hash_origin' }
     )
   }
 }
