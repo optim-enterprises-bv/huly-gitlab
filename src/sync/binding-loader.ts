@@ -5,6 +5,9 @@ import type { AccountClient } from '@hcengineering/account-client'
 import type { Logger } from '../logging'
 import type { Store } from '../state/store'
 import type { CredentialResolver } from '../auth'
+import type { AttachmentMirrorDoc } from '../state/attachment-mirror'
+import type { MirrorDeps, HulyAttachmentStore } from './attachments'
+import { createHulyAttachmentStore } from './huly-attachment-store'
 import { GitLabClient } from '../adapter/gitlab-client'
 import { detectCapabilities } from '../adapter/capabilities'
 import { createPlatformClient, closePlatformClient } from '../huly/client'
@@ -72,6 +75,7 @@ interface WorkspaceCacheEntry {
   txOperations: TxOperations
   identity: UserIdentity
   expiresAt: number
+  hulyStore?: HulyAttachmentStore
 }
 
 export interface BindingLoaderDeps {
@@ -106,6 +110,14 @@ export interface BindingLoaderDeps {
    * does NOT prevent eviction.
    */
   onWorkspaceEvicted?: (workspaceUuid: WorkspaceUuid) => Promise<void> | void
+  /**
+   * MongoDB collection for the attachment mirror mapping table.
+   * When provided, a HulyAttachmentStore is constructed per workspace and
+   * mirrorDeps is populated on each returned binding context (enabling
+   * bi-directional attachment mirroring). When omitted, mirrorDeps is
+   * undefined on all contexts and managers fall back to link-through.
+   */
+  mirrorCol?: Collection<AttachmentMirrorDoc>
 }
 
 /**
@@ -155,6 +167,7 @@ export class BindingLoader {
   private readonly bindingsByWorkspace = new Map<WorkspaceUuid, Map<string, string>>()
   private readonly onWorkspaceLoaded?: BindingLoaderDeps['onWorkspaceLoaded']
   private readonly onWorkspaceEvicted?: BindingLoaderDeps['onWorkspaceEvicted']
+  private readonly mirrorCol?: Collection<AttachmentMirrorDoc>
 
   constructor (deps: BindingLoaderDeps) {
     this.store = deps.store
@@ -167,6 +180,7 @@ export class BindingLoader {
     this.cacheTtlMs = deps.cacheTtlMs ?? 30 * 60 * 1000
     this.onWorkspaceLoaded = deps.onWorkspaceLoaded
     this.onWorkspaceEvicted = deps.onWorkspaceEvicted
+    this.mirrorCol = deps.mirrorCol
   }
 
   /**
@@ -199,7 +213,8 @@ export class BindingLoader {
       gitlabClient: ctx.gitlabClient as unknown as NotesBindingContext['gitlabClient'],
       userIdentity: ctx.userIdentity,
       gitlabBaseUrl: ctx.gitlabBaseUrl,
-      isMultiInstanceWorkspace: ctx.isMultiInstanceWorkspace
+      isMultiInstanceWorkspace: ctx.isMultiInstanceWorkspace,
+      mirrorDeps: ctx.mirrorDeps
     }
   }
 
@@ -253,6 +268,7 @@ export class BindingLoader {
       defaultTaskType: ctx.defaultTaskType,
       gitlabBaseUrl,
       isMultiInstanceWorkspace: ctx.isMultiInstanceWorkspace,
+      mirrorDeps: ctx.mirrorDeps,
       credentials: {
         resolveActorToken: async (workspaceUuid: WorkspaceUuid, hulyPersonUuid: PersonUuid) => {
           if (workspaceUuid === undefined || hulyPersonUuid === undefined) return undefined
@@ -289,7 +305,8 @@ export class BindingLoader {
       gitlabClient: ctx.gitlabClient as unknown as MRReviewBindingContext['gitlabClient'],
       userIdentity: ctx.userIdentity,
       gitlabBaseUrl: ctx.gitlabBaseUrl,
-      isMultiInstanceWorkspace: ctx.isMultiInstanceWorkspace
+      isMultiInstanceWorkspace: ctx.isMultiInstanceWorkspace,
+      mirrorDeps: ctx.mirrorDeps
     }
   }
 
@@ -392,6 +409,16 @@ export class BindingLoader {
     const milestoneCache = new MilestoneCache(binding.gitlabProjectId, hulyProjectRef)
     const mrCache = new MRCache(binding.gitlabProjectId)
 
+    const mirrorDeps: MirrorDeps | undefined =
+      workspace.hulyStore !== undefined && this.mirrorCol !== undefined
+        ? {
+            hulyStore: workspace.hulyStore,
+            gitlabClient: gitlabClient as unknown as MirrorDeps['gitlabClient'],
+            mirrorCol: this.mirrorCol,
+            logger: this.logger
+          }
+        : undefined
+
     return {
       workspaceUuid,
       gitlabProjectId: binding.gitlabProjectId,
@@ -406,7 +433,8 @@ export class BindingLoader {
       mrCache,
       defaultTaskType,
       gitlabBaseUrl,
-      isMultiInstanceWorkspace
+      isMultiInstanceWorkspace,
+      mirrorDeps
     }
   }
 
@@ -447,11 +475,24 @@ export class BindingLoader {
 
     const identity = new UserIdentity(this.accountClient, createIdMapStoreAdapter(this.store.idmap()), workspaceUuid)
 
+    let hulyStore: HulyAttachmentStore | undefined
+    if (this.mirrorCol !== undefined) {
+      try {
+        hulyStore = createHulyAttachmentStore({ client: txOperations, logger: this.logger, workspaceUuid })
+      } catch (err) {
+        this.logger.warn('BindingLoader: failed to create HulyAttachmentStore — attachment mirroring disabled', {
+          workspaceUuid,
+          err: err instanceof Error ? err.message : String(err)
+        })
+      }
+    }
+
     const entry: WorkspaceCacheEntry = {
       client,
       txOperations,
       identity,
-      expiresAt: now + this.cacheTtlMs
+      expiresAt: now + this.cacheTtlMs,
+      hulyStore
     }
     this.workspaceCache.set(workspaceUuid, entry)
 

@@ -43,6 +43,7 @@ import {
   buildReviewFromSyncMR,
   type MRCredentialResolver
 } from './mr-approvals'
+import type { MirrorDeps } from './attachments'
 import { withOriginatedMarker } from './originated-marker'
 import {
   areEqual,
@@ -132,6 +133,12 @@ export interface MRBindingContext {
    * between GitLab instances (TG-4 defense-in-depth).
    */
   isMultiInstanceWorkspace?: boolean
+  /**
+   * Optional attachment mirror deps. When present (wired by BindingLoader when
+   * mirrorCol is provided), GitLab upload links in MR descriptions are mirrored
+   * into Huly and vice versa. When absent, link-through is used.
+   */
+  mirrorDeps?: MirrorDeps
   /**
    * Task 2: Optional pre-resolved project full path (e.g. "group/project").
    * When present, getMergeRequest / listMergeRequestsWithApprovals / listEpicsWithChildren
