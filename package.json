@@ -57,7 +57,9 @@
     "ws": "^8.18.2"
   },
   "overrides": {
-    "uuid": "^11.0.3"
+    "uuid": "^11.0.3",
+    "svelte": "^4.2.20",
+    "minimatch": "^9.0.9"
   },
   "devDependencies": {
     "@types/body-parser": "^1.19.2",
