@@ -466,3 +466,58 @@ describe('TxSubscriber: binding resolution', () => {
     ])
   })
 })
+
+// ---------------------------------------------------------------------------
+// Echo filter integration: resolved (non-sentinel) PersonId
+// ---------------------------------------------------------------------------
+// These tests verify that the echo filter works correctly when the
+// serviceAccountPersonId is a resolved real PersonId (Path F or G outcome),
+// not just the systemAccountUuid sentinel.
+
+describe('TxSubscriber: echo filter with resolved PersonId (Path F/G integration)', () => {
+  const RESOLVED_PERSON_ID = 'a1b2c3d4-face-cafe-beef-000000000001' as unknown as PersonId
+
+  it('drops echoes when serviceAccountPersonId is the resolved non-sentinel id', () => {
+    const { deps, client, enqueueCalls } = makeDeps({
+      bindingsByProject: new Map<string, string>([['101', 'binding-resolved']])
+    })
+    // Override service account to the resolved PersonId (Path F or G outcome)
+    const resolvedDeps = { ...deps, serviceAccountPersonId: RESOLVED_PERSON_ID }
+    const sub = new TxSubscriber(resolvedDeps)
+    sub.start()
+    sub.markEngineStarted()
+
+    // Tx authored by the resolved service account — should be dropped as echo
+    const echoTx = mkTxUpdate(
+      'tracker:class:Issue',
+      'issue-doc-1',
+      { title: 'written by service account' },
+      RESOLVED_PERSON_ID
+    )
+    client.notify?.(echoTx)
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
+  })
+
+  it('passes through user txes when serviceAccountPersonId is the resolved id', () => {
+    const { deps, client, enqueueCalls } = makeDeps({
+      bindingsByProject: new Map<string, string>([['101', 'binding-resolved']])
+    })
+    const resolvedDeps = { ...deps, serviceAccountPersonId: RESOLVED_PERSON_ID }
+    const sub = new TxSubscriber(resolvedDeps)
+    sub.start()
+    sub.markEngineStarted()
+
+    // Tx authored by a real user — should pass through
+    const userTx = mkTxUpdate(
+      'tracker:class:Issue',
+      'issue-doc-2',
+      { title: 'written by user' },
+      USER_ACCOUNT
+    )
+    client.notify?.(userTx)
+    expect(enqueueCalls).toHaveLength(1)
+    expect(enqueueCalls[0].doc).toBe('issue-doc-2')
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(0)
+  })
+})
