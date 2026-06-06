@@ -14,6 +14,7 @@ import { MR_REVIEW_THREAD_MIXIN, type MRReviewThreadMixinDoc } from './mr-review
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
+import type { MirrorDeps } from './attachments'
 import { markAndRetry, REVIEW_RETRY_FLAG } from './deferred-parent'
 import { withOriginatedMarker } from './originated-marker'
 
@@ -44,6 +45,12 @@ export interface MRReviewBindingContext {
    * therefore not affected.
    */
   isMultiInstanceWorkspace?: boolean
+  /**
+   * Optional attachment mirror deps. When present (wired by BindingLoader when
+   * mirrorCol is provided), attachment links in review thread bodies are
+   * mirrored. When absent, link-through is used.
+   */
+  mirrorDeps?: MirrorDeps
 }
 
 /**

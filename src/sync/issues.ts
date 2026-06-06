@@ -89,6 +89,12 @@ export interface BindingContext {
    * between GitLab instances (TG-4 defense-in-depth).
    */
   isMultiInstanceWorkspace?: boolean
+  /**
+   * Optional attachment mirror deps. When present (wired by BindingLoader when
+   * mirrorCol is provided), GitLab upload links in issue descriptions are
+   * mirrored into Huly and vice versa. When absent, link-through is used.
+   */
+  mirrorDeps?: MirrorDeps
 }
 
 /**

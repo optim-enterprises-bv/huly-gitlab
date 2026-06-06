@@ -109,6 +109,7 @@ async function main (): Promise<void> {
     ctx,
     defaultGitlabBaseUrl: config.GitLabBaseUrl,
     encryptionKey,
+    mirrorCol: store.attachmentMirror(),
     onWorkspaceLoaded: (workspaceUuid, client, bindingsByProject) => {
       startTxSubscriberForWorkspace(workspaceUuid, client, bindingsByProject)
     },
