@@ -3,6 +3,7 @@ interface Config {
   PublicBaseUrl: string
   AccountsURL: string
   ServerSecret: string
+  ServerSecretPrevious?: string
   ServiceID: string
   MongoUrl: string
   MongoDb: string
@@ -30,7 +31,7 @@ interface Config {
   TrustProxy?: string
 }
 
-const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri' | 'TrustProxy'>, string> = {
+const envMap: Record<keyof Omit<Config, 'OAuthRedirectUri' | 'TrustProxy' | 'ServerSecretPrevious'>, string> = {
   Port: 'PORT',
   PublicBaseUrl: 'PUBLIC_BASE_URL',
   AccountsURL: 'ACCOUNTS_URL',
@@ -105,11 +106,14 @@ export function loadConfig (): Config {
     )
   }
 
+  const serverSecretPrevious = process.env.SERVER_SECRET_PREVIOUS
+
   return {
     Port: port,
     PublicBaseUrl: publicBaseUrl,
     AccountsURL: accountsUrl,
     ServerSecret: serverSecret,
+    ServerSecretPrevious: serverSecretPrevious !== undefined && serverSecretPrevious !== '' ? serverSecretPrevious : undefined,
     ServiceID: serviceId,
     MongoUrl: mongoUrl,
     MongoDb: mongoDb,

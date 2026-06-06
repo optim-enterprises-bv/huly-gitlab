@@ -24,6 +24,14 @@ export class BiDirectionalCache<K, V> {
     this.evictIfOverflowing()
   }
 
+  /**
+   * Invalidates cache entries.
+   * When called with undefined key: clears all entries and resets primed=false,
+   * so next get() will re-prime by calling primer.loadAll().
+   * When called with a specific key: removes only that entry but leaves primed=true,
+   * so cache stays partially populated; subsequent get(key) returns undefined unless
+   * reload(key, fetcher) is called.
+   */
   invalidate (key?: K): void {
     if (key === undefined) {
       this.cache.clear()
@@ -31,6 +39,19 @@ export class BiDirectionalCache<K, V> {
     } else {
       this.cache.delete(key)
     }
+  }
+
+  /**
+   * Re-fetches a single key by calling the provided fetcher and re-inserting
+   * the matching entry back into the cache.
+   * Useful after invalidate(key) to refresh just that one key without full re-prime.
+   */
+  async reload (key: K, fetcher: () => Promise<V | undefined>): Promise<V | undefined> {
+    const value = await fetcher()
+    if (value !== undefined) {
+      this.put(key, value)
+    }
+    return value
   }
 
   primeSync (entries: Iterable<{ key: K, value: V }>): void {

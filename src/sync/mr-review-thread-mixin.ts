@@ -9,7 +9,7 @@ import type { SyncReviewPosition } from '../adapter/types'
  * `position` is set only on the thread's first note; replies inherit position by
  * joining via `threadId`.
  */
-export const MR_REVIEW_MIXIN = 'gitlab-review' as unknown as Ref<Mixin<MRReviewMixinDoc>>
+export const MR_REVIEW_THREAD_MIXIN = 'gitlab-review' as unknown as Ref<Mixin<MRReviewThreadMixinDoc>>
 
 /**
  * Shape of the runtime `gitlab-review` mixin written onto a chunter.ChatMessage
@@ -24,7 +24,7 @@ export const MR_REVIEW_MIXIN = 'gitlab-review' as unknown as Ref<Mixin<MRReviewM
  * `position` is set ONLY on the first note (discussion root); reply notes have
  * `position: undefined`.
  */
-export interface MRReviewMixinDoc extends ChatMessage {
+export interface MRReviewThreadMixinDoc extends ChatMessage {
   /** GitLab discussion_id for the thread this note belongs to. */
   threadId: string
   /** Whether this thread is resolved. Replicated on every note in the thread. */

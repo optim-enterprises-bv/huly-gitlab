@@ -18,9 +18,12 @@ import type { ApprovalStatus, SyncMergeRequest, SyncMRApprovalRule } from '../ad
 import type { Logger } from '../logging'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
-import type { MRMixinDoc } from './mr-mixin'
+import { type MRMixinDoc, readMRMixinAttributes } from './mr-mixin'
+import type { MRCoreMixinDoc } from './mr-core-mixin'
+import type { MRReviewMixinDoc } from './mr-review-mixin-doc'
 import type { MRBindingContext } from './mr'
 import type { BindingRef } from './types'
+import { withOriginatedMarker } from './originated-marker'
 
 /**
  * Phase 3 race window: when applyRemote sees fewer approvers in remote than
@@ -94,8 +97,8 @@ export async function applyApprovalActions (
     tracker.class.Issue,
     { _id: issueRef }
   )
-  const existingMixin = hulyIssue !== undefined ? readMixinApprovals(hulyIssue) : undefined
-  const current = (existingMixin?.approvedBy as PersonUuid[] | undefined) ?? []
+  const existingMixin = hulyIssue !== undefined ? readMRMixinAttributes(hulyIssue) : undefined
+  const current = existingMixin?.approvedBy ?? []
 
   const currentSet = new Set(current.map((u) => String(u)))
   const incomingSet = new Set(incoming.map((u) => String(u)))
@@ -181,12 +184,12 @@ export async function postVisibilityComment (
     await bctx.hulyClient.createDoc(
       chunter.class.ChatMessage,
       bctx.hulyProjectRef,
-      {
+      withOriginatedMarker({
         attachedTo: issueRef,
         attachedToClass: tracker.class.Issue,
         collection: 'comments',
         message: body
-      } as unknown as Parameters<TxOperations['createDoc']>[2]
+      }) as unknown as Parameters<TxOperations['createDoc']>[2]
     )
   } catch (err) {
     logger.warn('mr.approval.visibility.comment.failed', {
@@ -206,26 +209,16 @@ export async function postFailureComment (
     await bctx.hulyClient.createDoc(
       chunter.class.ChatMessage,
       bctx.hulyProjectRef,
-      {
+      withOriginatedMarker({
         attachedTo: issueRef,
         attachedToClass: tracker.class.Issue,
         collection: 'comments',
         message: body
-      } as unknown as Parameters<TxOperations['createDoc']>[2]
+      }) as unknown as Parameters<TxOperations['createDoc']>[2]
     )
   } catch {
     // Swallow — failure comment failure is non-fatal
   }
-}
-
-function readMixinApprovals (issue: Issue): Record<string, unknown> | undefined {
-  const MR_MIXIN_KEY = 'gitlab-mr'
-  const obj = issue as unknown as Record<string, unknown>
-  const direct = obj[MR_MIXIN_KEY]
-  if (direct !== undefined && direct !== null && typeof direct === 'object') {
-    return direct as Record<string, unknown>
-  }
-  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +270,79 @@ export function buildMixinUpdateData (
   }
   applyPhase3MixinFields(update, syncMR, reviewerUuids, approvedByUuids)
   return update
+}
+
+// ---------------------------------------------------------------------------
+// P5-T-17: split mixin builders for MR_CORE_MIXIN + MR_REVIEW_MIXIN_DOC.
+// New writes go to these two mixins; legacy MR_MIXIN is no longer written.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the core-mixin attribute object — the always-required GitLab-side
+ * fields that mirror the MR shape on Huly. Used for BOTH create and update
+ * paths because core fields are GitLab-authoritative (remote-wins).
+ *
+ * Note: `mergedAt` type on MR_CORE_MIXIN is `number | null` but legacy MRMixinDoc
+ * carries a Date. Cast at the boundary; on-wire shape is unchanged for tests.
+ */
+export function buildCoreFromSyncMR (
+  syncMR: SyncMergeRequest
+): Omit<MRCoreMixinDoc, keyof Issue> {
+  return {
+    sourceBranch: syncMR.sourceBranch,
+    targetBranch: syncMR.targetBranch,
+    draft: syncMR.draft,
+    mergedAt: syncMR.mergedAt as unknown as MRCoreMixinDoc['mergedAt'],
+    mergeStatus: syncMR.mergeStatus,
+    webUrl: syncMR.webUrl,
+    gitlabIid: syncMR.iid,
+    gitlabProjectId: syncMR.projectId
+  }
+}
+
+/**
+ * Build the review-mixin attribute object — Phase 3 + Phase 4 EE fields. Only
+ * keys whose source data is defined on the incoming SyncMergeRequest are
+ * populated (B2 "undefined means not yet fetched"). Returns an empty object
+ * when no review-side data is present; callers should suppress the write in
+ * that case (no point firing a no-op TxMixin).
+ */
+export function buildReviewFromSyncMR (
+  syncMR: SyncMergeRequest,
+  reviewerUuids: PersonUuid[] | undefined,
+  approvedByUuids: PersonUuid[] | undefined
+): Partial<Omit<MRReviewMixinDoc, keyof Issue>> {
+  const target: Partial<Omit<MRReviewMixinDoc, keyof Issue>> = {}
+  if (syncMR.reviewers !== undefined && reviewerUuids !== undefined) {
+    target.reviewers = reviewerUuids
+  }
+  if (syncMR.approvedBy !== undefined && approvedByUuids !== undefined) {
+    target.approvedBy = approvedByUuids
+  }
+  if (syncMR.approvalsRequired !== undefined) {
+    target.approvalsRequired = syncMR.approvalsRequired
+  }
+  if (syncMR.approvalRules !== undefined) {
+    target.approvalRules = syncMR.approvalRules
+  }
+  if (syncMR.approvalRules !== undefined && syncMR.approvalRules.length > 0) {
+    target.approvalStatus = deriveApprovalStatusFromRules(syncMR.approvalRules)
+  } else if (syncMR.approvedBy !== undefined && syncMR.approvalsRequired !== undefined) {
+    target.approvalStatus = deriveApprovalStatus(
+      approvedByUuids ?? [],
+      syncMR.approvalsRequired
+    )
+  }
+  if (syncMR.iteration !== undefined) {
+    target.iteration = syncMR.iteration
+  }
+  if (syncMR.diffWebUrl !== undefined) {
+    target.diffWebUrl = syncMR.diffWebUrl
+  }
+  if (syncMR.changedFiles !== undefined) {
+    target.changedFiles = syncMR.changedFiles
+  }
+  return target
 }
 
 /**

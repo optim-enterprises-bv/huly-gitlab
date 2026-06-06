@@ -111,3 +111,42 @@ test('put: adds entry accessible via get without triggering loadAll after primeS
   expect(result).toBe(777)
   expect(primer.calls).toBe(0)
 })
+
+test('reload(key, fetcher): re-fetches single key and re-inserts after invalidate', async () => {
+  const primer = makePrimer([{ key: 'a', value: 1 }, { key: 'b', value: 2 }])
+  const cache = new BiDirectionalCache(primer)
+
+  await cache.get('a')
+  expect(primer.calls).toBe(1)
+
+  // Invalidate single key — cache stays primed
+  cache.invalidate('a')
+  expect(await cache.get('a')).toBeUndefined()
+  expect(primer.calls).toBe(1) // Still 1, not re-primed
+
+  // Reload with custom fetcher
+  let fetchCalls = 0
+  const newValue = await cache.reload('a', async () => {
+    fetchCalls++
+    return 999
+  })
+
+  expect(newValue).toBe(999)
+  expect(fetchCalls).toBe(1)
+  // Now 'a' should be back in cache
+  expect(await cache.get('a')).toBe(999)
+  // primer.loadAll still called only once
+  expect(primer.calls).toBe(1)
+})
+
+test('reload(key, fetcher): returns undefined if fetcher returns undefined', async () => {
+  const primer = makePrimer([{ key: 'x', value: 10 }])
+  const cache = new BiDirectionalCache(primer)
+
+  cache.primeSync([{ key: 'x', value: 10 }])
+  cache.invalidate('x')
+
+  const result = await cache.reload('x', async () => undefined)
+  expect(result).toBeUndefined()
+  expect(await cache.get('x')).toBeUndefined()
+})

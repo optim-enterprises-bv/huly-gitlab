@@ -849,6 +849,105 @@ The `gitlab-mr` mixin now has 16 fields across four managers:
 
 ---
 
+## Phase 5 Additions
+
+### Dual-Layer Echo Filter (Service-Account PersonId + `_originated` Marker)
+
+```mermaid
+sequenceDiagram
+    participant HulyUI as Huly UI<br/>(Browser)
+    participant HulyClient as HulyClient<br/>(transactor)
+    participant TxSubscriber as TxSubscriber<br/>(subscription)
+    participant Layer1 as Layer 1:<br/>PersonId Match
+    participant Layer2 as Layer 2:<br/>_originated Marker
+    participant SyncEngine as SyncEngine
+    participant Adapter as GitLabAdapter
+    participant GitLab as GitLab API
+    
+    HulyUI->>HulyClient: updateMixin(issueRef,<br/>gitlab-mr, {approvalStatus...})
+    HulyClient->>HulyClient: TxMixin event<br/>(createdBy: hulyPersonUuid)
+    HulyClient->>TxSubscriber: notify handler
+    
+    TxSubscriber->>Layer1: Check tx.createdBy ==<br/>serviceAccountPersonUuid?
+    
+    alt Layer 1: PersonId Match
+        Layer1->>Layer1: Drop + metric<br/>tx.filter.person_match
+    else Not service account
+        TxSubscriber->>SyncEngine: enqueueLocalEvent
+        SyncEngine->>Adapter: approveMR (composite)
+        Adapter->>Layer2: Stamp _originated='gitlab'<br/>on updateMixin attributes
+        Adapter->>GitLab: PATCH approval
+        GitLab-->>Adapter: 200
+    end
+```
+
+**Rationale:** Service-account PersonId detection is the primary filter (Path D). If TxSubscriber initialization fails to resolve service-account identity, or if a non-self event somehow passes, the `_originated: 'gitlab'` marker on applyRemote serves as fallback. Operator monitors `tx.subscription.echo.dropped` metric; sustained zero confirms Layer 1 filter working. Threshold of 5+ dropped events/minute indicates echo storm.
+
+### Mixin Split + Migration Flow (`gitlab-mr` → `gitlab-mr-core` + `gitlab-mr-review`)
+
+```mermaid
+sequenceDiagram
+    participant Admin as Operator
+    participant Migration as POST /api/v1/bindings/:id<br/>/migrate-mixin-split
+    participant Loader as BindingLoader
+    participant Store as MongoDB
+    participant Huly as HulyClient
+    
+    Admin->>Admin: Pause binding via PATCH
+    Admin->>Migration: POST /migrate-mixin-split
+    Migration->>Store: Query Phase 4 MR Issues<br/>(carrying gitlab-mr)
+    
+    loop For each MR Issue
+        Migration->>Loader: loadBinding + client
+        Migration->>Store: Read mixin fields
+        Migration->>Huly: removeMixin gitlab-mr
+        Migration->>Huly: createMixin gitlab-mr-core<br/>(7 fields: source/target/draft/merged/status/url/pipeline)
+        Migration->>Huly: createMixin gitlab-mr-review<br/>(9 fields: reviewers/approvals/rules/iteration/epic)
+    end
+    
+    Migration->>Store: Record cursor
+    Migration-->>Admin: 200<br/>{ migratedAt,<br/>mrsScanned,<br/>splitsPerformed }
+    
+    Admin->>Admin: Unpause binding via PATCH
+```
+
+**Field partition:**
+- `gitlab-mr-core` (Phase 2–5 MR metadata): `sourceBranch`, `targetBranch`, `draft`, `mergedAt`, `mergeStatus`, `webUrl`, `pipelineStatus`
+- `gitlab-mr-review` (Phase 3–5 review/approval): `reviewers`, `approvedBy`, `approvalsRequired`, `approvalStatus`, `diffWebUrl`, `changedFiles`, `approvalRules`, `iteration`, `parentEpicIid`
+
+Phase 4 bindings continue to work with monolithic `gitlab-mr` until migration is run; Phase 5 bindings ship with split mixins.
+
+### GraphQL Capability + REST Fallback Decision
+
+```mermaid
+flowchart TD
+    Start["Composite query needed<br/>(getMR + approvals + rules + iteration)"]
+    
+    Start -->|Capability cache miss| Detect["GraphQL capability detection:<br/>POST /graphql with introspection"]
+    
+    Detect -->|Success| Cache["Cache result<br/>1 hour TTL"]
+    Detect -->|Fail| SetFalse["Set capability=false<br/>retry in 1h"]
+    
+    Cache --> Decision{"GraphQL capability<br/>available?"}
+    
+    Decision -->|Yes| GraphQL["Use GraphQL composite<br/>getMR + approvals +<br/>rules + iteration<br/>single round-trip<br/>40-60% quota savings"]
+    
+    Decision -->|No| REST["Fallback to REST<br/>sequential requests:<br/>getMR + getApprovals +<br/>getRules + getIteration<br/>per-binding quota budget"]
+    
+    GraphQL --> Return["Return composite fields"]
+    REST --> Return
+    Return --> Done["Done"]
+    
+    Note["Edge case: Partial<br/>failure (e.g., rules 404<br/>on CE) → partial<br/>SyncMergeRequest<br/>with metric increment"]
+```
+
+**Strategy:**
+- EE instances with GraphQL support: preferred path (single round-trip, 40–60% quota savings on composite getMR)
+- CE instances or network error: silent fallback to REST
+- Capability cached per GitLab instance; re-checked if cache expires or instance reports version change
+
+---
+
 ## Phase 3 Planning Notes
 
 - **Cursor split:** Split `'notes'` into `'issue_notes'` + `'mr_notes'` if backfill metrics show contention.

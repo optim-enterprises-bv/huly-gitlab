@@ -51,15 +51,10 @@ export interface SyncChangedFile {
   status: 'added' | 'modified' | 'deleted' | 'renamed'
 }
 
-export interface SyncReviewPosition {
-  filePath: string
-  oldLine: number | null
-  newLine: number | null
-  baseSha: string
-  headSha: string
-  startSha: string
-  positionType: 'text'
-}
+export type SyncReviewPosition =
+  | { positionType: 'text', filePath: string, oldLine: number | null, newLine: number | null, baseSha: string, headSha: string, startSha: string }
+  | { positionType: 'image', filePath: string, x: number, y: number, width: number, height: number, baseSha: string, headSha: string }
+  | { positionType: 'file', filePath: string, baseSha: string, headSha: string }
 
 export interface SyncReviewNote {
   id: number

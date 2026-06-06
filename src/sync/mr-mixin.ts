@@ -1,6 +1,8 @@
-import type { Mixin, PersonUuid, Ref } from '@hcengineering/core'
+import type { Doc, Mixin, PersonUuid, Ref } from '@hcengineering/core'
 import type { Issue } from '@hcengineering/tracker'
 import type { ApprovalStatus, MergeStatus, SyncChangedFile, SyncIteration, SyncMRApprovalRule } from '../adapter/types'
+import { MR_CORE_MIXIN } from './mr-core-mixin'
+import { MR_REVIEW_MIXIN_DOC } from './mr-review-mixin-doc'
 
 /**
  * Shape of the runtime `gitlab-mr` mixin written onto a tracker.Issue
@@ -67,3 +69,26 @@ export interface MRMixinDoc extends Issue {
 
 /** Runtime mixin id used to carry GitLab MR fields on a tracker.Issue. */
 export const MR_MIXIN = 'gitlab-mr' as unknown as Ref<Mixin<MRMixinDoc>>
+
+/**
+ * Read MR mixin attributes from EITHER legacy `gitlab-mr` mixin OR the new split
+ * (`gitlab-mr-core` + `gitlab-mr-review`). During mixin-split migration window, BOTH
+ * may be present on the same Issue. Prefer NEW (core+review); fall back to LEGACY.
+ *
+ * Returns a unified attribute view that callers can use as if reading from the
+ * legacy `MRMixinDoc` shape.
+ */
+export function readMRMixinAttributes (issue: Doc | null | undefined): Partial<MRMixinDoc> {
+  if (issue === null || issue === undefined) return {}
+  const obj = issue as unknown as Record<string, Record<string, unknown> | undefined>
+
+  const core = obj[MR_CORE_MIXIN as unknown as string]
+  const review = obj[MR_REVIEW_MIXIN_DOC as unknown as string]
+  if (core !== undefined || review !== undefined) {
+    const merged: Partial<MRMixinDoc> = { ...(core ?? {}), ...(review ?? {}) }
+    return merged
+  }
+
+  const legacy: Partial<MRMixinDoc> = (obj[MR_MIXIN as unknown as string] ?? {}) as Partial<MRMixinDoc>
+  return legacy
+}

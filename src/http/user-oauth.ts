@@ -20,7 +20,7 @@
  * bearer-protected, to avoid any code path that could be tempted to read a bearer from the URL.
  */
 
-import { createHmac, randomBytes, createHash } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import { Router as createRouter } from 'express'
 import type { Request, Response, Router } from 'express'
 import { ObjectId } from 'mongodb'
@@ -38,6 +38,8 @@ import { validateGitLabBaseUrl } from '../util/url-validation'
 import { requireHulyCookie } from './cookie-auth'
 import type { HulyUserAuthRequest } from './cookie-auth'
 import { rateLimit } from './rate-limit'
+import { signHmac, verifyHmac } from '../util/secret-rotation'
+import type { SecretConfig } from '../util/secret-rotation'
 
 /**
  * Per-user OAuth state document. Wider than the Phase 1 admin OAuthStateDoc — it carries
@@ -48,6 +50,7 @@ interface UserOAuthStateDoc {
   _id: ObjectId
   kind: 'user'
   state: string
+  statePayload: string
   nonce: string
   codeVerifier: string
   workspaceUuid: string
@@ -61,12 +64,11 @@ export interface UserOAuthRouterDeps {
   config: Config
   store: Store
   logger: Logger
+  secrets?: SecretConfig
 }
 
-function signState (secret: string, workspaceUuid: string, hulyPersonUuid: string, nonce: string, epoch: number): string {
-  return createHmac('sha256', secret)
-    .update(`user|${workspaceUuid}|${hulyPersonUuid}|${nonce}|${epoch}`)
-    .digest('hex')
+function buildStatePayload (workspaceUuid: string, hulyPersonUuid: string, nonce: string, epoch: number): string {
+  return `user|${workspaceUuid}|${hulyPersonUuid}|${nonce}|${epoch}`
 }
 
 /**
@@ -95,9 +97,10 @@ function isSafeReturnTo (raw: string | undefined, publicBaseUrl: string): string
 
 export function createUserOAuthRouter (deps: UserOAuthRouterDeps): Router {
   const { config, store, logger } = deps
+  const secrets: SecretConfig = deps.secrets ?? { primary: config.ServerSecret, previous: config.ServerSecretPrevious }
   const router = createRouter()
 
-  const cookieAuth = requireHulyCookie(config.ServerSecret)
+  const cookieAuth = requireHulyCookie(secrets)
   const startRateLimit = rateLimit({ capacity: 10, refillPerSecond: 10 / 60 })
 
   // GET /start?gitlabBaseUrl=...&returnTo=...
@@ -129,7 +132,8 @@ export function createUserOAuthRouter (deps: UserOAuthRouterDeps): Router {
     const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url')
 
     const epoch = Date.now()
-    const state = signState(config.ServerSecret, identity.workspaceUuid, identity.hulyPersonUuid, nonce, epoch)
+    const statePayload = buildStatePayload(identity.workspaceUuid, identity.hulyPersonUuid, nonce, epoch)
+    const state = signHmac(statePayload, secrets)
     const expiresAt = new Date(epoch + 10 * 60 * 1000)
 
     const userOAuthStates = store.oauthStates() as unknown as Collection<UserOAuthStateDoc>
@@ -137,6 +141,7 @@ export function createUserOAuthRouter (deps: UserOAuthRouterDeps): Router {
       _id: new ObjectId(),
       kind: 'user',
       state,
+      statePayload,
       nonce,
       codeVerifier,
       workspaceUuid: identity.workspaceUuid,
@@ -187,10 +192,20 @@ export function createUserOAuthRouter (deps: UserOAuthRouterDeps): Router {
     const userOAuthStates = store.oauthStates() as unknown as Collection<UserOAuthStateDoc>
     const filter: Partial<UserOAuthStateDoc> = { state, kind: 'user' }
     const stateDoc = await userOAuthStates.findOne(filter)
+    // Sec M-1: unknown state row → 404 (matches admin oauth pattern) so callers
+    // can't distinguish "never existed" from "wrong HMAC".
     if (stateDoc === null) {
-      res.status(401).json({ error: 'invalid_state', message: 'Unknown or already-used state' })
+      res.status(404).json({ error: 'not_found', message: 'Unknown or already-used state' })
       return
     }
+
+    // Dual-verify HMAC against primary OR previous secret (grace-period rotation).
+    if (verifyHmac(stateDoc.statePayload, state, secrets) === null) {
+      await userOAuthStates.deleteOne({ _id: stateDoc._id })
+      res.status(401).json({ error: 'invalid_state', message: 'State HMAC verification failed' })
+      return
+    }
+
     if (stateDoc.expiresAt.getTime() < Date.now()) {
       await userOAuthStates.deleteOne({ _id: stateDoc._id })
       res.status(410).json({ error: 'expired', message: 'OAuth state has expired' })

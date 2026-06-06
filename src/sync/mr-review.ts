@@ -10,11 +10,12 @@ import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
 import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import type { SyncUser as IdentitySyncUser, UserIdentity } from '../huly/users'
-import { MR_REVIEW_MIXIN, type MRReviewMixinDoc } from './mr-review-mixin'
+import { MR_REVIEW_THREAD_MIXIN, type MRReviewThreadMixinDoc } from './mr-review-thread-mixin'
 import type { BindingRef, SyncContext, SyncManager } from './types'
 import * as metrics from '../metrics'
 import { METRIC_NAMES } from '../metrics'
 import { markAndRetry, REVIEW_RETRY_FLAG } from './deferred-parent'
+import { withOriginatedMarker } from './originated-marker'
 
 const HULY_CLASS_CHAT_MESSAGE = 'chunter.class.ChatMessage'
 
@@ -225,7 +226,7 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
         messageRef = await bctx.hulyClient.createDoc<ChatMessage>(
           chunter.class.ChatMessage,
           bctx.hulyProjectRef,
-          {
+          withOriginatedMarker({
             attachedTo: issueRef,
             attachedToClass: tracker.class.Issue,
             collection: 'comments',
@@ -234,7 +235,7 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
             modifiedOn: noteUpdatedMs,
             createdBy: authorRef as ChatMessage['createdBy'],
             createdOn: noteCreatedMs
-          }
+          })
         )
         await upsertIdMap(
           ctx.store.idmap(),
@@ -259,11 +260,11 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
             chunter.class.ChatMessage,
             bctx.hulyProjectRef,
             messageRef,
-            {
+            withOriginatedMarker({
               message: messageMarkup,
               modifiedOn: noteUpdatedMs,
               modifiedBy: authorRef as ChatMessage['modifiedBy']
-            }
+            })
           )
         }
       }
@@ -274,25 +275,32 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
         threadId: syncThread.discussionId,
         resolved: syncThread.resolved
       }
-      if (resolvedByUuid !== undefined) mixinAttrs.resolvedBy = resolvedByUuid
-      if (resolvedAtMs !== undefined) mixinAttrs.resolvedAt = resolvedAtMs
+      if (syncThread.resolved) {
+        if (resolvedByUuid !== undefined) mixinAttrs.resolvedBy = resolvedByUuid
+        if (resolvedAtMs !== undefined) mixinAttrs.resolvedAt = resolvedAtMs
+      } else {
+        // Stale-on-unresolve: explicitly clear resolver attribution when thread
+        // transitions resolved → false so prior resolver doesn't linger.
+        mixinAttrs.resolvedBy = undefined
+        mixinAttrs.resolvedAt = undefined
+      }
       if (isRoot && note.position !== undefined) mixinAttrs.position = note.position
 
       if (firstApply) {
-        await bctx.hulyClient.createMixin<ChatMessage, MRReviewMixinDoc>(
+        await bctx.hulyClient.createMixin<ChatMessage, MRReviewThreadMixinDoc>(
           messageRef,
           chunter.class.ChatMessage,
           bctx.hulyProjectRef,
-          MR_REVIEW_MIXIN,
-          mixinAttrs as unknown as Omit<MRReviewMixinDoc, keyof ChatMessage>
+          MR_REVIEW_THREAD_MIXIN,
+          withOriginatedMarker(mixinAttrs) as unknown as Omit<MRReviewThreadMixinDoc, keyof ChatMessage>
         )
       } else {
-        await bctx.hulyClient.updateMixin<ChatMessage, MRReviewMixinDoc>(
+        await bctx.hulyClient.updateMixin<ChatMessage, MRReviewThreadMixinDoc>(
           messageRef,
           chunter.class.ChatMessage,
           bctx.hulyProjectRef,
-          MR_REVIEW_MIXIN,
-          mixinAttrs as unknown as Partial<Omit<MRReviewMixinDoc, keyof ChatMessage>>
+          MR_REVIEW_THREAD_MIXIN,
+          withOriginatedMarker(mixinAttrs) as unknown as Partial<Omit<MRReviewThreadMixinDoc, keyof ChatMessage>>
         )
       }
     }
@@ -305,10 +313,6 @@ export class ReviewThreadsSyncManager implements SyncManager<SyncReviewThread> {
    * TxProcessor subscription is wired to call `engine.enqueueLocalEvent`.
    * Currently no such wiring exists in `src/index.ts`. Calls from tests work
    * fine; real Huly UI mutations do NOT trigger this path. Phase 4 work.
-   *
-   * Phase 4 follow-up F2: `resolvedBy`/`resolvedAt` may go stale on unresolve
-   * — review thread mirror only clears `resolved` flag, leaving prior
-   * resolver attribution visible until the next remote pull overwrites it.
    */
   async applyLocal (
     ctx: SyncContext,

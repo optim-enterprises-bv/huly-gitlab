@@ -24,3 +24,11 @@
 - [ ] `mr.ts` mixin split execution (Phase 3 Q5 trigger reached) — with Phase 4 adding `approvalRules`, `iteration`, `parentEpicIid` (3 new fields), the `gitlab-mr` mixin reaches ~17 fields, surpassing the Phase 3 Q5 trigger (≥ 4 more = split). Phase 4 ADR (P4-T-21) defers the split as a post-Phase-4 maintenance ticket: `gitlab-mr-core` + `gitlab-mr-review` + `gitlab-mr-ee`. — Affects long-term maintainability and the JSDoc-only field-ownership invariant.
 - [ ] EE compose stack for E2E — P4-T-20 EE tests auto-skip when `capabilities.edition === 'CE'` is detected. Default: maintainers run the EE test variant against a local EE compose periodically; CI runs CE-only. Track an EE CI runner as a post-Phase-4 nice-to-have. — Affects ongoing EE coverage confidence between manual EE runs.
 - [ ] TxSubscriber polling fallback details (Path C only) — if P4-T-01b chooses Path C, Phase 4 adds a `tx_cursors` MongoDB collection with workspace-scoped rows and a default 5s poll cadence. Cadence and cursor format should be tuned against real workload metrics post-deploy. — Affects load on the Huly transactor under polling cadence and lag of Huly → GitLab applyLocal propagation.
+
+## autopilot-impl-phase5 - 2026-06-06
+- [ ] Service-account PersonId API surface (P5-T-01b) — Path A `findPersonBySocialKey('system:account')` vs Path B `getSystemAccount` vs Path C `findPersonByEmail` vs Path D no-API; gates P5-T-04. If Path D: spec §A is blocked.
+- [ ] Legacy `mr-mixin.ts` deletion timing — Phase 5 retains for read-compat; deletion is a separate post-migration cleanup PR (not Phase 5 scope).
+- [ ] `graphql-request` package version + transitive deps — verify present in package.json before P5-T-21 starts (per Phase 1 spec).
+- [ ] Webhook secret rotation scope (P5-T-07) — does `webhook.ts` use pod-wide `ServerSecret` or per-binding tokens only? If per-binding only, P5-T-07 reduces to documentation.
+- [ ] Huly platform mixin-removal API (P5-T-19 step 7) — verify `updateDoc({$unset: {[MR_MIXIN]: ''}})` actually removes the mixin tx-level. If unavailable: document post-migration cleanup using a Huly admin tool.
+- [ ] `_originated:'gitlab'` marker persistence (R-3) — verify TxMixin `attributes._originated` is tx-transient and does NOT persist on the resulting Doc. If it persists, add to diff exclusion list in `mr-mixin-reader.ts`.

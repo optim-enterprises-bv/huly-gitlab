@@ -23,6 +23,19 @@ import {
   resolveMRRef
 } from '../../src/sync/mr'
 import type { SyncContext } from '../../src/sync/types'
+import { postVisibilityComment, postFailureComment } from '../../src/sync/mr-approvals'
+import { ORIGINATED_MARKER_KEY, ORIGINATED_MARKER_VALUE } from '../../src/sync/originated-marker'
+import { MR_CORE_MIXIN } from '../../src/sync/mr-core-mixin'
+import { MR_REVIEW_MIXIN_DOC } from '../../src/sync/mr-review-mixin-doc'
+import { readMRMixinAttributes } from '../../src/sync/mr-mixin'
+import { TxSubscriber, type TxSubscriberDeps } from '../../src/sync/tx-subscription'
+import type { Client, PersonId, Tx } from '@hcengineering/core'
+import type { SyncEngine } from '../../src/sync/engine'
+import {
+  get as getMetric,
+  reset as resetMetric,
+  METRIC_NAMES as METRIC_NAMES_GLOBAL
+} from '../../src/metrics'
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -108,6 +121,11 @@ interface MixinCall {
   attributes: Record<string, unknown>
 }
 
+interface CreateDocCall {
+  cls: unknown
+  attrs: Record<string, unknown>
+}
+
 interface FakeHulyClient extends TxOperations {
   issues: Map<Ref<Issue>, Issue>
   mixinByIssue: Map<string, Record<string, unknown>>
@@ -115,6 +133,7 @@ interface FakeHulyClient extends TxOperations {
   updates: number
   createMixinCalls: MixinCall[]
   updateMixinCalls: MixinCall[]
+  createDocCalls: CreateDocCall[]
   lastUpdate: Partial<Issue> | null
   getMixin: (issueRef: string) => Record<string, unknown> | undefined
 }
@@ -126,6 +145,7 @@ function makeHulyClient (): FakeHulyClient {
   let updates = 0
   const createMixinCalls: MixinCall[] = []
   const updateMixinCalls: MixinCall[] = []
+  const createDocCalls: CreateDocCall[] = []
   let lastUpdate: Partial<Issue> | null = null
   let counter = 0
 
@@ -137,6 +157,7 @@ function makeHulyClient (): FakeHulyClient {
     mixinByIssue,
     createMixinCalls,
     updateMixinCalls,
+    createDocCalls,
     get creates (): number { return creates },
     get updates (): number { return updates },
     get lastUpdate (): Partial<Issue> | null { return lastUpdate },
@@ -159,6 +180,7 @@ function makeHulyClient (): FakeHulyClient {
     findAll: async () => [],
     createDoc: async (cls: unknown, _space: unknown, attrs: Partial<Issue>): Promise<Ref<Issue>> => {
       counter++
+      createDocCalls.push({ cls, attrs: attrs as Record<string, unknown> })
       if (!isIssueClass(cls)) {
         return `aux-ref-${counter}` as unknown as Ref<Issue>
       }
@@ -451,14 +473,15 @@ test('1. create remote→local: applyRemote creates Issue + mixin with expected 
   await h.manager.applyRemote(h.ctx, 'binding-1', mr)
 
   expect(h.huly.creates).toBe(1)
-  expect(h.huly.createMixinCalls).toHaveLength(1)
+  // P5-T-17: split mixin writes — core + review (reviewers: [] is defined → review fires).
+  expect(h.huly.createMixinCalls).toHaveLength(2)
 
   const issueRef = Array.from(h.huly.issues.keys())[0]
   const issue = h.huly.issues.get(issueRef)
   expect(issue?.title).toBe('Hello MR')
   expect(String(issue?.status)).toBe('todo') // 'opened' → first Active-category match (todo)
 
-  // C8: mixin round-trip — readback via fake.
+  // C8: mixin round-trip — readback via fake (fake merges all mixins by issue key).
   const mixin = h.huly.getMixin(issueRef as unknown as string) ?? {}
   expect(mixin.sourceBranch).toBe('feat/a')
   expect(mixin.targetBranch).toBe('main')
@@ -467,8 +490,9 @@ test('1. create remote→local: applyRemote creates Issue + mixin with expected 
   expect(mixin.mergeStatus).toBe('can_be_merged')
   expect(mixin.mergedAt).toBeNull()
 
-  // Mixin call referenced 'gitlab-mr' as the mixin id.
-  expect(String(h.huly.createMixinCalls[0].mixin)).toBe('gitlab-mr')
+  // P5-T-17: first call is core mixin; review follows when review-side data is defined.
+  expect(String(h.huly.createMixinCalls[0].mixin)).toBe('gitlab-mr-core')
+  expect(String(h.huly.createMixinCalls[1].mixin)).toBe('gitlab-mr-review')
 
   // idmap upserted with the merge_request kind.
   expect(h.idmap.docs).toHaveLength(1)
@@ -879,8 +903,9 @@ test('P3-7. applyLocal add to approvedBy → calls approveMR; no stored token �
   expect(h.gitlab.approveMR).toHaveBeenCalledWith(42, 70, undefined)
   expect(getApprovalServiceAccountFallbackCount()).toBe(1)
   // Visibility comment posted: one createDoc call on ChatMessage class (counter on aux-ref-*).
-  // We just assert createMixin was still 1 (issue creation only — no extra mixins).
-  expect(h.huly.createMixinCalls.length).toBe(1)
+  // P5-T-17: createMixin still fires exactly once on initial create — split across
+  // core + review (reviewers: [] is defined → review write), so 2 calls.
+  expect(h.huly.createMixinCalls.length).toBe(2)
 })
 
 test('P3-8. applyLocal add with stored OAuth token → calls approveMR with actorToken', async () => {
@@ -1336,4 +1361,285 @@ test('P4-10. CE approvalStatus derivation matches Phase 3 (Bug-4 explicit regres
   expect(mixin.approvedBy).toEqual(['person-a1'])
   expect(mixin.approvalsRequired).toBe(1)
   expect(mixin.approvalStatus).toBe('approved')
+})
+
+// ---------------------------------------------------------------------------
+// Phase 5 (P5-T-09) — _originated marker on all applyRemote write paths
+// ---------------------------------------------------------------------------
+
+test('P5-1. applyRemote create → createDoc attrs and createMixin attrs carry _originated: "gitlab"', async () => {
+  const h = buildHarness()
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 700, title: 'P5 create test' }))
+
+  // createDocCalls captures the raw attrs object passed to createDoc.
+  const issueCreateCall = h.huly.createDocCalls.find((c) => String(c.cls).includes('Issue'))
+  expect(issueCreateCall).toBeDefined()
+  expect(issueCreateCall?.attrs._originated).toBe('gitlab')
+
+  // createMixin call attributes must carry the marker.
+  // P5-T-17: split mixin writes — core (always) + review (reviewers: [] is defined).
+  expect(h.huly.createMixinCalls).toHaveLength(2)
+  expect(h.huly.createMixinCalls[0].attributes._originated).toBe('gitlab')
+  expect(h.huly.createMixinCalls[1].attributes._originated).toBe('gitlab')
+})
+
+test('P5-2. applyRemote update → updateMixin attrs carry _originated: "gitlab"', async () => {
+  const h = buildHarness()
+  // Seed via create.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({ iid: 701 }))
+
+  // Trigger update with a newer timestamp.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 701,
+    title: 'P5 updated title',
+    updatedAt: new Date('2025-01-01T10:00:00.000Z')
+  }))
+
+  // The last updateMixin call must carry the marker.
+  const lastUpdate = h.huly.updateMixinCalls[h.huly.updateMixinCalls.length - 1]
+  expect(lastUpdate).toBeDefined()
+  expect(lastUpdate.attributes._originated).toBe('gitlab')
+})
+
+// ---------------------------------------------------------------------------
+// P5-T-10 — originated marker on approval comment write paths
+// ---------------------------------------------------------------------------
+
+test('P5-T-10-1. postVisibilityComment createDoc attrs contain originated marker', async () => {
+  const h = buildHarness()
+  const issueRef = 'issue-vis-1' as unknown as Ref<Issue>
+  await postVisibilityComment(h.ctx.logger, h.bctx, issueRef, 'approve')
+  const commentCalls = h.huly.createDocCalls.filter(
+    (c) => !String(c.cls).includes('Issue')
+  )
+  expect(commentCalls).toHaveLength(1)
+  expect(commentCalls[0].attrs[ORIGINATED_MARKER_KEY]).toBe(ORIGINATED_MARKER_VALUE)
+})
+
+test('P5-T-10-2. postFailureComment createDoc attrs contain originated marker', async () => {
+  const h = buildHarness()
+  const issueRef = 'issue-fail-1' as unknown as Ref<Issue>
+  await postFailureComment(h.bctx, issueRef, 'approve')
+  const commentCalls = h.huly.createDocCalls.filter(
+    (c) => !String(c.cls).includes('Issue')
+  )
+  expect(commentCalls).toHaveLength(1)
+  expect(commentCalls[0].attrs[ORIGINATED_MARKER_KEY]).toBe(ORIGINATED_MARKER_VALUE)
+})
+
+// ---------------------------------------------------------------------------
+// P5-T-17 — split MR_MIXIN writes into MR_CORE_MIXIN + MR_REVIEW_MIXIN_DOC.
+// Legacy MR_MIXIN is no longer written on new applyRemote paths; the P5-T-19
+// migration helper covers existing legacy data.
+// ---------------------------------------------------------------------------
+
+test('P5-T-17-1. applyRemote create → core + review mixin writes, each with correct attrs', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:1701', 'person-r1701' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 1701,
+    sourceBranch: 'feat/split',
+    targetBranch: 'main',
+    webUrl: 'https://gitlab.example/mr/1701',
+    reviewers: [makeUser(1701)]
+  }))
+
+  expect(h.huly.createMixinCalls).toHaveLength(2)
+  const coreCall = h.huly.createMixinCalls.find(
+    (c) => String(c.mixin) === String(MR_CORE_MIXIN)
+  )
+  const reviewCall = h.huly.createMixinCalls.find(
+    (c) => String(c.mixin) === String(MR_REVIEW_MIXIN_DOC)
+  )
+  expect(coreCall).toBeDefined()
+  expect(reviewCall).toBeDefined()
+
+  // Core mixin carries the core fields.
+  expect(coreCall?.attributes.sourceBranch).toBe('feat/split')
+  expect(coreCall?.attributes.targetBranch).toBe('main')
+  expect(coreCall?.attributes.draft).toBe(false)
+  expect(coreCall?.attributes.webUrl).toBe('https://gitlab.example/mr/1701')
+  expect(coreCall?.attributes.gitlabIid).toBe(1701)
+  expect(coreCall?.attributes.gitlabProjectId).toBe(42)
+  // Core mixin MUST NOT carry review-side keys.
+  expect(Object.keys(coreCall?.attributes ?? {})).not.toContain('reviewers')
+  expect(Object.keys(coreCall?.attributes ?? {})).not.toContain('approvedBy')
+
+  // Review mixin carries the reviewer mapping.
+  expect(reviewCall?.attributes.reviewers).toEqual(['person-r1701'])
+  // Review mixin MUST NOT carry core-side keys.
+  expect(Object.keys(reviewCall?.attributes ?? {})).not.toContain('sourceBranch')
+  expect(Object.keys(reviewCall?.attributes ?? {})).not.toContain('gitlabIid')
+
+  // Legacy MR_MIXIN MUST NOT be written.
+  expect(h.huly.createMixinCalls.some((c) => String(c.mixin) === 'gitlab-mr')).toBe(false)
+})
+
+test('P5-T-17-2. applyRemote create with no review fields → core only, NO review createMixin call', async () => {
+  const h = buildHarness()
+  // Strip review-side fields entirely from the SyncMR.
+  const mrNoReview = makeSyncMR({ iid: 1702 }) as unknown as Record<string, unknown>
+  delete mrNoReview.reviewers
+  delete mrNoReview.approvedBy
+  delete mrNoReview.approvalsRequired
+  delete mrNoReview.approvalRules
+  delete mrNoReview.iteration
+  delete mrNoReview.diffWebUrl
+  delete mrNoReview.changedFiles
+  await h.manager.applyRemote(h.ctx, 'binding-1', mrNoReview as unknown as SyncMergeRequest)
+
+  // Exactly one mixin write — the core one.
+  expect(h.huly.createMixinCalls).toHaveLength(1)
+  expect(String(h.huly.createMixinCalls[0].mixin)).toBe(String(MR_CORE_MIXIN))
+  // Legacy MR_MIXIN MUST NOT be written.
+  expect(h.huly.createMixinCalls.some((c) => String(c.mixin) === 'gitlab-mr')).toBe(false)
+})
+
+test('P5-T-17-3. applyRemote update → updateMixin called for both core and review', async () => {
+  const known = new Map<string, PersonUuid>([
+    ['gitlab:1703', 'person-r1703' as unknown as PersonUuid]
+  ])
+  const h = buildHarness({ knownUsers: known })
+  // Seed.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 1703,
+    reviewers: [makeUser(1703)]
+  }))
+  // Now an update event with newer timestamp.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 1703,
+    title: 'P5-T-17-3 updated',
+    draft: true,
+    reviewers: [makeUser(1703)],
+    updatedAt: new Date('2025-02-01T10:00:00.000Z')
+  }))
+
+  // Two update mixin writes — one core, one review.
+  const updateCore = h.huly.updateMixinCalls.filter(
+    (c) => String(c.mixin) === String(MR_CORE_MIXIN)
+  )
+  const updateReview = h.huly.updateMixinCalls.filter(
+    (c) => String(c.mixin) === String(MR_REVIEW_MIXIN_DOC)
+  )
+  expect(updateCore.length).toBeGreaterThanOrEqual(1)
+  expect(updateReview.length).toBeGreaterThanOrEqual(1)
+  // Legacy MR_MIXIN MUST NOT appear in any update call.
+  expect(h.huly.updateMixinCalls.some((c) => String(c.mixin) === 'gitlab-mr')).toBe(false)
+
+  // Core update carries the draft flip.
+  const lastCore = updateCore[updateCore.length - 1]
+  expect(lastCore.attributes.draft).toBe(true)
+  // Review update carries the reviewer set.
+  const lastReview = updateReview[updateReview.length - 1]
+  expect(lastReview.attributes.reviewers).toEqual(['person-r1703'])
+})
+
+test('P5-T-17-4. readMRMixinAttributes reads new core+review split correctly (regression)', async () => {
+  // The fake huly client merges all mixin attributes by issue key, so we
+  // simulate the platform shape directly: assign `gitlab-mr-core` + `gitlab-mr-review`
+  // as keys on the Doc and confirm the reader composes a unified view.
+  const issueDoc = {
+    _id: 'issue-readback' as unknown as Ref<Issue>,
+    title: 'readback',
+    [MR_CORE_MIXIN as unknown as string]: {
+      sourceBranch: 'src',
+      targetBranch: 'main',
+      draft: false,
+      mergedAt: null,
+      mergeStatus: 'can_be_merged',
+      webUrl: 'https://x',
+      gitlabIid: 99,
+      gitlabProjectId: 42
+    },
+    [MR_REVIEW_MIXIN_DOC as unknown as string]: {
+      reviewers: ['person-x'],
+      approvedBy: ['person-y'],
+      approvalsRequired: 1,
+      approvalStatus: 'approved'
+    }
+  } as unknown as Issue
+  const merged = readMRMixinAttributes(issueDoc)
+  expect(merged.sourceBranch).toBe('src')
+  expect(merged.targetBranch).toBe('main')
+  expect(merged.gitlabIid).toBe(99)
+  expect(merged.gitlabProjectId).toBe(42)
+  expect(merged.reviewers).toEqual(['person-x'])
+  expect(merged.approvedBy).toEqual(['person-y'])
+  expect(merged.approvalStatus).toBe('approved')
+})
+
+test('P5-T-17-5. critic #6: both mixin txes carry _originated marker → TxSubscriber drops 2', async () => {
+  // Step 1: drive applyRemote and capture the two mixin createMixin calls.
+  const h = buildHarness()
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeSyncMR({
+    iid: 1705,
+    reviewers: [makeUser(1705)]
+  }))
+  expect(h.huly.createMixinCalls).toHaveLength(2)
+  for (const call of h.huly.createMixinCalls) {
+    expect(call.attributes._originated).toBe('gitlab')
+  }
+
+  // Step 2: round-trip those attribute payloads as TxMixin events through a
+  // fresh TxSubscriber. Both MUST be dropped by layer 2 (originated marker).
+  resetMetric(METRIC_NAMES_GLOBAL.TX_SUBSCRIPTION_ECHO_DROPPED)
+
+  const enqueueCalls: Array<{ binding: string, kind: string, doc: string, change: Record<string, unknown> }> = []
+  const fakeClient = {
+    notify: undefined,
+    findOne: async () => undefined,
+    findAll: async () => [] as never,
+    close: async () => {}
+  } as unknown as Client
+  const fakeEngine = {
+    enqueueLocalEvent: (binding: string, kind: string, doc: string, change: Record<string, unknown>) => {
+      enqueueCalls.push({ binding, kind, doc, change })
+    }
+  } as unknown as SyncEngine
+  const subDeps: TxSubscriberDeps = {
+    client: fakeClient,
+    syncEngine: fakeEngine,
+    workspaceUuid: WORKSPACE,
+    serviceAccountPersonId: 'svc' as unknown as PersonId,
+    bindingsByProject: new Map<string, string>([['42', 'binding-1']]),
+    logger: makeLogger()
+  }
+  const sub = new TxSubscriber(subDeps)
+  sub.start()
+  sub.markEngineStarted()
+
+  const coreCall = h.huly.createMixinCalls[0]
+  const reviewCall = h.huly.createMixinCalls[1]
+
+  // Synthesise a TxMixin for each — these mirror what the platform would
+  // generate from the createMixin call (modifiedBy is a non-service-account
+  // PersonId to ensure layer 1 does NOT short-circuit; only layer 2 fires).
+  const coreTx = {
+    _id: 'tx-core',
+    _class: 'core:class:TxMixin',
+    objectId: coreCall.objectId,
+    objectClass: 'tracker:class:Issue',
+    mixin: String(coreCall.mixin),
+    attributes: coreCall.attributes,
+    modifiedBy: 'user-not-svc' as unknown as PersonId
+  } as unknown as Tx
+  const reviewTx = {
+    _id: 'tx-review',
+    _class: 'core:class:TxMixin',
+    objectId: reviewCall.objectId,
+    objectClass: 'tracker:class:Issue',
+    mixin: String(reviewCall.mixin),
+    attributes: reviewCall.attributes,
+    modifiedBy: 'user-not-svc' as unknown as PersonId
+  } as unknown as Tx
+
+  fakeClient.notify?.(coreTx)
+  fakeClient.notify?.(reviewTx)
+
+  // Both dropped — engine receives nothing.
+  expect(enqueueCalls).toHaveLength(0)
+  // Drop counter increments exactly twice.
+  expect(getMetric(METRIC_NAMES_GLOBAL.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(2)
 })

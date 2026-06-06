@@ -9,8 +9,11 @@ import { putCredential, deleteCredential, rotateCredential } from '../state/cred
 import { requireBearer } from './auth-middleware'
 import { parseObjectId } from '../util/object-id'
 import { asyncHandler } from './async-handler'
+import { rateLimit } from './rate-limit'
 import { migrateReviewerLabels, type ReviewerMigrationResult } from '../sync/reviewer-migration'
+import { migrateMixinSplit, type MixinSplitMigrationResult } from '../sync/mixin-migration'
 import type { BindingLoader } from '../sync/binding-loader'
+import { invalidateGraphQLCapability, getGraphQLCapabilityCacheSize } from '../adapter/gitlab-graphql-client'
 
 interface CreateBindingBody {
   workspaceUuid: string
@@ -40,6 +43,7 @@ export function createBindingRouter (
 ): Router {
   const router = createRouter()
   const auth = requireBearer(serverSecret)
+  const adminRateLimit = rateLimit({ capacity: 10, refillPerSecond: 10 / 60 })
 
   // POST /api/v1/bindings
   router.post('/api/v1/bindings', auth, asyncHandler(async (req: Request, res: Response) => {
@@ -326,6 +330,67 @@ export function createBindingRouter (
 
     logger.info('binding: reviewer label migration complete', { id, ...result })
     res.status(200).json(result)
+  }))
+
+  // POST /api/v1/bindings/:id/migrate-mixin-split — Phase 5 P5-T-19 mixin-split migration (Q3)
+  router.post('/api/v1/bindings/:id/migrate-mixin-split', auth, adminRateLimit, asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params
+
+    if (parseObjectId(id) === null) {
+      res.status(400).json({ error: 'invalid id format' })
+      return
+    }
+
+    const binding = await getBinding(store.bindings(), id)
+    if (binding === null) {
+      res.status(404).json({ error: 'Not found' })
+      return
+    }
+
+    if (!binding.disabled) {
+      res.status(409).json({
+        error: 'binding active',
+        message: 'Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running mixin-split migration; re-enable after.'
+      })
+      return
+    }
+
+    if (bindingLoader === undefined) {
+      logger.error('binding: migrate-mixin-split called without bindingLoader wired', { id })
+      res.status(500).json({ error: 'Internal server error' })
+      return
+    }
+
+    const bctx = await bindingLoader.loadForMergeRequests(id)
+    const result: MixinSplitMigrationResult = await migrateMixinSplit(
+      {
+        store,
+        hulyClient: bctx.hulyClient,
+        logger
+      },
+      binding
+    )
+
+    logger.info('binding: mixin-split migration complete', { id, ...result })
+    res.status(200).json(result)
+  }))
+
+  // POST /api/v1/admin/invalidate-graphql-cache — Phase 5 P5-T-21 critic B5
+  // Manual operator hook to bust the per-baseUrl GraphQL capability cache.
+  // Optional body `{baseUrl}` invalidates one entry; omitted body invalidates all.
+  router.post('/api/v1/admin/invalidate-graphql-cache', auth, adminRateLimit, asyncHandler(async (req: Request, res: Response) => {
+    const body = (req.body ?? {}) as { baseUrl?: unknown }
+    let invalidated: string
+    if (typeof body.baseUrl === 'string' && body.baseUrl.length > 0) {
+      invalidateGraphQLCapability(body.baseUrl)
+      invalidated = body.baseUrl
+    } else {
+      invalidateGraphQLCapability()
+      invalidated = 'all'
+    }
+    const cacheSize = getGraphQLCapabilityCacheSize()
+    logger.info('binding: invalidated graphql capability cache', { invalidated, cacheSize })
+    res.status(200).json({ invalidated, cacheSize })
   }))
 
   return router

@@ -256,6 +256,66 @@ curl -X PATCH http://localhost:3600/api/v1/bindings/binding-id-123 \
 
 ---
 
+### POST /api/v1/bindings/:id/migrate-mixin-split
+
+Migrate Phase 4 monolithic `gitlab-mr` mixin to Phase 5 split `gitlab-mr-core` + `gitlab-mr-review` mixins. **Requires the binding to be paused (`disabled: true`) before execution.** This is a one-shot operation per binding; running on an already-migrated binding is safe (idempotent).
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/migrate-mixin-split \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Path Parameters:**
+- `id` (string, required) — Binding ID (24-character hex ObjectId)
+
+**Request Body:**
+- Empty (POST with no body)
+
+**Response (success):**
+```json
+{
+  "migratedAt": "2026-06-06T10:00:00Z",
+  "mrsScanned": 156,
+  "splitsPerformed": 156,
+  "coreFieldsMoved": 1092,
+  "reviewFieldsMoved": 1404
+}
+```
+
+**Response fields:**
+- `migratedAt` (ISO 8601 string) — Timestamp of the migration
+- `mrsScanned` (integer) — Number of mirrored MR Issues examined
+- `splitsPerformed` (integer) — Number of MR documents split into two mixins
+- `coreFieldsMoved` (integer) — Total Phase 2–5 core fields migrated
+- `reviewFieldsMoved` (integer) — Total Phase 3–5 review fields migrated
+
+**Response (conflict):**
+```json
+{
+  "error": "binding_active",
+  "message": "Pause binding (PATCH /api/v1/bindings/:id with {disabled: true}) before running migration; re-enable after.",
+  "timestamp": "2026-06-06T10:00:00Z"
+}
+```
+
+**Status Codes:**
+- `200` — Migration completed successfully
+- `400` — Invalid binding ID format (not a 24-hex ObjectId)
+- `401` — Invalid or missing `Authorization` header
+- `404` — Binding not found
+- `409` — Binding is active (`disabled !== true`); pause before retrying
+
+**Notes:**
+- **Idempotent and safe:** Re-running migration on an already-migrated binding is safe. Attempting to split an already-split mixin returns 200 with `splitsPerformed: 0`.
+- **Phase 4 → Phase 5 migration:** All existing Phase 4 bindings carrying monolithic `gitlab-mr` mixin are migrated by this endpoint. Phase 5 bindings ship with split mixins by default.
+- **Operator workflow:** See [Phase 5 Migration Runbook](../docs/phase5-runbook.md) for the recommended sequence:
+  1. Pause: `PATCH /api/v1/bindings/:id {disabled: true}`
+  2. Migrate: `POST /api/v1/bindings/:id/migrate-mixin-split`
+  3. Resume: `PATCH /api/v1/bindings/:id {disabled: false}`
+
+---
+
 ### POST /api/v1/bindings/:id/migrate-reviewer-labels
 
 Migrate Phase 2 synthetic reviewer labels to Phase 3 typed `reviewers` field. **Requires the binding to be paused (`disabled: true`) before execution.** This is a one-shot operation per binding; running on an already-migrated binding is safe (idempotent).
@@ -313,6 +373,41 @@ curl -X POST http://localhost:3600/api/v1/bindings/binding-id-123/migrate-review
   1. Pause: `PATCH /api/v1/bindings/:id {disabled: true}`
   2. Migrate: `POST /api/v1/bindings/:id/migrate-reviewer-labels`
   3. Resume: `PATCH /api/v1/bindings/:id {disabled: false}`
+
+---
+
+### POST /api/v1/admin/invalidate-graphql-cache
+
+Invalidate the GraphQL capability cache for all GitLab instances. Used after a GitLab upgrade or when testing GraphQL support without waiting for the 1-hour TTL.
+
+**Request:**
+```bash
+curl -X POST http://localhost:3600/api/v1/admin/invalidate-graphql-cache \
+  -H "Authorization: Bearer ${SERVER_SECRET}"
+```
+
+**Response:**
+```json
+{
+  "invalidatedAt": "2026-06-06T10:05:00Z",
+  "instancesAffected": 3,
+  "message": "GraphQL capability cache cleared for all instances"
+}
+```
+
+**Response fields:**
+- `invalidatedAt` (ISO 8601 string) — Timestamp of the cache invalidation
+- `instancesAffected` (integer) — Number of GitLab instances with cached capabilities cleared
+- `message` (string) — Status message
+
+**Status Codes:**
+- `200` — Cache invalidated successfully
+- `401` — Invalid or missing `Authorization` header
+
+**Notes:**
+- **Effect:** The next composite query (getMR + approvals + rules + iteration) will perform fresh GraphQL capability detection. If GraphQL is available, it will be used; otherwise falls back to REST.
+- **Typical use:** After GitLab upgrade or maintenance window when GraphQL support status may have changed.
+- **No disruption:** Invalidation does not affect in-flight requests; only new capability checks are affected.
 
 ---
 

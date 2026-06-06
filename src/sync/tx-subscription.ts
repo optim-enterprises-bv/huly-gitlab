@@ -9,17 +9,22 @@
  * flat-key contract verified by P3-T-01b (`{ field: value }`).
  *
  * Critic-applied constraints:
- *   - MR-2 (echo storm): drop tx events authored by the pod's service
- *     account (`tx.modifiedBy === serviceAccountPersonId`). MR-2 protection
- *     is single-layer (service-account PersonId filter only). The original
- *     spec called for dual-layer with `_originated:'gitlab'` marker but
- *     stamping every applyRemote write site is invasive and was deferred.
- *     Service-account identity check is sufficient if `serviceAccountPersonId`
- *     is correctly resolved at startup. Operators MUST monitor
- *     `tx.subscription.echo.dropped` for healthy non-zero values during
- *     applyRemote bursts; a flat-zero counter indicates the service-account
- *     PersonId is not the same one platform writes use, and the filter is
- *     silently a no-op (see SH-1 below).
+ *   - MR-2 (echo storm): drop tx events that originated from this pod.
+ *     Phase 5 §C restores dual-layer defense:
+ *       Layer 1: `tx.modifiedBy === serviceAccountPersonId` (service-account
+ *                PersonId filter).
+ *       Layer 2: `_originated: 'gitlab'` marker stamped on the attribute /
+ *                operation payload by every applyRemote write path
+ *                (Wave C: P5-T-08..P5-T-14 cover all 7 managers).
+ *     Either layer alone catches the dispatch; together they are
+ *     defense-in-depth so that one filter being silently a no-op (SH-1,
+ *     mis-resolved service-account PersonId) does not blow up the engine
+ *     with echo events.
+ *     TxRemoveDoc carve-out: removes have no attribute payload to stamp,
+ *     so layer 2 is N/A; the service-account PersonId filter is the SOLE
+ *     defense for echo-storm prevention on TxRemoveDoc.
+ *     Operators MUST monitor `tx.subscription.echo.dropped` for healthy
+ *     non-zero values during applyRemote bursts.
  *   - SH-1 (security hardening): `serviceAccountPersonId` is currently set
  *     to `systemAccountUuid` cast in `src/index.ts`. If real platform writes
  *     use a different `Tx.modifiedBy`, the echo filter is silently a no-op.
@@ -50,7 +55,7 @@ import type { SyncEngine } from './engine'
 import type { Logger } from '../logging'
 import { increment, METRIC_NAMES } from '../metrics'
 import { MR_MIXIN } from './mr-mixin'
-import { MR_REVIEW_MIXIN } from './mr-review-mixin'
+import { MR_REVIEW_THREAD_MIXIN } from './mr-review-thread-mixin'
 
 const BUFFER_MAX = 1024
 
@@ -62,6 +67,30 @@ const TX_CLASS_MIXIN = 'core:class:TxMixin'
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 const HULY_CLASS_CHAT_MESSAGE = 'chunter:class:ChatMessage'
+
+/**
+ * Layer 2 echo-storm filter (Phase 5 §C):
+ * Returns `true` when the tx carries the `_originated:'gitlab'` marker
+ * stamped by an applyRemote write path. Checks both attribute-style
+ * (TxCreateDoc / TxMixin → `attributes._originated`) and operation-style
+ * (TxUpdateDoc → `operations._originated` OR `operations.$set._originated`)
+ * payloads. TxRemoveDoc has no payload to inspect — returns `false` to
+ * defer to layer 1 (the service-account PersonId filter).
+ */
+function isGitlabOriginated (tx: Tx): boolean {
+  const txClass = tx._class as unknown as string
+  if (txClass === TX_CLASS_REMOVE) return false
+
+  const attrs = (tx as unknown as { attributes?: Record<string, unknown> }).attributes
+  if (attrs?._originated === 'gitlab') return true
+
+  const ops = (tx as unknown as { operations?: Record<string, unknown> }).operations
+  if (ops?._originated === 'gitlab') return true
+  const setOp = ops?.$set as Record<string, unknown> | undefined
+  if (setOp?._originated === 'gitlab') return true
+
+  return false
+}
 
 /** Sync-engine `kind` strings — keep in lock-step with SyncManager.kind values. */
 type SyncKind = 'merge_request' | 'review' | 'issue' | 'note'
@@ -160,9 +189,19 @@ export class TxSubscriber {
   private onTx (tx: Tx): void {
     if (this.stopped) return
 
-    // MR-2 echo filter: drop self-authored txes. Compare as strings since
-    // PersonId is a branded string at type level but identical on the wire.
+    // Layer 1 (MR-2 echo filter): drop self-authored txes. Compare as
+    // strings since PersonId is a branded string at type level but
+    // identical on the wire.
     if ((tx.modifiedBy as unknown as string) === (this.deps.serviceAccountPersonId as unknown as string)) {
+      increment(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)
+      return
+    }
+
+    // Layer 2 (Phase 5 §C restoration): drop txes carrying the
+    // `_originated:'gitlab'` marker stamped by every applyRemote write.
+    // TxRemoveDoc has no attribute payload — carve-out returns false so
+    // removes defer to layer 1 (service-account filter) only.
+    if (isGitlabOriginated(tx)) {
       increment(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)
       return
     }
@@ -221,7 +260,7 @@ export class TxSubscriber {
       if (mixinRef === (MR_MIXIN as unknown as string)) {
         return { kind: 'merge_request', doc, change, objectClass }
       }
-      if (mixinRef === (MR_REVIEW_MIXIN as unknown as string)) {
+      if (mixinRef === (MR_REVIEW_THREAD_MIXIN as unknown as string)) {
         return { kind: 'review', doc, change, objectClass }
       }
       return null

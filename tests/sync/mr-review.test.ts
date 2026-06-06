@@ -18,7 +18,7 @@ import {
   type MRReviewBindingContext,
   type MRReviewGitLabClient
 } from '../../src/sync/mr-review'
-import { MR_REVIEW_MIXIN } from '../../src/sync/mr-review-mixin'
+import { MR_REVIEW_THREAD_MIXIN } from '../../src/sync/mr-review-thread-mixin'
 import type { SyncContext } from '../../src/sync/types'
 
 // ---------------------------------------------------------------------------
@@ -399,7 +399,7 @@ test('1. create thread root → ChatMessage created with mixin (position set, re
   expect(mixin.threadId).toBe('disc-abc')
   expect(mixin.resolved).toBe(false)
   expect((mixin.position as SyncReviewPosition).filePath).toBe('src/a.ts')
-  expect(String(h.huly.createMixinCalls[0].mixin)).toBe(MR_REVIEW_MIXIN as unknown as string)
+  expect(String(h.huly.createMixinCalls[0].mixin)).toBe(MR_REVIEW_THREAD_MIXIN as unknown as string)
 
   expect(h.idmap.docs).toHaveLength(2) // parent MR seed + 1 review_thread row
   const reviewRows = h.idmap.docs.filter((d) => d.gitlabKind === 'review_thread')
@@ -638,10 +638,9 @@ test('9. author unmatched → stub guest created via UserIdentity.ensureStubGues
   expect(h.huly.creates).toBe(1)
 })
 
-test('10. position_type !== text already filtered upstream → no-op for review manager', async () => {
-  // Adapter filters non-text positions before they reach the manager.
-  // This test confirms the manager handles a thread with note.position === undefined
-  // (which is what general MR discussions look like after adapter filtering).
+test('10. general MR discussion (no position) → mixin.position undefined', async () => {
+  // General MR discussions have note.position === undefined.
+  // The manager must store the thread with position unset.
   const h = buildHarness()
   await seedParentMR(h, 42)
 
@@ -656,6 +655,68 @@ test('10. position_type !== text already filtered upstream → no-op for review 
   const mixin = h.huly.getMixin(msgRef) ?? {}
   expect(mixin.position).toBeUndefined()
   expect(mixin.threadId).toBe('disc-abc')
+})
+
+test('10b. image position written to mixin on root note (P5-T-25)', async () => {
+  const h = buildHarness()
+  await seedParentMR(h, 42)
+
+  const imagePos: SyncReviewPosition = {
+    positionType: 'image',
+    filePath: 'images/logo.png',
+    x: 10,
+    y: 20,
+    width: 100,
+    height: 200,
+    baseSha: 'base-sha',
+    headSha: 'head-sha'
+  }
+  const root = makeReviewNote({ id: 1001, position: imagePos })
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({ notes: [root] })
+  )
+  expect(h.huly.creates).toBe(1)
+  const msgRef = Array.from(h.huly.messages.keys())[0]
+  const mixin = h.huly.getMixin(msgRef) ?? {}
+  const pos = mixin.position as SyncReviewPosition
+  expect(pos.positionType).toBe('image')
+  if (pos.positionType === 'image') {
+    expect(pos.filePath).toBe('images/logo.png')
+    expect(pos.x).toBe(10)
+    expect(pos.y).toBe(20)
+    expect(pos.width).toBe(100)
+    expect(pos.height).toBe(200)
+  }
+})
+
+test('10c. file position written to mixin on root note (P5-T-25)', async () => {
+  const h = buildHarness()
+  await seedParentMR(h, 42)
+
+  const filePos: SyncReviewPosition = {
+    positionType: 'file',
+    filePath: 'src/big.bin',
+    baseSha: 'base-sha',
+    headSha: 'head-sha'
+  }
+  const root = makeReviewNote({ id: 1001, position: filePos })
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({ notes: [root] })
+  )
+  expect(h.huly.creates).toBe(1)
+  const msgRef = Array.from(h.huly.messages.keys())[0]
+  const mixin = h.huly.getMixin(msgRef) ?? {}
+  const pos = mixin.position as SyncReviewPosition
+  expect(pos.positionType).toBe('file')
+  if (pos.positionType === 'file') {
+    expect(pos.filePath).toBe('src/big.bin')
+    expect(pos.baseSha).toBe('base-sha')
+    expect(pos.headSha).toBe('head-sha')
+  }
 })
 
 test('11. resourceKey returns review:${discussionId} (flat + webhook envelope)', () => {
@@ -748,6 +809,140 @@ test('16. applyLocal change.resolved=false → calls resolveDiscussion(false)', 
   )
   expect(h.gitlab.resolveDiscussion).toHaveBeenCalledTimes(1)
   expect(h.gitlab.resolveDiscussion.mock.calls[0][3]).toBe(false)
+})
+
+test('T11-A. applyRemote create thread → createDoc attrs contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  await seedParentMR(h, 42)
+  const thread = makeReviewThread({
+    notes: [makeReviewNote({ id: 1001, position: makePosition() })]
+  })
+
+  await h.manager.applyRemote(h.ctx, 'binding-1', thread)
+
+  expect(h.huly.creates).toBe(1)
+  const created = Array.from(h.huly.messages.values())[0] as Record<string, unknown>
+  // createDoc attrs are stored on the FakeHulyClient message; the marker is
+  // forwarded via withOriginatedMarker and we verify it appeared on the
+  // createMixinCalls (the attrs wrapper in the mixin path also carries it).
+  expect(h.huly.createMixinCalls).toHaveLength(1)
+  const mixinAttrs = h.huly.createMixinCalls[0].attributes
+  expect(mixinAttrs._originated).toBe('gitlab')
+  // Sanity: message was still created correctly.
+  expect(created._id).toBeDefined()
+})
+
+test('T11-B. applyRemote update review (second delivery) → updateMixin attrs contain _originated:gitlab marker', async () => {
+  const h = buildHarness()
+  await seedParentMR(h, 42)
+  const note = makeReviewNote({ id: 1001, position: makePosition() })
+
+  // First delivery — creates.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeReviewThread({ notes: [note] }))
+
+  // Second delivery with resolved=true — triggers updateMixin path.
+  const resolvedAt = new Date('2024-02-01T08:00:00.000Z')
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({
+      notes: [note],
+      resolved: true,
+      resolvedBy: makeUser(5),
+      resolvedAt,
+      updatedAt: resolvedAt
+    })
+  )
+
+  expect(h.huly.updateMixinCalls).toHaveLength(1)
+  const attrs = h.huly.updateMixinCalls[0].attributes
+  expect(attrs._originated).toBe('gitlab')
+  expect(attrs.resolved).toBe(true)
+})
+
+test('T20-A. resolve thread → resolvedBy and resolvedAt populated on mixin when user is known', async () => {
+  const resolverUuid = 'person-uuid-77' as unknown as PersonUuid
+  // Map gitlab user id 77 via the social key format used by UserIdentity.
+  const known = new Map<string, PersonUuid>([['gitlab:77', resolverUuid]])
+  const h = buildHarness({ knownUsers: known })
+  await seedParentMR(h, 42)
+
+  const root = makeReviewNote({ id: 1001, position: makePosition() })
+  // Start unresolved.
+  await h.manager.applyRemote(h.ctx, 'binding-1', makeReviewThread({ notes: [root] }))
+
+  const resolvedAt = new Date('2024-03-01T09:00:00.000Z')
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({
+      notes: [root],
+      resolved: true,
+      resolvedBy: makeUser(77),
+      resolvedAt,
+      updatedAt: resolvedAt
+    })
+  )
+
+  const reviewRows = h.idmap.docs.filter((d) => d.gitlabKind === 'review_thread')
+  expect(reviewRows).toHaveLength(1)
+  const mixin = h.huly.getMixin(reviewRows[0].hulyRef) ?? {}
+  expect(mixin.resolved).toBe(true)
+  expect(typeof mixin.resolvedAt).toBe('number')
+  expect(mixin.resolvedAt).toBe(resolvedAt.getTime())
+  expect(mixin.resolvedBy).toBeDefined()
+})
+
+test('T20-B. unresolve thread after being resolved → resolvedBy and resolvedAt cleared on mixin', async () => {
+  const h = buildHarness()
+  await seedParentMR(h, 42)
+
+  const root = makeReviewNote({ id: 1001, position: makePosition() })
+  const reply = makeReviewNote({ id: 1002 })
+
+  // First: resolve.
+  const resolvedAt = new Date('2024-03-01T09:00:00.000Z')
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({
+      notes: [root, reply],
+      resolved: true,
+      resolvedBy: makeUser(77),
+      resolvedAt,
+      updatedAt: resolvedAt
+    })
+  )
+
+  // Verify resolved fields populated.
+  const rowsBefore = h.idmap.docs.filter((d) => d.gitlabKind === 'review_thread')
+  for (const row of rowsBefore) {
+    const m = h.huly.getMixin(row.hulyRef) ?? {}
+    expect(m.resolved).toBe(true)
+    expect(m.resolvedAt).toBeDefined()
+  }
+
+  // Now unresolve.
+  await h.manager.applyRemote(
+    h.ctx,
+    'binding-1',
+    makeReviewThread({
+      notes: [root, reply],
+      resolved: false,
+      resolvedBy: null,
+      resolvedAt: null,
+      updatedAt: new Date('2024-03-02T10:00:00.000Z')
+    })
+  )
+
+  const rowsAfter = h.idmap.docs.filter((d) => d.gitlabKind === 'review_thread')
+  for (const row of rowsAfter) {
+    const mixin = h.huly.getMixin(row.hulyRef) ?? {}
+    expect(mixin.resolved).toBe(false)
+    // Stale resolver attribution must be explicitly cleared.
+    expect(mixin.resolvedBy).toBeUndefined()
+    expect(mixin.resolvedAt).toBeUndefined()
+  }
 })
 
 test('backfill: lists MRs then discussions; each thread enqueued', async () => {

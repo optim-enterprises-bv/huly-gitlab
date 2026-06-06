@@ -709,19 +709,82 @@ test('listDiscussions: happy path with pagination', async () => {
 })
 
 // ---------------------------------------------------------------------------
-// P3-T-03 / 2. listDiscussions: drops position_type='image'/'file' + metric
+// P3-T-03 / 2. listDiscussions: image position parsed into SyncReviewPosition
 // ---------------------------------------------------------------------------
-test('listDiscussions: drops non-text position types and logs metric', async () => {
-  const imagePos = { ...textPosition, position_type: 'image' }
-  const filePos = { ...textPosition, position_type: 'file' }
+test('listDiscussions: image position parsed correctly', async () => {
+  const imagePos = {
+    base_sha: 'base', start_sha: 'start', head_sha: 'head',
+    position_type: 'image',
+    new_path: 'images/logo.png', old_path: 'images/logo.png',
+    x: 10, y: 20, width: 100, height: 200
+  }
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1' })
+    .reply(200, [
+      makeDiscussion({ id: 'img-disc', notes: [makeDiscussionNote({ id: 5, position: imagePos })] })
+    ], { 'x-next-page': '' })
+
+  const client = makeClient()
+  const threads = await client.listDiscussions(1, 10)
+  expect(threads).toHaveLength(1)
+  expect(threads[0].discussionId).toBe('img-disc')
+  const pos = threads[0].notes[0].position
+  expect(pos?.positionType).toBe('image')
+  if (pos?.positionType === 'image') {
+    expect(pos.filePath).toBe('images/logo.png')
+    expect(pos.x).toBe(10)
+    expect(pos.y).toBe(20)
+    expect(pos.width).toBe(100)
+    expect(pos.height).toBe(200)
+    expect(pos.baseSha).toBe('base')
+    expect(pos.headSha).toBe('head')
+  }
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 2b. listDiscussions: file position parsed into SyncReviewPosition
+// ---------------------------------------------------------------------------
+test('listDiscussions: file position parsed correctly', async () => {
+  const filePos = {
+    base_sha: 'base', start_sha: 'start', head_sha: 'head',
+    position_type: 'file',
+    new_path: 'src/big.bin', old_path: 'src/big.bin'
+  }
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1' })
+    .reply(200, [
+      makeDiscussion({ id: 'file-disc', notes: [makeDiscussionNote({ id: 6, position: filePos })] })
+    ], { 'x-next-page': '' })
+
+  const client = makeClient()
+  const threads = await client.listDiscussions(1, 10)
+  expect(threads).toHaveLength(1)
+  expect(threads[0].discussionId).toBe('file-disc')
+  const pos = threads[0].notes[0].position
+  expect(pos?.positionType).toBe('file')
+  if (pos?.positionType === 'file') {
+    expect(pos.filePath).toBe('src/big.bin')
+    expect(pos.baseSha).toBe('base')
+    expect(pos.headSha).toBe('head')
+  }
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 2c. listDiscussions: unknown position_type → dropped + metric
+// ---------------------------------------------------------------------------
+test('listDiscussions: unknown position_type dropped with warn metric', async () => {
+  const unknownPos = { ...textPosition, position_type: 'video' }
 
   nock(BASE_URL)
     .get('/api/v4/projects/1/merge_requests/10/discussions')
     .query({ per_page: '100', page: '1' })
     .reply(200, [
       makeDiscussion({ id: 'keep', notes: [makeDiscussionNote({ id: 1, position: textPosition })] }),
-      makeDiscussion({ id: 'drop-img', notes: [makeDiscussionNote({ id: 2, position: imagePos })] }),
-      makeDiscussion({ id: 'drop-file', notes: [makeDiscussionNote({ id: 3, position: filePos })] })
+      makeDiscussion({ id: 'drop-unk', notes: [makeDiscussionNote({ id: 7, position: unknownPos })] })
     ], { 'x-next-page': '' })
 
   const logger = makeLogger()
@@ -730,8 +793,35 @@ test('listDiscussions: drops non-text position types and logs metric', async () 
   expect(threads).toHaveLength(1)
   expect(threads[0].discussionId).toBe('keep')
 
-  const dropMsgs = logger.infoCalls.filter((c) => c.msg === 'discussion.position.unsupported')
-  expect(dropMsgs).toHaveLength(2)
+  const dropMsgs = logger.warnCalls.filter((c) => c.msg === 'discussion.position.unsupported')
+  expect(dropMsgs).toHaveLength(1)
+  expect(dropMsgs[0].ctx).toMatchObject({ discussionId: 'drop-unk' })
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 2d. listDiscussions: text position regression (P5-T-25)
+// ---------------------------------------------------------------------------
+test('listDiscussions: text position parsed correctly (regression)', async () => {
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1' })
+    .reply(200, [
+      makeDiscussion({ id: 'txt-disc', notes: [makeDiscussionNote({ id: 8, position: textPosition })] })
+    ], { 'x-next-page': '' })
+
+  const client = makeClient()
+  const threads = await client.listDiscussions(1, 10)
+  expect(threads).toHaveLength(1)
+  const pos = threads[0].notes[0].position
+  expect(pos?.positionType).toBe('text')
+  if (pos?.positionType === 'text') {
+    expect(pos.filePath).toBe('src/foo.ts')
+    expect(pos.newLine).toBe(42)
+    expect(pos.oldLine).toBeNull()
+    expect(pos.baseSha).toBe('base')
+    expect(pos.headSha).toBe('head')
+    expect(pos.startSha).toBe('start')
+  }
 })
 
 // ---------------------------------------------------------------------------

@@ -1,27 +1,32 @@
-import { createHmac, randomBytes, createHash } from 'node:crypto'
+import { randomBytes, createHash } from 'node:crypto'
 import { Router as createRouter } from 'express'
 import type { Request, Response, Router } from 'express'
 import { ObjectId } from 'mongodb'
+import type { Collection } from 'mongodb'
 import type { Config } from '../config'
 import type { Store } from '../state/store'
 import type { Logger } from '../logging'
+import type { OAuthStateDoc } from '../state/oauth-state'
 import { putCredential } from '../state/credentials'
 import { validateGitLabBaseUrl } from '../util/url-validation'
+import { signHmac, verifyHmac } from '../util/secret-rotation'
+import type { SecretConfig } from '../util/secret-rotation'
+
+/** Admin OAuth state rows carry no `kind` field (or kind != 'user'). */
+interface AdminOAuthStateDoc extends OAuthStateDoc {
+  kind?: string
+}
 
 export interface OAuthRouterDeps {
   config: Config
   store: Store
   logger: Logger
-}
-
-function signState (secret: string, workspaceUuid: string, hulyProjectRef: string, nonce: string, epoch: number): string {
-  return createHmac('sha256', secret)
-    .update(`${workspaceUuid}|${hulyProjectRef}|${nonce}|${epoch}`)
-    .digest('hex')
+  secrets?: SecretConfig
 }
 
 export function createOAuthRouter (deps: OAuthRouterDeps): Router {
   const { config, store, logger } = deps
+  const secrets: SecretConfig = deps.secrets ?? { primary: config.ServerSecret, previous: config.ServerSecretPrevious }
   const router = createRouter()
 
   // GET /oauth/start?workspaceUuid=...&hulyProjectRef=...&gitlabBaseUrl=...
@@ -53,7 +58,8 @@ export function createOAuthRouter (deps: OAuthRouterDeps): Router {
     const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url')
 
     const epoch = Date.now()
-    const state = signState(config.ServerSecret, workspaceUuid, hulyProjectRef, nonce, epoch)
+    const statePayload = `${workspaceUuid}|${hulyProjectRef}|${nonce}|${epoch}`
+    const state = signHmac(statePayload, secrets)
 
     const expiresAt = new Date(epoch + 10 * 60 * 1000)
 
@@ -61,6 +67,7 @@ export function createOAuthRouter (deps: OAuthRouterDeps): Router {
       await store.oauthStates().insertOne({
         _id: new ObjectId(),
         state,
+        statePayload,
         nonce,
         codeVerifier,
         workspaceUuid,
@@ -100,9 +107,17 @@ export function createOAuthRouter (deps: OAuthRouterDeps): Router {
       return
     }
 
-    const stateDoc = await store.oauthStates().findOne({ state })
+    const adminStates = store.oauthStates() as unknown as Collection<AdminOAuthStateDoc>
+    const stateDoc = await adminStates.findOne({ state, kind: { $ne: 'user' } } as unknown as Partial<AdminOAuthStateDoc>)
     if (stateDoc === null) {
       res.status(404).json({ error: 'not_found', message: 'Unknown or already-used state' })
+      return
+    }
+
+    // Dual-verify HMAC against primary OR previous secret (grace-period rotation).
+    if (verifyHmac(stateDoc.statePayload, state, secrets) === null) {
+      await store.oauthStates().deleteOne({ state })
+      res.status(401).json({ error: 'invalid_state', message: 'State HMAC verification failed' })
       return
     }
 

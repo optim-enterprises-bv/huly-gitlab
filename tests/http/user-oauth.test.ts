@@ -8,6 +8,8 @@ import { createUserOAuthRouter } from '../../src/http/user-oauth'
 import { Store } from '../../src/state/store'
 import { signCookie } from '../../src/http/cookie-auth'
 import { putUserCredential } from '../../src/state/user-credentials'
+import { signHmac } from '../../src/util/secret-rotation'
+import { ObjectId } from 'mongodb'
 import type { WorkspaceUuid, PersonUuid } from '@hcengineering/core'
 import type { Logger } from '../../src/logging'
 import type { Config } from '../../src/config'
@@ -59,7 +61,7 @@ function makeConfig (): Config {
 function makeCookie (workspaceUuid: string = WS, hulyPersonUuid: string = PERSON): string {
   return signCookie(
     { workspaceUuid, hulyPersonUuid, expiresAt: Date.now() + 60 * 60 * 1000 },
-    SERVER_SECRET
+    { primary: SERVER_SECRET }
   )
 }
 
@@ -239,14 +241,14 @@ describe('GET /user/oauth/callback', () => {
     expect(res.body.error).toBe('expired')
   })
 
-  test('7. invalid (unknown) state → 401', async () => {
+  test('7. invalid (unknown) state → 404 (Sec M-1: parity with admin oauth)', async () => {
     const app = buildApp()
     const res = await request(app)
       .get('/user/oauth/callback')
       .query({ code: 'auth-code-abc', state: 'totally-unknown-state' })
 
-    expect(res.status).toBe(401)
-    expect(res.body.error).toBe('invalid_state')
+    expect(res.status).toBe(404)
+    expect(res.body.error).toBe('not_found')
   })
 
   test('8. username captured from GitLab /api/v4/user response', async () => {
@@ -286,7 +288,7 @@ describe('GET /user/oauth/callback', () => {
     // Pass a TOTALLY DIFFERENT cookie at callback time. Identity MUST still come from the state row.
     const wrongCookie = signCookie(
       { workspaceUuid: 'ws-different', hulyPersonUuid: 'person-different', expiresAt: Date.now() + 60_000 },
-      SERVER_SECRET
+      { primary: SERVER_SECRET }
     )
     const res = await request(app)
       .get('/user/oauth/callback')
@@ -390,5 +392,75 @@ describe('DELETE /user/oauth/credential', () => {
       .send({ gitlabBaseUrl: GITLAB_BASE })
 
     expect(res.status).toBe(401)
+  })
+})
+
+describe('GET /user/oauth/callback — secret rotation grace period', () => {
+  async function insertUserStateSignedWith (secret: string, nonce: string, expiresAt: Date): Promise<string> {
+    const epoch = Date.now()
+    const statePayload = `user|${WS}|${PERSON}|${nonce}|${epoch}`
+    const state = signHmac(statePayload, { primary: secret })
+    await store.oauthStates().insertOne({
+      _id: new ObjectId(),
+      kind: 'user',
+      state,
+      statePayload,
+      nonce,
+      codeVerifier: 'test-code-verifier',
+      workspaceUuid: WS,
+      hulyPersonUuid: PERSON,
+      gitlabBaseUrl: GITLAB_BASE,
+      expiresAt
+    } as any)
+    return state
+  }
+
+  function buildAppWithSecrets (primary: string, previous?: string): express.Express {
+    const app = express()
+    app.use(bodyParser.json())
+    app.use(
+      '/user/oauth',
+      createUserOAuthRouter({
+        config: { ...makeConfig(), ServerSecret: primary, ServerSecretPrevious: previous },
+        store,
+        logger: makeLogger(),
+        secrets: { primary, previous }
+      })
+    )
+    return app
+  }
+
+  test('14. state HMAC-signed with previous secret is accepted after rotation', async () => {
+    const previous = 'user-old-secret'
+    const primary = 'user-new-secret'
+    const state = await insertUserStateSignedWith(previous, 'rot-prev-nonce', new Date(Date.now() + 5 * 60 * 1000))
+
+    nock(GITLAB_BASE)
+      .post('/oauth/token')
+      .reply(200, { access_token: 'rot-access', expires_in: 7200 })
+    nock(GITLAB_BASE)
+      .get('/api/v4/user')
+      .reply(200, { id: 1, username: 'rot-user' })
+
+    const app = buildAppWithSecrets(primary, previous)
+    const res = await request(app)
+      .get('/user/oauth/callback')
+      .query({ code: 'rot-code', state })
+
+    expect([200, 302]).toContain(res.status)
+    const credDoc = await store.userCredentials().findOne({ workspaceUuid: WS, hulyPersonUuid: PERSON, gitlabBaseUrl: GITLAB_BASE })
+    expect(credDoc?.username).toBe('rot-user')
+  })
+
+  test('15. state HMAC-signed with neither primary nor previous → 401 invalid_state', async () => {
+    const state = await insertUserStateSignedWith('attacker-secret', 'rot-bad-nonce', new Date(Date.now() + 5 * 60 * 1000))
+
+    const app = buildAppWithSecrets('rot-primary', 'rot-previous')
+    const res = await request(app)
+      .get('/user/oauth/callback')
+      .query({ code: 'rot-bad-code', state })
+
+    expect(res.status).toBe(401)
+    expect(res.body.error).toBe('invalid_state')
   })
 })

@@ -15,7 +15,7 @@ import { TxSubscriber, type TxSubscriberDeps } from '../../src/sync/tx-subscript
 import type { SyncEngine } from '../../src/sync/engine'
 import type { Logger } from '../../src/logging'
 import { MR_MIXIN } from '../../src/sync/mr-mixin'
-import { MR_REVIEW_MIXIN } from '../../src/sync/mr-review-mixin'
+import { MR_REVIEW_THREAD_MIXIN } from '../../src/sync/mr-review-thread-mixin'
 import { get as getMetric, reset as resetMetrics, METRIC_NAMES } from '../../src/metrics'
 
 const WORKSPACE = 'ws-1' as WorkspaceUuid
@@ -148,12 +148,10 @@ describe('TxSubscriber: MR-2 echo storm filter', () => {
     expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
   })
 
-  // B3: _originated:'gitlab' marker check was removed. The marker is never
-  // stamped by any applyRemote write path; the dual-defense layer was
-  // documented but never wired. MR-2 is now single-defense (service-account
-  // PersonId filter only). A tx that carries the marker but is authored by
-  // a non-service-account is forwarded to the engine like any other tx.
-  it('B3: tx with _originated marker but non-service-account modifiedBy is NOT dropped', () => {
+  // P5-T-15: layer 2 defense restored. The marker is stamped by every
+  // applyRemote write path (Wave C). A tx that carries the marker is
+  // dropped even if it is authored by a non-service-account.
+  it('P5-T-15: tx with attributes._originated marker is DROPPED (layer 2)', () => {
     const { deps, client, enqueueCalls } = makeDeps()
     const sub = new TxSubscriber(deps)
     sub.start()
@@ -166,8 +164,122 @@ describe('TxSubscriber: MR-2 echo storm filter', () => {
     )
     client.notify?.(markedTx)
 
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
+  })
+
+  it('P5-T-15: TxUpdateDoc with operations._originated marker is DROPPED', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    client.notify?.(
+      mkTxUpdate('tracker:class:Issue', 'issue-marked', {
+        title: 'changed',
+        _originated: 'gitlab'
+      })
+    )
+
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
+  })
+
+  it('P5-T-15: TxUpdateDoc with operations.$set._originated marker is DROPPED', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    client.notify?.(
+      mkTxUpdate('tracker:class:Issue', 'issue-set-marked', {
+        $set: { title: 'changed', _originated: 'gitlab' }
+      })
+    )
+
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
+  })
+
+  it('P5-T-15: tx with NO marker and non-service-account author is ENQUEUED', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    client.notify?.(
+      mkTxMixin(MR_MIXIN as unknown as string, 'doc-unmarked', { draft: true })
+    )
+
     expect(enqueueCalls).toHaveLength(1)
     expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(0)
+  })
+
+  it('P5-T-15: TxRemoveDoc carve-out — no marker payload; service-account author dropped via layer 1', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    const removeTx = {
+      _id: 'tx-rm-1',
+      _class: 'core:class:TxRemoveDoc',
+      objectId: 'issue-removed',
+      objectClass: 'tracker:class:Issue',
+      modifiedBy: SERVICE_ACCOUNT
+    } as unknown as Tx
+    client.notify?.(removeTx)
+
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(1)
+  })
+
+  it('P5-T-15: TxRemoveDoc with non-service-account author is ENQUEUED (no payload to check for marker)', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    const removeTx = {
+      _id: 'tx-rm-2',
+      _class: 'core:class:TxRemoveDoc',
+      objectId: 'issue-removed',
+      objectClass: 'tracker:class:Issue',
+      modifiedBy: USER_ACCOUNT
+    } as unknown as Tx
+    client.notify?.(removeTx)
+
+    expect(enqueueCalls).toEqual([
+      { binding: 'binding-1', kind: 'issue', doc: 'issue-removed', change: { _removed: true } }
+    ])
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(0)
+  })
+
+  it('P5-T-15 quantifier: a single sync write produces 2 marked txes (createDoc + createMixin); both dropped', () => {
+    const { deps, client, enqueueCalls } = makeDeps()
+    const sub = new TxSubscriber(deps)
+    sub.start()
+    sub.markEngineStarted()
+
+    const createTx = {
+      _id: 'tx-create-1',
+      _class: 'core:class:TxCreateDoc',
+      objectId: 'mr-doc',
+      objectClass: 'tracker:class:Issue',
+      attributes: { title: 'New MR', _originated: 'gitlab' },
+      modifiedBy: USER_ACCOUNT
+    } as unknown as Tx
+    const mixinTx = mkTxMixin(
+      MR_MIXIN as unknown as string,
+      'mr-doc',
+      { draft: true, _originated: 'gitlab' }
+    )
+
+    client.notify?.(createTx)
+    client.notify?.(mixinTx)
+
+    expect(enqueueCalls).toHaveLength(0)
+    expect(getMetric(METRIC_NAMES.TX_SUBSCRIPTION_ECHO_DROPPED)).toBe(2)
   })
 })
 
@@ -190,7 +302,7 @@ describe('TxSubscriber: MR-1 cold-start buffering', () => {
 
     const tx1 = mkTxMixin(MR_MIXIN as unknown as string, 'doc-1', { draft: true })
     const tx2 = mkTxMixin(MR_MIXIN as unknown as string, 'doc-2', { draft: false })
-    const tx3 = mkTxMixin(MR_REVIEW_MIXIN as unknown as string, 'doc-3', { resolved: true })
+    const tx3 = mkTxMixin(MR_REVIEW_THREAD_MIXIN as unknown as string, 'doc-3', { resolved: true })
     client.notify?.(tx1)
     client.notify?.(tx2)
     client.notify?.(tx3)
@@ -252,7 +364,7 @@ describe('TxSubscriber: kind classification', () => {
     ])
   })
 
-  it('TxMixin on MR_REVIEW_MIXIN → kind review', () => {
+  it('TxMixin on MR_REVIEW_THREAD_MIXIN → kind review', () => {
     const { deps, client, enqueueCalls } = makeDeps()
     const sub = new TxSubscriber(deps)
     sub.start()
@@ -260,7 +372,7 @@ describe('TxSubscriber: kind classification', () => {
 
     client.notify?.(
       mkTxMixin(
-        MR_REVIEW_MIXIN as unknown as string,
+        MR_REVIEW_THREAD_MIXIN as unknown as string,
         'review-doc',
         { resolved: true },
         USER_ACCOUNT,

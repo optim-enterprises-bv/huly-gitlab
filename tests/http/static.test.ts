@@ -95,4 +95,24 @@ describe('Static file serving (/user/ui)', () => {
     expect(res.text).toContain('sessionStorage.getItem')
     expect(res.text).toContain('hulyBearer')
   })
+
+  test('9. JavaScript file contains origin validation for postMessage', async () => {
+    const res = await request(app).get('/user/ui/app.js')
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('isOriginAllowed')
+    expect(res.text).toMatch(/e\.origin|event\.origin/)
+    expect(res.text).toContain('HULY_PARENT_ORIGINS')
+    expect(res.text).toContain('data-allowed-origins')
+    expect(res.text).toContain('postMessage from unauthorized origin rejected')
+  })
+
+  test('10. JavaScript file contains getAllowedOrigins function', async () => {
+    const res = await request(app).get('/user/ui/app.js')
+
+    expect(res.status).toBe(200)
+    expect(res.text).toContain('function getAllowedOrigins')
+    expect(res.text).toContain('HULY_PARENT_ORIGINS')
+    expect(res.text).toContain('meta[data-allowed-origins]')
+  })
 })

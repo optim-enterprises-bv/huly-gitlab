@@ -39,5 +39,16 @@ export const METRIC_NAMES = {
   WEBHOOK_EPIC_CE_SKIPPED: 'epic_hook.ce_skipped',
   WEBHOOK_PAYLOAD_INVALID: 'webhook.payload.invalid',
   EPIC_EE_SKIPPED: 'epic.ee.skipped',
-  EPIC_CHILD_DEFERRED: 'epic.child.deferred'
+  EPIC_CHILD_DEFERRED: 'epic.child.deferred',
+  // gauge: 1 if real resolution succeeded, 0 if sentinel fallback
+  SERVICE_ACCOUNT_RESOLVED: 'service_account.resolved',
+  // P5-T-22: composite getMergeRequest path selection
+  MR_COMPOSITE_GRAPHQL_HIT: 'mr.composite.graphql.hit',
+  MR_COMPOSITE_REST_FALLBACK: 'mr.composite.rest.fallback',
+  // P5-T-23: listEpicsWithChildren path selection
+  EPICS_LIST_GRAPHQL_HIT: 'epics.list.graphql.hit',
+  EPICS_LIST_REST_FALLBACK: 'epics.list.rest.fallback',
+  // P5-T-24: listMergeRequestsWithApprovals path selection
+  MR_LIST_GRAPHQL_HIT: 'mr.list.graphql.hit',
+  MR_LIST_REST_FALLBACK: 'mr.list.rest.fallback'
 } as const

@@ -3,6 +3,8 @@ import { generateToken, systemAccountUuid } from '@hcengineering/server-token'
 import { getClient as getAccountClient } from '@hcengineering/account-client'
 import { loadConfig } from './config'
 import { initializeLogging, createLogger } from './logging'
+import * as metrics from './metrics'
+import { METRIC_NAMES } from './metrics'
 import { Store } from './state/store'
 import {
   SyncEngine,
@@ -46,14 +48,27 @@ async function main (): Promise<void> {
   const breaker = new InMemoryBindingBreaker()
   const syncEngine = new SyncEngine({ store, logger, breaker })
 
-  // P4-T-19: TxSubscriber lifecycle wiring (Path B closure).
-  // Service-account PersonId resolution: `systemAccountUuid` is a
-  // PersonUuid; we cast it to PersonId for the on-wire equality check
-  // (TxSubscriber compares as strings). True provenance-resolution of the
-  // pod's service-account PersonId would require a Huly platform call we
-  // don't make here — the systemAccountUuid sentinel is the documented
-  // identity used by generateToken above and is the same identity that
-  // applyRemote writes will be authored by.
+  /**
+   * P4-T-19 / P5-T-04: TxSubscriber lifecycle wiring (Path B closure).
+   *
+   * Path D finding: no Huly platform API exists to resolve the pod's
+   * service-account PersonId at runtime. `systemAccountUuid` is a PersonUuid;
+   * we cast it to PersonId for the on-wire equality check (TxSubscriber
+   * compares as strings). This sentinel is semantically correct because
+   * `generateToken(systemAccountUuid, ...)` above stamps that exact identity,
+   * and applyRemote writes are authored by the same identity — making the
+   * echo-filter effective.
+   *
+   * SERVICE_ACCOUNT_RESOLVED gauge is set to 0 (sentinel/Path D fallback).
+   * If a future platform API becomes available, resolve the real PersonId and
+   * set the gauge to 1 so operators can distinguish the two modes.
+   *
+   * Operator must monitor `tx.subscription.echo.dropped`; sustained zero
+   * values indicate echo filter is non-functional and a tx storm may be
+   * silently occurring.
+   */
+  // Operator must monitor `tx.subscription.echo.dropped`; sustained zero values indicate echo filter is non-functional and a tx storm may be silently occurring.
+  metrics.increment(METRIC_NAMES.SERVICE_ACCOUNT_RESOLVED, 0)
   const serviceAccountPersonId = systemAccountUuid as unknown as PersonId
   const txSubscribers = new Map<string, TxSubscriber>()
   let engineHasStarted = false

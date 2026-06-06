@@ -7,6 +7,7 @@ import { METRIC_NAMES } from '../metrics'
 import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
 import { prefixGitlabIdForMultiInstance } from './multi-instance'
 import type { BindingRef, SyncContext, SyncManager } from './types'
+import { withOriginatedMarker } from './originated-marker'
 
 export function getPipelineLruDropCount (): number {
   return metrics.get(METRIC_NAMES.PIPELINE_LRU_DROP)
@@ -125,7 +126,7 @@ export class PipelineSyncManager implements SyncManager<SyncPipeline> {
       tracker.class.Issue,
       bctx.hulyProjectRef,
       MR_MIXIN,
-      { pipelineStatus: syncPipeline.status }
+      withOriginatedMarker({ pipelineStatus: syncPipeline.status })
     )
   }
 
