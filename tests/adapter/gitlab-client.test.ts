@@ -1,19 +1,26 @@
 import nock from 'nock'
-import { GitLabClient } from '../../src/adapter/gitlab-client'
+import { GitLabClient, getMrCompositePartialCount, resetMrCompositePartialCount } from '../../src/adapter/gitlab-client'
 import { detectCapabilities, clearCapabilityCache } from '../../src/adapter/capabilities'
 import { registerProjectWebhook } from '../../src/adapter/webhooks'
-import { RateLimitError, ConfidentialIssueError, ConfidentialMergeRequestError } from '../../src/adapter/errors'
+import { ApprovalActionError, GitLabApiError, RateLimitError, ConfidentialIssueError, ConfidentialMergeRequestError } from '../../src/adapter/errors'
 import type { Logger } from '../../src/logging'
 
 const BASE_URL = 'http://gitlab.test'
 
-function makeLogger (): Logger & { infoCalls: Array<{ msg: string; ctx: Record<string, unknown> | undefined }> } {
-  const infoCalls: Array<{ msg: string; ctx: Record<string, unknown> | undefined }> = []
+interface LogCall { msg: string, ctx: Record<string, unknown> | undefined }
+
+function makeLogger (): Logger & {
+  infoCalls: LogCall[]
+  warnCalls: LogCall[]
+} {
+  const infoCalls: LogCall[] = []
+  const warnCalls: LogCall[] = []
   return {
     infoCalls,
+    warnCalls,
     debug: () => {},
     info: (msg, ctx) => { infoCalls.push({ msg, ctx }) },
-    warn: () => {},
+    warn: (msg, ctx) => { warnCalls.push({ msg, ctx }) },
     error: () => {}
   }
 }
@@ -640,4 +647,409 @@ test.each([
   expect(pipeline.status).toBe(expected)
   expect(pipeline.rawStatus).toBe(rawStatus)
   expect(pipeline.mergeRequestIid).toBeNull()
+})
+
+// ===========================================================================
+// Phase 3 — P3-T-03: Review / Approval / Diff REST methods
+// ===========================================================================
+
+function makeDiscussionNote (overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 1, body: 'Review comment',
+    author: { id: 10, username: 'alice', name: 'Alice', email: 'a@b.c', avatar_url: '', web_url: '' },
+    created_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-02T00:00:00Z',
+    system: false,
+    resolvable: true,
+    resolved: false,
+    resolved_by: null,
+    resolved_at: null,
+    position: null,
+    ...overrides
+  }
+}
+
+function makeDiscussion (overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'disc-abc',
+    individual_note: false,
+    notes: [makeDiscussionNote()],
+    ...overrides
+  }
+}
+
+const textPosition = {
+  base_sha: 'base', start_sha: 'start', head_sha: 'head',
+  position_type: 'text',
+  new_path: 'src/foo.ts', old_path: 'src/foo.ts',
+  new_line: 42, old_line: null
+}
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 1. listDiscussions: happy path with pagination
+// ---------------------------------------------------------------------------
+test('listDiscussions: happy path with pagination', async () => {
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1' })
+    .reply(200, [makeDiscussion({ id: 'd1', notes: [makeDiscussionNote({ id: 1, position: textPosition })] })], { 'x-next-page': '2' })
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '2' })
+    .reply(200, [makeDiscussion({ id: 'd2', notes: [makeDiscussionNote({ id: 2 })] })], { 'x-next-page': '' })
+
+  const client = makeClient()
+  const threads = await client.listDiscussions(1, 10)
+  expect(threads).toHaveLength(2)
+  expect(threads[0].discussionId).toBe('d1')
+  expect(threads[0].notes[0].position?.filePath).toBe('src/foo.ts')
+  expect(threads[1].discussionId).toBe('d2')
+  expect(threads[1].notes[0].position).toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 2. listDiscussions: drops position_type='image'/'file' + metric
+// ---------------------------------------------------------------------------
+test('listDiscussions: drops non-text position types and logs metric', async () => {
+  const imagePos = { ...textPosition, position_type: 'image' }
+  const filePos = { ...textPosition, position_type: 'file' }
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1' })
+    .reply(200, [
+      makeDiscussion({ id: 'keep', notes: [makeDiscussionNote({ id: 1, position: textPosition })] }),
+      makeDiscussion({ id: 'drop-img', notes: [makeDiscussionNote({ id: 2, position: imagePos })] }),
+      makeDiscussion({ id: 'drop-file', notes: [makeDiscussionNote({ id: 3, position: filePos })] })
+    ], { 'x-next-page': '' })
+
+  const logger = makeLogger()
+  const client = makeClient(logger)
+  const threads = await client.listDiscussions(1, 10)
+  expect(threads).toHaveLength(1)
+  expect(threads[0].discussionId).toBe('keep')
+
+  const dropMsgs = logger.infoCalls.filter((c) => c.msg === 'discussion.position.unsupported')
+  expect(dropMsgs).toHaveLength(2)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 3. listDiscussions: updatedAfter query param passed through
+// ---------------------------------------------------------------------------
+test('listDiscussions: updatedAfter query param passes through', async () => {
+  const since = new Date('2024-06-01T00:00:00Z')
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/discussions')
+    .query({ per_page: '100', page: '1', updated_after: since.toISOString() })
+    .reply(200, [], { 'x-next-page': '' })
+
+  const client = makeClient()
+  const threads = await client.listDiscussions(1, 10, { updatedAfter: since })
+  expect(threads).toEqual([])
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 4. createDiscussion: POST body shape is {body: string}
+// ---------------------------------------------------------------------------
+test('createDiscussion: POST body wraps the comment in an object', async () => {
+  let capturedBody: Record<string, unknown> = {}
+
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/discussions', (body) => {
+      capturedBody = body as Record<string, unknown>
+      return true
+    })
+    .reply(201, makeDiscussion({ id: 'created', notes: [makeDiscussionNote({ id: 99, body: 'hi' })] }))
+
+  const client = makeClient()
+  const thread = await client.createDiscussion(1, 10, { body: 'hi' })
+  expect(capturedBody.body).toBe('hi')
+  expect(typeof capturedBody.body).toBe('string')
+  expect(thread.discussionId).toBe('created')
+  expect(thread.notes[0].body).toBe('hi')
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 5. resolveDiscussion: PUT with resolved=true
+// ---------------------------------------------------------------------------
+test('resolveDiscussion: PUT with resolved=true', async () => {
+  nock(BASE_URL)
+    .put('/api/v4/projects/1/merge_requests/10/discussions/disc-1')
+    .query({ resolved: 'true' })
+    .reply(200, makeDiscussion({ id: 'disc-1' }))
+
+  const client = makeClient()
+  await expect(client.resolveDiscussion(1, 10, 'disc-1', true)).resolves.toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 6. resolveDiscussion: PUT with resolved=false (unresolve)
+// ---------------------------------------------------------------------------
+test('resolveDiscussion: PUT with resolved=false', async () => {
+  nock(BASE_URL)
+    .put('/api/v4/projects/1/merge_requests/10/discussions/disc-1')
+    .query({ resolved: 'false' })
+    .reply(200, makeDiscussion({ id: 'disc-1' }))
+
+  const client = makeClient()
+  await expect(client.resolveDiscussion(1, 10, 'disc-1', false)).resolves.toBeUndefined()
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 7. getMRApprovals: happy path returns approvedBy + approvalsRequired
+// ---------------------------------------------------------------------------
+test('getMRApprovals: happy path returns approvedBy + approvalsRequired', async () => {
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/approvals')
+    .reply(200, {
+      approvals_required: 2,
+      approved_by: [
+        { user: { id: 11, username: 'bob', name: 'Bob', email: 'b@x', avatar_url: '', web_url: '' } },
+        { user: { id: 12, username: 'carol', name: 'Carol', email: 'c@x', avatar_url: '', web_url: '' } }
+      ]
+    })
+
+  const client = makeClient()
+  const approvals = await client.getMRApprovals(1, 10)
+  expect(approvals.approvalsRequired).toBe(2)
+  expect(approvals.approvedBy).toHaveLength(2)
+  expect(approvals.approvedBy[0].username).toBe('bob')
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 8. getMRApprovals: 404 returns defaults + increments mr.composite.partial
+// ---------------------------------------------------------------------------
+test('getMRApprovals: 404 returns defaults and increments mr.composite.partial', async () => {
+  resetMrCompositePartialCount()
+
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/approvals')
+    .reply(404, { message: 'Not Found' })
+
+  const logger = makeLogger()
+  const client = makeClient(logger)
+  const approvals = await client.getMRApprovals(1, 10)
+  expect(approvals.approvedBy).toEqual([])
+  expect(approvals.approvalsRequired).toBe(0)
+  expect(getMrCompositePartialCount()).toBe(1)
+  expect(logger.infoCalls.some((c) => c.msg === 'mr.composite.partial')).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 9. approveMR with actorToken → PRIVATE-TOKEN is the override
+// ---------------------------------------------------------------------------
+test('approveMR: with actorToken, PRIVATE-TOKEN header is the override', async () => {
+  let capturedToken: string | undefined
+
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/approve')
+    .reply(function () {
+      capturedToken = this.req.headers['private-token'] as string | undefined
+      return [201, {}]
+    })
+
+  const client = makeClient()
+  await client.approveMR(1, 10, 'actor-oauth-token')
+  expect(capturedToken).toBe('actor-oauth-token')
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 9b. approveMR without actorToken → service-account token + warn log
+// ---------------------------------------------------------------------------
+test('approveMR: without actorToken falls back to service token and warns', async () => {
+  let capturedToken: string | undefined
+
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/approve')
+    .reply(function () {
+      capturedToken = this.req.headers['private-token'] as string | undefined
+      return [201, {}]
+    })
+
+  const logger = makeLogger()
+  const client = makeClient(logger)
+  await client.approveMR(1, 10)
+  expect(capturedToken).toBe('test-token')
+  expect(logger.warnCalls.some((c) => c.msg === 'approval.action.fallback.service_account')).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 10. approveMR non-2xx → ApprovalActionError with correct fields
+// ---------------------------------------------------------------------------
+test('approveMR: 403 throws ApprovalActionError', async () => {
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/approve')
+    .reply(403, 'forbidden')
+
+  const client = makeClient()
+  await expect(client.approveMR(1, 10, 'actor-tok')).rejects.toMatchObject({
+    name: 'ApprovalActionError',
+    kind: 'approve',
+    projectId: '1',
+    mrIid: 10
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 11. unapproveMR mirrors approveMR (actor token + 403 → error)
+// ---------------------------------------------------------------------------
+test('unapproveMR: with actorToken uses override and 403 → ApprovalActionError', async () => {
+  let capturedToken: string | undefined
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/unapprove')
+    .reply(function () {
+      capturedToken = this.req.headers['private-token'] as string | undefined
+      return [201, {}]
+    })
+
+  const client = makeClient()
+  await client.unapproveMR(1, 10, 'actor-x')
+  expect(capturedToken).toBe('actor-x')
+
+  nock(BASE_URL)
+    .post('/api/v4/projects/1/merge_requests/10/unapprove')
+    .reply(403, 'forbidden')
+
+  await expect(client.unapproveMR(1, 10, 'actor-x')).rejects.toBeInstanceOf(ApprovalActionError)
+})
+
+// ---------------------------------------------------------------------------
+// B8 / Security M1. actorToken with CRLF rejected before fetch is attempted.
+// ---------------------------------------------------------------------------
+test('approveMR: actorToken containing CRLF throws GitLabApiError, no fetch call', async () => {
+  // Note: NO nock interceptor registered — if a fetch slipped through it would
+  // raise a 'Nock: No match for request' error, distinct from GitLabApiError.
+  const client = makeClient()
+  await expect(client.approveMR(1, 10, 'good-token\r\nX-Inject: evil'))
+    .rejects.toBeInstanceOf(GitLabApiError)
+  await expect(client.unapproveMR(1, 10, '')).rejects.toBeInstanceOf(GitLabApiError)
+  const oversized = 'x'.repeat(4097)
+  await expect(client.approveMR(1, 10, oversized)).rejects.toBeInstanceOf(GitLabApiError)
+  expect(nock.pendingMocks().length).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 12. getMRChanges: happy path returns changed files + diffWebUrl
+// ---------------------------------------------------------------------------
+test('getMRChanges: happy path returns diffWebUrl and changedFiles', async () => {
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/changes')
+    .reply(200, {
+      web_url: 'http://gitlab.test/ns/proj/-/merge_requests/10',
+      changes: [
+        { old_path: 'a.ts', new_path: 'a.ts', new_file: false, deleted_file: false, renamed_file: false },
+        { old_path: 'b.ts', new_path: 'b.ts', new_file: true, deleted_file: false, renamed_file: false },
+        { old_path: 'old.ts', new_path: 'new.ts', new_file: false, deleted_file: false, renamed_file: true }
+      ]
+    })
+
+  const client = makeClient()
+  const changes = await client.getMRChanges(1, 10)
+  expect(changes.diffWebUrl).toBe('http://gitlab.test/ns/proj/-/merge_requests/10/diffs')
+  expect(changes.changedFiles).toHaveLength(3)
+  expect(changes.changedFiles[0].status).toBe('modified')
+  expect(changes.changedFiles[1].status).toBe('added')
+  expect(changes.changedFiles[2].status).toBe('renamed')
+  expect(changes.changedFiles[2].oldPath).toBe('old.ts')
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 13. getMRChanges: 404 returns empty + derived diffWebUrl + metric
+// ---------------------------------------------------------------------------
+test('getMRChanges: 404 returns defaults using fallbackWebUrl and increments metric', async () => {
+  resetMrCompositePartialCount()
+  nock(BASE_URL)
+    .get('/api/v4/projects/1/merge_requests/10/changes')
+    .reply(404, { message: 'Not Found' })
+
+  const logger = makeLogger()
+  const client = makeClient(logger)
+  const changes = await client.getMRChanges(1, 10, 'http://gitlab.test/ns/proj/-/merge_requests/10')
+  expect(changes.changedFiles).toEqual([])
+  expect(changes.diffWebUrl).toBe('http://gitlab.test/ns/proj/-/merge_requests/10/diffs')
+  expect(getMrCompositePartialCount()).toBe(1)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 14. getMergeRequest composite: 200/200/200 → all fields populated
+// ---------------------------------------------------------------------------
+test('getMergeRequest composite: 200/200/200 populates all Phase 3 fields', async () => {
+  resetMrCompositePartialCount()
+
+  const mr = makeMR({
+    iid: 10,
+    reviewers: [{ id: 21, username: 'rev', name: 'Rev', email: '', avatar_url: '', web_url: '' }]
+  })
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10').reply(200, mr)
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/approvals').reply(200, {
+    approvals_required: 1,
+    approved_by: [{ user: { id: 22, username: 'app', name: 'App', email: '', avatar_url: '', web_url: '' } }]
+  })
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/changes').reply(200, {
+    web_url: 'http://gitlab.test/ns/proj/-/merge_requests/10',
+    changes: [{ old_path: 'x.ts', new_path: 'x.ts', new_file: false, deleted_file: false, renamed_file: false }]
+  })
+
+  const client = makeClient()
+  const result = await client.getMergeRequest(1, 10)
+  expect(result.reviewers).toHaveLength(1)
+  expect(result.reviewers?.[0].username).toBe('rev')
+  expect(result.approvedBy).toHaveLength(1)
+  expect(result.approvalsRequired).toBe(1)
+  expect(result.approvalStatus).toBe('approved')
+  expect(result.diffWebUrl).toBe('http://gitlab.test/ns/proj/-/merge_requests/10/diffs')
+  expect(result.changedFiles).toHaveLength(1)
+  expect(getMrCompositePartialCount()).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 15. getMergeRequest composite: 200/200/404 → partial degradation
+// ---------------------------------------------------------------------------
+test('getMergeRequest composite: 200/200/404 sets changes defaults and increments partial', async () => {
+  resetMrCompositePartialCount()
+
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10').reply(200, makeMR({
+    iid: 10,
+    reviewers: [{ id: 21, username: 'rev', name: 'Rev', email: '', avatar_url: '', web_url: '' }]
+  }))
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/approvals').reply(200, {
+    approvals_required: 0,
+    approved_by: []
+  })
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/changes').reply(404, { message: 'Not Found' })
+
+  const client = makeClient()
+  const result = await client.getMergeRequest(1, 10)
+  expect(result.reviewers?.[0].username).toBe('rev')
+  expect(result.approvedBy).toEqual([])
+  expect(result.approvalsRequired).toBe(0)
+  expect(result.approvalStatus).toBe('pending')
+  // 404 inside getMRChanges → defaults populated, partial metric incremented
+  expect(result.changedFiles).toEqual([])
+  expect(result.diffWebUrl).toBe('http://gitlab.test/ns/proj/-/merge_requests/10/diffs')
+  expect(getMrCompositePartialCount()).toBeGreaterThanOrEqual(1)
+})
+
+// ---------------------------------------------------------------------------
+// P3-T-03 / 16. getMergeRequest composite: 5xx auxiliary → field undefined,
+//             returns gracefully
+// ---------------------------------------------------------------------------
+test('getMergeRequest composite: 5xx in auxiliary leaves field undefined and degrades gracefully', async () => {
+  resetMrCompositePartialCount()
+
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10').reply(200, makeMR({ iid: 10 }))
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/approvals').reply(500, 'boom')
+  nock(BASE_URL).get('/api/v4/projects/1/merge_requests/10/changes').reply(500, 'boom')
+
+  const client = makeClient()
+  const result = await client.getMergeRequest(1, 10)
+  expect(result.iid).toBe(10)
+  expect(result.approvedBy).toBeUndefined()
+  expect(result.approvalsRequired).toBeUndefined()
+  expect(result.approvalStatus).toBeUndefined()
+  expect(result.diffWebUrl).toBeUndefined()
+  expect(result.changedFiles).toBeUndefined()
+  expect(getMrCompositePartialCount()).toBe(2)
 })

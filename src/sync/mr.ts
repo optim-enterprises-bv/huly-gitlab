@@ -1,3 +1,12 @@
+/**
+ * Phase 3 mixin-change-payload shape (verified P3-T-01b 2026-06-06):
+ *   client.updateMixin(... MR_MIXIN, { approvedBy }) fires applyLocal with
+ *   change carrying FLAT keys at the top level (matches Phase 2 convention).
+ * applyLocal reads typed Phase 3 deltas via:
+ *   change.approvedBy as PersonUuid[] | undefined
+ *   change.reviewers  as PersonUuid[] | undefined
+ * (NOT change['gitlab-mr.X'] — see Phase 3 plan §B3 / Path B.)
+ */
 import type {
   Doc,
   PersonUuid,
@@ -7,10 +16,12 @@ import type {
   WorkspaceUuid
 } from '@hcengineering/core'
 import tracker, { type Issue, IssuePriority, type Status, type TaskType } from '@hcengineering/tracker'
+import chunter from '@hcengineering/chunter'
 import type { TagElement } from '@hcengineering/tags'
 import { deepEqual } from 'fast-equals'
 import type { GitLabClient } from '../adapter/gitlab-client'
-import type { SyncMergeRequest } from '../adapter/types'
+import { ApprovalActionError } from '../adapter/errors'
+import type { ApprovalStatus, SyncMergeRequest, SyncMRApprovals, SyncMRChanges } from '../adapter/types'
 import { gfmMarkdownToMarkup, markupToGfmMarkdown } from '../markdown'
 import { findByGitlab, findByHuly, upsertIdMap } from '../state/idmap'
 import { setCursor } from '../state/cursors'
@@ -21,6 +32,23 @@ import type { MilestoneCache } from './milestone-cache'
 import { MR_MIXIN, type MRMixinDoc } from './mr-mixin'
 import { mapHulyStatusToMRStateEvent, mapRemoteMRState } from './mr-status-map'
 import type { BindingRef, SyncContext, SyncManager } from './types'
+import * as metrics from '../metrics'
+import { METRIC_NAMES } from '../metrics'
+
+/**
+ * Phase 3 race window: when applyRemote sees fewer approvers in remote than
+ * are currently in local mixin AND local was updated within this window, treat
+ * the discrepancy as an in-flight `approveMR` round-trip and KEEP local.
+ * Critic constraint C10 — see §"P3-T-07" in the Phase 3 plan.
+ */
+const APPROVAL_RACE_WINDOW_MS = 30_000
+
+export function getApprovalServiceAccountFallbackCount (): number {
+  return metrics.get(METRIC_NAMES.APPROVAL_SERVICE_ACCOUNT_FALLBACK)
+}
+export function resetApprovalServiceAccountFallbackCount (): void {
+  metrics.reset(METRIC_NAMES.APPROVAL_SERVICE_ACCOUNT_FALLBACK)
+}
 
 const HULY_CLASS_ISSUE = 'tracker:class:Issue'
 
@@ -52,6 +80,24 @@ export async function resolveMRRef (
 }
 
 /**
+ * Per-actor credential resolver. Phase 3 ships the API surface; the stub
+ * implementation always returns `undefined`, which triggers the service-account
+ * fallback path in approveMR/unapproveMR (with warn log + visibility comment).
+ * P3-T-10 will wire the real per-user OAuth lookup behind this interface.
+ */
+export interface MRCredentialResolver {
+  /**
+   * Resolve a GitLab API token attributed to the given Huly person, scoped to
+   * the binding's workspace. Phase 3 stub returns `undefined` (no UI for users
+   * to self-link credentials yet).
+   */
+  resolveActorToken: (
+    workspaceUuid: WorkspaceUuid,
+    hulyPersonUuid: PersonUuid
+  ) => Promise<string | undefined>
+}
+
+/**
  * Loaded binding context — everything MergeRequestsSyncManager needs about a binding
  * to operate. Constructed by the engine wiring (P2-T-10) and passed in via the loader.
  */
@@ -70,6 +116,11 @@ export interface MRBindingContext {
   defaultTaskType: Ref<TaskType>
   /** Absolute base URL used to resolve relative attachment links in markdown. */
   gitlabBaseUrl: string
+  /**
+   * Per-actor credential resolver — stub in Phase 3 (always returns
+   * undefined). P3-T-10 wires the real implementation.
+   */
+  credentials: MRCredentialResolver
 }
 
 /** Loader callback — engine returns the per-binding context. */
@@ -96,6 +147,27 @@ export interface MRGitLabClient {
   createLabel: GitLabClient['createLabel']
   listMilestones: GitLabClient['listMilestones']
   createMilestone: GitLabClient['createMilestone']
+  /** Phase 3 (P3-T-07): two-way approval actions. */
+  approveMR: (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ) => Promise<void>
+  unapproveMR: (
+    projectId: number | string,
+    mrIid: number,
+    actorToken?: string
+  ) => Promise<void>
+  /** Phase 3 (P3-T-07): composite enrichment helpers. */
+  getMRApprovals: (
+    projectId: number | string,
+    mrIid: number
+  ) => Promise<SyncMRApprovals>
+  getMRChanges: (
+    projectId: number | string,
+    mrIid: number,
+    fallbackWebUrl?: string
+  ) => Promise<SyncMRChanges>
 }
 
 export interface UpdateMRBody {
@@ -197,9 +269,12 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     const descriptionMarkup = gfmMarkdownToMarkup(syncMR.description ?? '', refUrl, imageUrl)
 
     const assigneeRef = await this.resolveAssignee(syncMR.assignees, bctx.userIdentity)
-    const reviewerLabels = await this.resolveReviewerLabels(syncMR.reviewers, bctx)
-    const baseLabels = await this.resolveLocalLabels(syncMR.labels, bctx)
-    const labelRefs = [...baseLabels, ...reviewerLabels]
+    // Phase 3 (P3-T-07): typed reviewers replace synthetic labels.
+    // resolveReviewerLabels remains exported below for the P3-T-09 migration helper
+    // to scan, but is no longer called from applyRemote (B-C16).
+    const reviewerUuids = await this.resolveReviewerUuids(syncMR.reviewers, bctx.userIdentity)
+    const approvedByUuids = await this.resolveReviewerUuids(syncMR.approvedBy, bctx.userIdentity)
+    const labelRefs = await this.resolveLocalLabels(syncMR.labels, bctx)
 
     const milestoneRef = syncMR.milestone !== null
       ? await bctx.milestoneCache.ensureLocalMilestone(
@@ -256,7 +331,7 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
         tracker.class.Issue,
         bctx.hulyProjectRef,
         MR_MIXIN,
-        buildMixinCreateData(syncMR)
+        buildMixinCreateData(syncMR, reviewerUuids, approvedByUuids)
       )
 
       await upsertIdMap(
@@ -356,6 +431,29 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
       )
     }
 
+    // Phase 3: race mitigation (C10 / B6) — when remote.approvedBy is strictly
+    // smaller than the locally-known set, keep local entries IF EITHER:
+    //   (a) we are within the in-flight race window (local touched within 30s), OR
+    //   (b) the local timestamp is newer than the remote payload.
+    //
+    // B6: Previous logic required BOTH (`&&`) the race window AND
+    // `localTsMs >= remoteTsMs`. That blocked the exact race it defended:
+    // Huly write at T0, GitLab webhook at T3 carries stale state with remote ts
+    // NEWER (server clock advanced) — `localTsMs >= remoteTsMs` is false and
+    // the guard never engages. Combining via OR engages on either signal.
+    let resolvedApprovedBy: PersonUuid[] | undefined = approvedByUuids
+    if (resolvedApprovedBy !== undefined) {
+      const existingMixin = readMixin(hulyIssue)
+      const localApprovedBy = (existingMixin?.approvedBy as PersonUuid[] | undefined) ?? []
+      const localTsMs = hulyIssue.modifiedOn
+      const remoteTsMs = remoteTs.getTime()
+      const withinRace = localTsMs > 0 && (Date.now() - localTsMs) < APPROVAL_RACE_WINDOW_MS
+      const localNewer = localTsMs > 0 && localTsMs >= remoteTsMs
+      if (localApprovedBy.length > resolvedApprovedBy.length && (withinRace || localNewer)) {
+        resolvedApprovedBy = localApprovedBy
+      }
+    }
+
     // Mixin-carried fields are GitLab-authoritative; always overwrite (remote-wins).
     // C2: NEVER write pipelineStatus here. PipelineSyncManager owns that field.
     await bctx.hulyClient.updateMixin<Issue, MRMixinDoc>(
@@ -363,7 +461,7 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
       tracker.class.Issue,
       bctx.hulyProjectRef,
       MR_MIXIN,
-      buildMixinUpdateData(syncMR)
+      buildMixinUpdateData(syncMR, reviewerUuids, resolvedApprovedBy)
     )
 
     if (localTs === undefined || remoteTs > localTs) {
@@ -371,6 +469,12 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     }
   }
 
+  /**
+   * NOTE (Phase 3 Path B gap): This method is reachable in production ONLY if a
+   * TxProcessor subscription is wired to call `engine.enqueueLocalEvent`.
+   * Currently no such wiring exists in `src/index.ts`. Calls from tests work
+   * fine; real Huly UI mutations do NOT trigger this path. Phase 4 work.
+   */
   async applyLocal (
     ctx: SyncContext,
     binding: BindingRef,
@@ -450,10 +554,187 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
     if (stateEvent !== undefined) update.state_event = stateEvent
     if (targetBranch !== undefined) update.target_branch = targetBranch
 
-    if (Object.keys(update).length === 0) return
+    let touchedRemote = false
+    if (Object.keys(update).length > 0) {
+      await bctx.gitlabClient.updateMergeRequest(bctx.gitlabProjectId, iid, update)
+      touchedRemote = true
+    }
 
-    await bctx.gitlabClient.updateMergeRequest(bctx.gitlabProjectId, iid, update)
+    // Phase 3 (P3-T-07): approval action handling. Read flat keys per B3 / Path B.
+    const approvedByChange = change.approvedBy as PersonUuid[] | undefined
+    if (approvedByChange !== undefined) {
+      await this.applyApprovalActions(
+        ctx, bctx, binding, hulyRef, iid, approvedByChange
+      )
+      touchedRemote = true
+    }
+
+    // Phase 3 (P3-T-07): Huly-side reviewer changes are NOT synced in Phase 3.
+    // GitLab is authoritative; Phase 4 will route reviewer add/remove back.
+    const reviewersChange = change.reviewers as PersonUuid[] | undefined
+    if (reviewersChange !== undefined) {
+      ctx.logger.warn('mr.reviewers.huly.unsynced', {
+        binding,
+        hulyRef,
+        iid,
+        note: 'Reviewer changes from Huly not synced; managed on GitLab.'
+      })
+    }
+
+    if (!touchedRemote) return
     await setCursor(ctx.store.cursors(), binding, 'merge_requests', new Date())
+  }
+
+  /**
+   * Phase 3 (P3-T-07): translate approvedBy set deltas into GitLab approve /
+   * unapprove calls. Per-user actor token resolved via `bctx.credentials`;
+   * undefined triggers the service-account fallback path in the adapter, with
+   * a visibility comment posted onto the parent Issue.
+   *
+   * Best-effort: an `ApprovalActionError` is logged + commented but does NOT
+   * propagate (next-write-wins semantics — Phase 3 §"Error Handling").
+   */
+  private async applyApprovalActions (
+    ctx: SyncContext,
+    bctx: MRBindingContext,
+    binding: BindingRef,
+    issueRef: Ref<Issue>,
+    iid: number,
+    incoming: PersonUuid[]
+  ): Promise<void> {
+    const hulyIssue = await bctx.hulyClient.findOne<Issue>(
+      tracker.class.Issue,
+      { _id: issueRef }
+    )
+    const existingMixin = hulyIssue !== undefined ? readMixin(hulyIssue) : undefined
+    const current = (existingMixin?.approvedBy as PersonUuid[] | undefined) ?? []
+
+    const currentSet = new Set(current.map((u) => String(u)))
+    const incomingSet = new Set(incoming.map((u) => String(u)))
+
+    const added: PersonUuid[] = []
+    for (const u of incoming) {
+      if (!currentSet.has(String(u))) added.push(u)
+    }
+    const removed: PersonUuid[] = []
+    for (const u of current) {
+      if (!incomingSet.has(String(u))) removed.push(u)
+    }
+
+    for (const person of added) {
+      await this.invokeApprovalAction(
+        ctx, bctx, binding, issueRef, iid, person, 'approve'
+      )
+    }
+    for (const person of removed) {
+      await this.invokeApprovalAction(
+        ctx, bctx, binding, issueRef, iid, person, 'unapprove'
+      )
+    }
+  }
+
+  private async invokeApprovalAction (
+    ctx: SyncContext,
+    bctx: MRBindingContext,
+    binding: BindingRef,
+    issueRef: Ref<Issue>,
+    iid: number,
+    person: PersonUuid,
+    kind: 'approve' | 'unapprove'
+  ): Promise<void> {
+    const actorToken = await bctx.credentials.resolveActorToken(bctx.workspaceUuid, person)
+    const usingServiceAccount = actorToken === undefined
+    if (usingServiceAccount) {
+      metrics.increment(METRIC_NAMES.APPROVAL_SERVICE_ACCOUNT_FALLBACK)
+      ctx.logger.warn('approval.action.fallback.service_account', {
+        binding,
+        iid,
+        person,
+        kind
+      })
+    }
+
+    try {
+      if (kind === 'approve') {
+        await bctx.gitlabClient.approveMR(bctx.gitlabProjectId, iid, actorToken)
+      } else {
+        await bctx.gitlabClient.unapproveMR(bctx.gitlabProjectId, iid, actorToken)
+      }
+    } catch (err) {
+      if (err instanceof ApprovalActionError) {
+        ctx.logger.error('mr.approval.action.failed', {
+          binding,
+          iid,
+          person,
+          kind,
+          error: err.message
+        })
+        // On failure post a DIFFERENT visibility comment so the optimistic
+        // "Approved via service account" message is NOT shown when the action
+        // actually failed (B2 — visibility ordering).
+        await this.postFailureComment(ctx, bctx, issueRef, kind)
+        return
+      }
+      throw err
+    }
+
+    // Adapter call succeeded — only now post the optimistic visibility comment
+    // (B2: post AFTER the adapter call, never before).
+    if (usingServiceAccount) {
+      await this.postVisibilityComment(ctx, bctx, issueRef, kind)
+    }
+  }
+
+  private async postVisibilityComment (
+    ctx: SyncContext,
+    bctx: MRBindingContext,
+    issueRef: Ref<Issue>,
+    kind: 'approve' | 'unapprove'
+  ): Promise<void> {
+    try {
+      const verb = kind === 'approve' ? 'Approved' : 'Unapproved'
+      const body = `${verb} via service account; per-user OAuth UI coming in Phase 4`
+      await bctx.hulyClient.createDoc(
+        chunter.class.ChatMessage,
+        bctx.hulyProjectRef,
+        {
+          attachedTo: issueRef,
+          attachedToClass: tracker.class.Issue,
+          collection: 'comments',
+          message: body
+        } as unknown as Parameters<TxOperations['createDoc']>[2]
+      )
+    } catch (err) {
+      ctx.logger.warn('mr.approval.visibility.comment.failed', {
+        err: err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+
+  private async postFailureComment (
+    ctx: SyncContext,
+    bctx: MRBindingContext,
+    issueRef: Ref<Issue>,
+    kind: 'approve' | 'unapprove'
+  ): Promise<void> {
+    try {
+      const verb = kind === 'approve' ? 'Approval' : 'Unapproval'
+      const body = `${verb} failed — see logs for details`
+      await bctx.hulyClient.createDoc(
+        chunter.class.ChatMessage,
+        bctx.hulyProjectRef,
+        {
+          attachedTo: issueRef,
+          attachedToClass: tracker.class.Issue,
+          collection: 'comments',
+          message: body
+        } as unknown as Parameters<TxOperations['createDoc']>[2]
+      )
+    } catch (err) {
+      ctx.logger.warn('mr.approval.failure.comment.failed', {
+        err: err instanceof Error ? err.message : String(err)
+      })
+    }
   }
 
   async backfill (
@@ -512,20 +793,53 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
   }
 
   /**
-   * Project reviewers onto synthetic `gitlab:reviewer:<username>` labels (critic C4).
+   * Project reviewers onto synthetic `gitlab:reviewer:<username>` labels.
    *
-   * GitLab MR reviewers do not have a typed analogue on tracker.Issue in Phase 2;
-   * we surface them as labels so they round-trip via the existing label channel.
+   * Phase 2 used this as the canonical reviewer representation (critic C4).
+   * Phase 3 stops calling it from applyRemote (typed `reviewers` field replaces
+   * the synthetic-label projection), but the function is RETAINED and exported
+   * via the manager so the reviewer-migration helper (P3-T-09) can scan and
+   * strip the legacy labels (C16).
    */
-  private async resolveReviewerLabels (
+  async resolveReviewerLabels (
     reviewers: SyncMergeRequest['reviewers'],
     bctx: MRBindingContext
   ): Promise<Array<Ref<TagElement>>> {
     const out: Array<Ref<TagElement>> = []
-    for (const r of reviewers) {
+    for (const r of reviewers ?? []) {
       const name = `gitlab:reviewer:${r.username}`
       const ref = await bctx.labelCache.ensureLocalTag(bctx.hulyClient, name)
       out.push(ref)
+    }
+    return out
+  }
+
+  /**
+   * Phase 3 (P3-T-07): resolve a list of GitLab users to PersonUuids via the
+   * UserIdentity, mirroring the assignee resolution path. Returns `undefined`
+   * when the input itself is `undefined` (B2 — "not yet fetched" stays
+   * "not yet fetched"; do NOT clear the mixin field by defaulting to []).
+   */
+  private async resolveReviewerUuids (
+    users: SyncMergeRequest['reviewers'],
+    userIdentity: UserIdentity
+  ): Promise<PersonUuid[] | undefined> {
+    if (users === undefined) return undefined
+    const out: PersonUuid[] = []
+    for (const u of users) {
+      const identity: IdentitySyncUser = {
+        gitlabId: String(u.id),
+        ...(u.email !== null ? { email: u.email } : {}),
+        ...(u.name !== '' ? { name: u.name } : {}),
+        ...(u.username !== '' ? { username: u.username } : {})
+      }
+      const matched = await userIdentity.mapByGitlabUser(identity)
+      if (matched !== undefined) {
+        out.push(matched)
+      } else {
+        const stub = await userIdentity.ensureStubGuest(identity)
+        out.push(stub as unknown as PersonUuid)
+      }
     }
     return out
   }
@@ -547,8 +861,23 @@ export class MergeRequestsSyncManager implements SyncManager<SyncMergeRequest> {
 // Mixin delta builders. The MRMixinDoc shape is exported from ./mr-mixin.
 // ---------------------------------------------------------------------------
 
-function buildMixinCreateData (syncMR: SyncMergeRequest): Omit<MRMixinDoc, keyof Issue> {
-  return {
+function deriveApprovalStatus (
+  approvedBy: PersonUuid[] | undefined,
+  approvalsRequired: number | undefined
+): ApprovalStatus {
+  if (approvalsRequired !== undefined && approvalsRequired > 0 &&
+      approvedBy !== undefined && approvedBy.length >= approvalsRequired) {
+    return 'approved'
+  }
+  return 'pending'
+}
+
+function buildMixinCreateData (
+  syncMR: SyncMergeRequest,
+  reviewerUuids: PersonUuid[] | undefined,
+  approvedByUuids: PersonUuid[] | undefined
+): Omit<MRMixinDoc, keyof Issue> {
+  const base: Omit<MRMixinDoc, keyof Issue> = {
     sourceBranch: syncMR.sourceBranch,
     targetBranch: syncMR.targetBranch,
     draft: syncMR.draft,
@@ -558,10 +887,16 @@ function buildMixinCreateData (syncMR: SyncMergeRequest): Omit<MRMixinDoc, keyof
     gitlabIid: syncMR.iid,
     gitlabProjectId: syncMR.projectId
   }
+  applyPhase3MixinFields(base, syncMR, reviewerUuids, approvedByUuids)
+  return base
 }
 
-function buildMixinUpdateData (syncMR: SyncMergeRequest): Partial<Omit<MRMixinDoc, keyof Issue>> {
-  return {
+function buildMixinUpdateData (
+  syncMR: SyncMergeRequest,
+  reviewerUuids: PersonUuid[] | undefined,
+  approvedByUuids: PersonUuid[] | undefined
+): Partial<Omit<MRMixinDoc, keyof Issue>> {
+  const update: Partial<Omit<MRMixinDoc, keyof Issue>> = {
     sourceBranch: syncMR.sourceBranch,
     targetBranch: syncMR.targetBranch,
     draft: syncMR.draft,
@@ -569,6 +904,60 @@ function buildMixinUpdateData (syncMR: SyncMergeRequest): Partial<Omit<MRMixinDo
     mergeStatus: syncMR.mergeStatus,
     webUrl: syncMR.webUrl
   }
+  applyPhase3MixinFields(update, syncMR, reviewerUuids, approvedByUuids)
+  return update
+}
+
+/**
+ * Phase 3 field writer. Each field is written ONLY when the source data is
+ * defined on the incoming SyncMergeRequest. Per B2: `undefined` means
+ * "not yet fetched" — never clear the mixin field by defaulting to [] or 0.
+ */
+function applyPhase3MixinFields (
+  target: Partial<Omit<MRMixinDoc, keyof Issue>>,
+  syncMR: SyncMergeRequest,
+  reviewerUuids: PersonUuid[] | undefined,
+  approvedByUuids: PersonUuid[] | undefined
+): void {
+  if (syncMR.reviewers !== undefined && reviewerUuids !== undefined) {
+    target.reviewers = reviewerUuids
+  }
+  if (syncMR.approvedBy !== undefined && approvedByUuids !== undefined) {
+    target.approvedBy = approvedByUuids
+  }
+  if (syncMR.approvalsRequired !== undefined) {
+    target.approvalsRequired = syncMR.approvalsRequired
+  }
+  // B3: only derive approvalStatus when BOTH inputs are present. A partial
+  // composite (e.g. only approvalsRequired arrived) MUST NOT clobber a
+  // previously-known status by defaulting the missing half.
+  if (syncMR.approvedBy !== undefined && syncMR.approvalsRequired !== undefined) {
+    target.approvalStatus = deriveApprovalStatus(
+      approvedByUuids ?? [],
+      syncMR.approvalsRequired
+    )
+  }
+  if (syncMR.diffWebUrl !== undefined) {
+    target.diffWebUrl = syncMR.diffWebUrl
+  }
+  if (syncMR.changedFiles !== undefined) {
+    target.changedFiles = syncMR.changedFiles
+  }
+}
+
+/**
+ * Read the runtime mixin attributes from a Huly Issue. The platform's mixin
+ * accessor stores the attribute bag under the mixin Ref key on the Doc; tests
+ * use a flat shape, so we accept both forms.
+ */
+function readMixin (issue: Issue): Record<string, unknown> | undefined {
+  const obj = issue as unknown as Record<string, unknown>
+  const mixinKey = MR_MIXIN as unknown as string
+  const direct = obj[mixinKey]
+  if (direct !== undefined && direct !== null && typeof direct === 'object') {
+    return direct as Record<string, unknown>
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import type { SyncEngine } from '../sync/engine'
 import type { Logger } from '../logging'
 import type { CredentialResolver } from '../auth'
 import type { BindingLifecycleService } from '../sync/binding-lifecycle'
+import type { BindingLoader } from '../sync/binding-loader'
 import { createHealthRouter } from './health'
 import { createWebhookRouter } from './webhook'
 import { createBindingRouter } from './binding'
@@ -21,6 +22,7 @@ export interface AppDependencies {
   logger: Logger
   credentialResolver?: CredentialResolver
   bindingLifecycle?: BindingLifecycleService
+  bindingLoader?: BindingLoader
 }
 
 export function createApp (deps: AppDependencies): express.Express {
@@ -63,7 +65,8 @@ export function createApp (deps: AppDependencies): express.Express {
     config.ServerSecret,
     logger,
     deps.bindingLifecycle,
-    config.PublicBaseUrl
+    config.PublicBaseUrl,
+    deps.bindingLoader
   ))
 
   // OAuth routes

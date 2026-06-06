@@ -14,6 +14,7 @@ import {
 } from './sync'
 import { MergeRequestsSyncManager } from './sync/mr'
 import { PipelineSyncManager } from './sync/pipeline'
+import { ReviewThreadsSyncManager } from './sync/mr-review'
 import { createApp } from './http'
 import { CredentialResolver, OAuthRefresher } from './auth'
 import { BindingLifecycleService } from './sync/binding-lifecycle'
@@ -76,6 +77,10 @@ async function main (): Promise<void> {
   const pipelineManager = new PipelineSyncManager({
     loadBinding: bindingLoader.loadForPipelines
   })
+  const reviewManager = new ReviewThreadsSyncManager({
+    loadBinding: bindingLoader.loadForReviews,
+    backfillEnqueuer
+  })
 
   // Cast to engine's generic SyncManager — managers are parameterised on their
   // own record types (SyncIssue / note envelope) while the engine treats records
@@ -84,6 +89,7 @@ async function main (): Promise<void> {
   syncEngine.register(notesManager as unknown as Parameters<typeof syncEngine.register>[0])
   syncEngine.register(mrManager as unknown as Parameters<typeof syncEngine.register>[0])
   syncEngine.register(pipelineManager as unknown as Parameters<typeof syncEngine.register>[0])
+  syncEngine.register(reviewManager as unknown as Parameters<typeof syncEngine.register>[0])
 
   await syncEngine.start()
   logger.info('main: sync engine started')
@@ -126,7 +132,7 @@ async function main (): Promise<void> {
   })
 
   // Build and start HTTP server
-  const app = createApp({ config, store, syncEngine, logger, credentialResolver, bindingLifecycle })
+  const app = createApp({ config, store, syncEngine, logger, credentialResolver, bindingLifecycle, bindingLoader })
   const server = app.listen(config.Port, () => {
     logger.info('main: HTTP server listening', { port: config.Port })
   })

@@ -27,23 +27,45 @@ Phase 2 extends Phase 1 with two-way Merge Request synchronization, MR-attached 
 - **Draft Detection**: MRs with `draft: true` automatically map to Huly priority Low.
 - **Reviewers as Labels**: MR reviewers are stored as synthetic `gitlab:reviewer:<username>` labels (Phase 3 will introduce a typed reviewer field).
 
-## Current Limitations
+## Phase 3: Review Threads + Approvals + Diff Metadata
 
-The following features are **not** included in Phases 1–2 and are targeted for Phases 3–4:
+Phase 3 adds code review primitives to MR mirrors: review threads as GitLab discussion notes stored as Huly ChatMessages with line-position tracking, Community Edition (CE) approvals as typed mixin fields, and diff metadata (changed files, diff URLs). A one-shot migration endpoint converts Phase 2's synthetic reviewer labels to a typed `reviewers` field.
+
+**Phase 3 Features:**
+
+- **Review Threads as ChatMessages**: GitLab discussion notes (including line comments) mirror to `chunter.class.ChatMessage` carrying a runtime `gitlab-review` mixin with `threadId`, `resolved`, `resolvedBy`, `resolvedAt`, and `position` (line/column for the first note; null for replies).
+- **Line Comments with Text Position**: Inline review comments include file path, line numbers, and SHAs for precise positioning in the code diff.
+- **CE Approvals Two-Way**: MR approval state (`approvedBy`, `approvalsRequired`, `approvalStatus`) syncs bidirectionally. Huly users can approve/unapprove MRs; approvals propagate to GitLab (with per-user OAuth preferred, service-account fallback in Phase 3).
+- **Diff Metadata**: MRs include `diffWebUrl` (link to GitLab diff UI) and `changedFiles` (path, additions/deletions, status for each file).
+- **Typed Reviewers Field**: MR reviewers replace Phase 2's synthetic `gitlab:reviewer:*` labels with a typed `reviewers` array of PersonUuids. A one-shot `POST /api/v1/bindings/:id/migrate-reviewer-labels` endpoint converts existing labels for Phase 2 bindings.
+- **Suggestion Blocks Passthrough**: Suggestion comments preserve GitLab's `<<<<<<< SUGGEST` markdown blocks verbatim (no Huly UI affordance in Phase 3).
+
+## Phase 1 + Phase 2 + Phase 3 Limitations
+
+The following features are **not** included in this release and are targeted for Phase 4 or later:
+
+### Carried forward from Phase 1–2
 
 - **Confidential Issues & Merge Requests**: Private issues and confidential merge requests are deliberately skipped (Q5 resolution). Revisit when ACL mapping ships in Phase 4.
-- **MR Creation from Huly**: Creating merge requests from within Huly is not yet supported. Phase 3 will add intent capture (UI signal to push Issue to GitLab as MR).
 - **Encryption Key Rotation**: In-product key rotation is deferred. Rotation requires pod restart and manual credential re-encryption.
-- **Code Review Threads & Line Comments**: Inline review comments, approvals, and threaded discussions on merge requests are Phase 3.
-- **MR Diff & Changes Content**: Full diff metadata and commit details are Phase 3.
-- **Reviewers as Typed Field**: MR reviewers are stored as synthetic labels (`gitlab:reviewer:<username>`) in Phase 2. Phase 3 will introduce a dedicated typed reviewer field.
-- **Pipeline Job Details**: Pipeline status in Huly shows summary only (pending/running/success/failed/canceled). Individual job logs, stages, and artifacts are Phase 3.
+- **Pipeline Job Details**: Pipeline status in Huly shows summary only (pending/running/success/failed/canceled). Individual job logs, stages, and artifacts are Phase 4.
 - **MR Status Read-Only**: The `pipelineStatus` field on MR mirrors is read-only in Huly (owned by `PipelineSyncManager`). Huly users cannot override.
 - **MR Source Branch Read-Only**: The `sourceBranch` field is read-only in Huly; branch changes must be made on GitLab.
-- **Existing Binding Re-registration**: Phase 1 bindings registered before Phase 2 deploy will NOT receive MR or pipeline events until a one-time admin re-registration call. See [Phase 2 Migration Runbook](docs/phase2-runbook.md).
-- **Custom Fields & Iterations**: Custom fields, epics, and iteration planning are Phase 3–4.
+- **MR Creation from Huly**: Creating merge requests from within Huly is not yet supported. Phase 4 will add intent capture.
+- **Custom Fields & Iterations**: Custom fields, epics, and iteration planning are Phase 4+.
 - **Multi-instance Bindings**: Binding a single Huly project to multiple GitLab projects per workspace is Phase 4.
 - **File Attachments**: Attachments are link-through only (referenced as plain markdown links). No upload mirror to Huly.
+
+### Phase 3 Known Limitations
+
+- **No Huly-to-GitLab writeback yet**: `applyLocal` exists for issues, MRs, notes, and review threads but no production TxMixin subscription is wired. Real Huly UI edits (Huly user approves MR, resolves discussion, edits comment body) do NOT propagate to GitLab in Phase 3. Phase 4 prerequisite work.
+- **Approval Actions Fall Back to Service Account**: Phase 3 provides API surface for per-user approval attribution (`approvedBy` and `approvalsRequired` sync bidirectionally), but no Huly UI exists for users to self-link per-user OAuth credentials yet. All Phase 3 approval actions from Huly fall back to the binding's service account and include a visibility comment on the parent Issue: _"Approved via service account; per-user OAuth UI coming in Phase 4"_. See [Phase 3 Migration Runbook](docs/phase3-runbook.md).
+- **Line Comments Text-Position Only**: Review threads support `position_type='text'` (inline code comments) only. Image and file-level discussion annotations are deferred to Phase 4.
+- **Approval Status Default**: The `approvalStatus` field defaults to `'pending'` when `approvalsRequired=0` (i.e., no approval rule configured on GitLab). This is expected for CE instances.
+- **Migration Requires Binding Pause**: The Phase 2 → Phase 3 reviewer-label migration endpoint (`POST /api/v1/bindings/:id/migrate-reviewer-labels`) requires the operator to pause the binding via `PATCH /api/v1/bindings/:id {disabled: true}` before running migration, then re-enable afterward. This prevents sync writes during label conversion.
+- **Suggestion Comments Markdown Passthrough**: Suggestion blocks (`<<<<<<< SUGGEST ... >>>>>>>> SUGGEST`) in review comments pass through as raw markdown. No Huly UI affordance for inline apply/dismiss; users must manually apply suggestions on GitLab.
+- **EE Approval Rules Not Synced**: Enterprise Edition approval rules (rule-based required approvers) are not synced. The simple CE approval count (`approvalsRequired`) is synced.
+- **Full Diff Body Not Synced**: The complete git diff content is not mirrored to Huly. Only metadata is synced: file paths, additions/deletions count, change status (added/modified/deleted/renamed), and a link to the diff on GitLab (`diffWebUrl`).
 
 ## Requirements
 

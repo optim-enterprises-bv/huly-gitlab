@@ -455,3 +455,422 @@ export async function setupStackForMR (deps: HarnessDeps, args: SeedMRArgs = {})
   const mr = await seedGitLabMR(deps, deps.gitlabBaseUrl, base.gitlabRootToken, base.gitlabProjectId, args)
   return { ...base, ...mr }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3: review threads, approvals, diff metadata, reviewer migration
+// ---------------------------------------------------------------------------
+
+export interface SeedDiscussionPosition {
+  baseSha: string
+  startSha: string
+  headSha: string
+  oldPath: string
+  newPath: string
+  positionType: 'text'
+  oldLine?: number
+  newLine?: number
+}
+
+export interface SeedDiscussionArgs {
+  body: string
+  position?: SeedDiscussionPosition
+}
+
+export interface SeedDiscussionResult {
+  discussionId: string
+  noteId: number
+}
+
+export interface SeedDiscussionBody {
+  body: string
+  position?: {
+    base_sha: string
+    start_sha: string
+    head_sha: string
+    old_path: string
+    new_path: string
+    position_type: 'text'
+    old_line?: number
+    new_line?: number
+  }
+}
+
+/** Build the REST POST body for `POST /api/v4/projects/:id/merge_requests/:iid/discussions`. */
+export function buildSeedDiscussionBody (args: SeedDiscussionArgs): SeedDiscussionBody {
+  const body: SeedDiscussionBody = { body: args.body }
+  if (args.position !== undefined) {
+    body.position = {
+      base_sha: args.position.baseSha,
+      start_sha: args.position.startSha,
+      head_sha: args.position.headSha,
+      old_path: args.position.oldPath,
+      new_path: args.position.newPath,
+      position_type: args.position.positionType
+    }
+    if (args.position.oldLine !== undefined) {
+      body.position.old_line = args.position.oldLine
+    }
+    if (args.position.newLine !== undefined) {
+      body.position.new_line = args.position.newLine
+    }
+  }
+  return body
+}
+
+/**
+ * Seed a discussion (thread) on a GitLab merge request. When `position` is
+ * provided the discussion is a line-anchored review comment; otherwise it is
+ * a free-form thread.
+ */
+export async function seedGitLabDiscussion (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  args: SeedDiscussionArgs
+): Promise<SeedDiscussionResult> {
+  const body = buildSeedDiscussionBody(args)
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    }
+  )
+  if (res.status !== 201) {
+    throw new Error(`seedGitLabDiscussion: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { id: string, notes?: Array<{ id: number }> }
+  const firstNote = json.notes?.[0]
+  if (firstNote === undefined) {
+    throw new Error('seedGitLabDiscussion: response missing first note')
+  }
+  return { discussionId: json.id, noteId: firstNote.id }
+}
+
+export interface SeedDiscussionReplyArgs {
+  discussionId: string
+  body: string
+}
+
+/**
+ * Append a reply note to an existing discussion thread. The reply inherits
+ * the parent discussion's position; `position` is not posted on reply notes
+ * (per the GitLab API).
+ */
+export async function seedGitLabDiscussionReply (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  args: SeedDiscussionReplyArgs
+): Promise<{ noteId: number }> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions/${encodeURIComponent(args.discussionId)}/notes`,
+    {
+      method: 'POST',
+      headers: {
+        'PRIVATE-TOKEN': rootToken,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ body: args.body })
+    }
+  )
+  if (res.status !== 201) {
+    throw new Error(`seedGitLabDiscussionReply: unexpected status ${res.status}`)
+  }
+  const json = await res.json() as { id: number }
+  return { noteId: json.id }
+}
+
+/**
+ * Resolve a discussion on a GitLab MR via REST. Used to assert the
+ * `gitlab-review.resolved` mixin flips true on all notes in the thread.
+ */
+export async function resolveGitLabDiscussion (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number,
+  discussionId: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/discussions/${encodeURIComponent(discussionId)}?resolved=true`,
+    {
+      method: 'PUT',
+      headers: { 'PRIVATE-TOKEN': rootToken }
+    }
+  )
+  if (res.status !== 200) {
+    throw new Error(`resolveGitLabDiscussion: unexpected status ${res.status}`)
+  }
+}
+
+/**
+ * Approve a merge request as a specific user (via that user's PRIVATE-TOKEN).
+ * The token is the approver's personal access token, not the root token.
+ */
+export async function seedGitLabApprover (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  projectId: number,
+  mrIid: number,
+  approverToken: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approve`,
+    {
+      method: 'POST',
+      headers: { 'PRIVATE-TOKEN': approverToken }
+    }
+  )
+  if (res.status !== 201 && res.status !== 200) {
+    throw new Error(`seedGitLabApprover: unexpected status ${res.status}`)
+  }
+}
+
+/**
+ * Unapprove a merge request as a specific user. Used to assert the
+ * `gitlab-mr.approvedBy` list shrinks.
+ */
+export async function unapproveGitLabMR (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  projectId: number,
+  mrIid: number,
+  approverToken: string
+): Promise<void> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/unapprove`,
+    {
+      method: 'POST',
+      headers: { 'PRIVATE-TOKEN': approverToken }
+    }
+  )
+  if (res.status !== 201 && res.status !== 200) {
+    throw new Error(`unapproveGitLabMR: unexpected status ${res.status}`)
+  }
+}
+
+export interface MRApprovalsResponse {
+  approvalsRequired: number
+  approvedBy: string[]
+}
+
+/**
+ * GET the approvals snapshot for an MR. Used by the diff/approval assertion
+ * helpers to cross-check the Huly mirror state against GitLab ground truth.
+ */
+export async function getMRApprovalsFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRApprovalsResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/approvals`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRApprovalsFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as {
+    approvals_required: number
+    approved_by?: Array<{ user: { username: string } }>
+  }
+  return {
+    approvalsRequired: body.approvals_required,
+    approvedBy: (body.approved_by ?? []).map((a) => a.user.username)
+  }
+}
+
+export interface MRDiffFile {
+  oldPath: string
+  newPath: string
+  newFile: boolean
+  renamedFile: boolean
+  deletedFile: boolean
+}
+
+export interface MRDiffResponse {
+  files: MRDiffFile[]
+  webUrl: string
+}
+
+/**
+ * GET the changes/diff snapshot for an MR. Used to cross-check the
+ * `gitlab-mr.changedFiles` mirror.
+ */
+export async function getMRDiffFromGitLab (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  gitlabBaseUrl: string,
+  rootToken: string,
+  projectId: number,
+  mrIid: number
+): Promise<MRDiffResponse> {
+  const res = await deps.fetch(
+    `${gitlabBaseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/changes`,
+    { headers: { 'PRIVATE-TOKEN': rootToken } }
+  )
+  if (res.status !== 200) {
+    throw new Error(`getMRDiffFromGitLab: unexpected status ${res.status}`)
+  }
+  const body = await res.json() as {
+    web_url: string
+    changes?: Array<{
+      old_path: string
+      new_path: string
+      new_file: boolean
+      renamed_file: boolean
+      deleted_file: boolean
+    }>
+  }
+  return {
+    webUrl: body.web_url,
+    files: (body.changes ?? []).map((c) => ({
+      oldPath: c.old_path,
+      newPath: c.new_path,
+      newFile: c.new_file,
+      renamedFile: c.renamed_file,
+      deletedFile: c.deleted_file
+    }))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// directMixinPatch — harness-only writer for ChatMessage AND Issue mixins
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal transactor interface required by `directMixinPatch*` helpers.
+ *
+ * The real harness binds this to a `@hcengineering/client` connection. Unit
+ * tests inject a mock that records the call shape. This keeps the harness
+ * decoupled from the heavy transactor client at type level.
+ */
+export interface MinimalTransactor {
+  createMixin: (
+    targetRef: string,
+    targetClass: string,
+    space: string,
+    mixin: string,
+    attrs: Record<string, unknown>
+  ) => Promise<void>
+  updateMixin: (
+    targetRef: string,
+    targetClass: string,
+    space: string,
+    mixin: string,
+    attrs: Record<string, unknown>
+  ) => Promise<void>
+}
+
+/** Class id for tracker.Issue — duplicated as a string constant to avoid pulling the heavy core import into the harness. */
+export const HARNESS_ISSUE_CLASS = 'tracker:class:Issue'
+/** Class id for chunter.ChatMessage. */
+export const HARNESS_CHAT_MESSAGE_CLASS = 'chunter:class:ChatMessage'
+
+export interface DirectMixinPatchArgs {
+  targetRef: string
+  space: string
+  mixin: string
+  attrs: Record<string, unknown>
+  mode?: 'create' | 'update'
+}
+
+/**
+ * Patch a runtime mixin onto a tracker.Issue via the transactor. Phase 2
+ * shape; preserved here verbatim so existing call sites keep working.
+ */
+export async function directMixinPatchOnIssue (
+  transactor: MinimalTransactor,
+  args: DirectMixinPatchArgs
+): Promise<void> {
+  const mode = args.mode ?? 'update'
+  if (mode === 'create') {
+    await transactor.createMixin(args.targetRef, HARNESS_ISSUE_CLASS, args.space, args.mixin, args.attrs)
+  } else {
+    await transactor.updateMixin(args.targetRef, HARNESS_ISSUE_CLASS, args.space, args.mixin, args.attrs)
+  }
+}
+
+/**
+ * Patch a runtime mixin onto a chunter.ChatMessage via the transactor.
+ * Phase 3 addition (C18) — Phase 2 harness only supported Issue mixins.
+ */
+export async function directMixinPatchOnChatMessage (
+  transactor: MinimalTransactor,
+  args: DirectMixinPatchArgs
+): Promise<void> {
+  const mode = args.mode ?? 'update'
+  if (mode === 'create') {
+    await transactor.createMixin(args.targetRef, HARNESS_CHAT_MESSAGE_CLASS, args.space, args.mixin, args.attrs)
+  } else {
+    await transactor.updateMixin(args.targetRef, HARNESS_CHAT_MESSAGE_CLASS, args.space, args.mixin, args.attrs)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: migration endpoint client
+// ---------------------------------------------------------------------------
+
+export interface MigrationResponse {
+  status: number
+  body: unknown
+}
+
+/**
+ * POST to the reviewer-label migration endpoint with bearer auth.
+ * Returns the parsed JSON body alongside the status so 409 and 200 paths
+ * can be asserted symmetrically.
+ */
+export async function postMigrateReviewerLabels (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podBaseUrl: string, serverSecret: string, bindingId: string }
+): Promise<MigrationResponse> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}/migrate-reviewer-labels`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${args.serverSecret}` }
+    }
+  )
+  const text = await res.text()
+  let body: unknown = text
+  try {
+    body = JSON.parse(text)
+  } catch {
+    body = text
+  }
+  return { status: res.status, body }
+}
+
+/**
+ * PATCH a binding's `disabled` flag. Used by the migration runbook to pause
+ * delivery before invoking `migrate-reviewer-labels`.
+ */
+export async function patchBindingDisabled (
+  deps: Pick<HarnessDeps, 'fetch'>,
+  args: { podBaseUrl: string, serverSecret: string, bindingId: string, disabled: boolean }
+): Promise<{ status: number }> {
+  const res = await deps.fetch(
+    `${args.podBaseUrl}/api/v1/bindings/${args.bindingId}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${args.serverSecret}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ disabled: args.disabled })
+    }
+  )
+  return { status: res.status }
+}

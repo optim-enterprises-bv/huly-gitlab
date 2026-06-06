@@ -8,7 +8,19 @@ import { getCredential } from '../../src/state/credentials'
 import { Store } from '../../src/state/store'
 import type { Logger } from '../../src/logging'
 import type { BindingLifecycleService } from '../../src/sync/binding-lifecycle'
+import type { BindingLoader } from '../../src/sync/binding-loader'
 import { randomBytes } from 'node:crypto'
+
+// Mock migrateReviewerLabels so the route can be tested without a real Huly client.
+jest.mock('../../src/sync/reviewer-migration', () => ({
+  migrateReviewerLabels: jest.fn(async () => ({
+    migratedAt: '2026-06-06T00:00:00.000Z',
+    mrsScanned: 0,
+    labelsStripped: 0,
+    reviewersResolved: 0,
+    unresolvedCount: 0
+  }))
+}))
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -374,5 +386,166 @@ describe('binding admin routes', () => {
 
     // rotateWebhookSecret was NOT called (no webhookId, webhookRegistered:false)
     expect(mockRotate).not.toHaveBeenCalled()
+  })
+
+  // --- PATCH /api/v1/bindings/:id ---
+
+  test('16. PATCH with bad ObjectId → 400', async () => {
+    const app = buildApp()
+    const res = await request(app)
+      .patch('/api/v1/bindings/not-a-valid-id')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send({ disabled: true })
+
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid id format')
+  })
+
+  test('17. PATCH unknown binding ID → 404', async () => {
+    const app = buildApp()
+    const { ObjectId } = await import('mongodb')
+    const fakeId = new ObjectId().toHexString()
+
+    const res = await request(app)
+      .patch(`/api/v1/bindings/${fakeId}`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send({ disabled: true })
+
+    expect(res.status).toBe(404)
+  })
+
+  test('18. PATCH with {disabled: true} → 200, updated view (no webhookSecretRef)', async () => {
+    const app = buildApp()
+    const postRes = await request(app)
+      .post('/api/v1/bindings')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send(validBody)
+
+    expect(postRes.status).toBe(201)
+    const { bindingId } = postRes.body as { bindingId: string }
+
+    const res = await request(app)
+      .patch(`/api/v1/bindings/${bindingId}`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send({ disabled: true })
+
+    expect(res.status).toBe(200)
+    expect(res.body.disabled).toBe(true)
+    expect(res.body.id).toBe(bindingId)
+    expect(res.body).not.toHaveProperty('webhookSecretRef')
+    expect(res.body).not.toHaveProperty('webhookSecret')
+
+    // Persisted in store
+    const { ObjectId } = await import('mongodb')
+    const raw = await store.bindings().findOne({ _id: new ObjectId(bindingId) })
+    expect(raw?.disabled).toBe(true)
+  })
+
+  // --- POST /api/v1/bindings/:id/migrate-reviewer-labels ---
+
+  test('19. migrate-reviewer-labels: missing bearer → 401', async () => {
+    const app = buildApp()
+    const res = await request(app).post('/api/v1/bindings/someid/migrate-reviewer-labels')
+    expect(res.status).toBe(401)
+  })
+
+  test('20. migrate-reviewer-labels: invalid id format → 400', async () => {
+    const app = buildApp()
+    const res = await request(app)
+      .post('/api/v1/bindings/not-a-valid-id/migrate-reviewer-labels')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('invalid id format')
+  })
+
+  test('21. migrate-reviewer-labels: unknown binding ID → 404', async () => {
+    const app = buildApp()
+    const { ObjectId } = await import('mongodb')
+    const fakeId = new ObjectId().toHexString()
+
+    const res = await request(app)
+      .post(`/api/v1/bindings/${fakeId}/migrate-reviewer-labels`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(404)
+  })
+
+  test('22. migrate-reviewer-labels: binding.disabled !== true → 409 with operator-pause message (Q3)', async () => {
+    const app = buildApp()
+    const postRes = await request(app)
+      .post('/api/v1/bindings')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send(validBody)
+
+    expect(postRes.status).toBe(201)
+    const { bindingId } = postRes.body as { bindingId: string }
+
+    const res = await request(app)
+      .post(`/api/v1/bindings/${bindingId}/migrate-reviewer-labels`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(409)
+    expect(res.body.error).toBe('binding active')
+    expect(typeof res.body.message).toBe('string')
+    expect(res.body.message).toMatch(/Pause binding/)
+    expect(res.body.message).toMatch(/disabled: true/)
+  })
+
+  test('23. migrate-reviewer-labels: binding paused → 200 with MigrationResult; secret not in response', async () => {
+    const postApp = buildApp()
+    const postRes = await request(postApp)
+      .post('/api/v1/bindings')
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+      .send(validBody)
+
+    expect(postRes.status).toBe(201)
+    const { bindingId } = postRes.body as { bindingId: string }
+
+    // Pause binding directly in store (PATCH covered separately)
+    const { ObjectId } = await import('mongodb')
+    await store.bindings().updateOne(
+      { _id: new ObjectId(bindingId) },
+      { $set: { disabled: true } }
+    )
+
+    const mockLoader = {
+      loadForMergeRequests: jest.fn(async () => ({
+        workspaceUuid: 'ws-test-1',
+        gitlabProjectId: 100,
+        gitlabProjectPath: 'group/repo',
+        hulyProjectRef: 'proj-test-1',
+        hulyClient: {} as unknown,
+        gitlabClient: {} as unknown,
+        statuses: [],
+        userIdentity: {} as unknown,
+        labelCache: {} as unknown,
+        milestoneCache: {} as unknown,
+        defaultTaskType: 'taskType:1',
+        gitlabBaseUrl: 'http://gitlab.test',
+        credentials: { resolveActorToken: async () => undefined }
+      }))
+    } as unknown as BindingLoader
+
+    const appWithLoader = express()
+    appWithLoader.use(bodyParser.json({ limit: '5mb' }))
+    appWithLoader.use(
+      createBindingRouter(store, ENCRYPTION_KEY, SERVER_SECRET, makeLogger(), undefined, undefined, mockLoader)
+    )
+
+    const res = await request(appWithLoader)
+      .post(`/api/v1/bindings/${bindingId}/migrate-reviewer-labels`)
+      .set('Authorization', `Bearer ${SERVER_SECRET}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveProperty('migratedAt')
+    expect(res.body).toHaveProperty('mrsScanned')
+    expect(res.body).toHaveProperty('labelsStripped')
+    expect(res.body).toHaveProperty('reviewersResolved')
+    expect(res.body).not.toHaveProperty('webhookSecretRef')
+    expect(res.body).not.toHaveProperty('webhookSecret')
+    expect(res.body).not.toHaveProperty('secret')
+
+    expect(mockLoader.loadForMergeRequests).toHaveBeenCalledWith(bindingId)
   })
 })

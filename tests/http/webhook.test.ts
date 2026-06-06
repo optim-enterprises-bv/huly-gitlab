@@ -423,4 +423,25 @@ describe('POST /webhook/:bindingId', () => {
     expect(res.status).toBe(204)
     expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
   })
+
+  // -------------------------------------------------------------------------
+  // B7. Disabled binding — webhook honors operator-pause contract (Q3).
+  // -------------------------------------------------------------------------
+  test('B7. Webhook delivery to a disabled binding → 200, NOT enqueued', async () => {
+    const disabledBinding = makeBindingDoc()
+    disabledBinding.disabled = true
+    const store = makeStore(disabledBinding)
+    const engine = makeSyncEngine()
+    const app = buildApp(store, engine)
+
+    const res = await request(app)
+      .post(`/webhook/${validBindingId}`)
+      .set('X-Gitlab-Event', 'Issue Hook')
+      .set('X-Gitlab-Token', WEBHOOK_SECRET)
+      .send({ object_attributes: { id: 700, updated_at: '2024-04-01T00:00:00Z' } })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ accepted: false, reason: 'binding disabled' })
+    expect(engine.enqueueWebhookEvent).not.toHaveBeenCalled()
+  })
 })

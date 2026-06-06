@@ -8,26 +8,19 @@ import { getBinding } from '../state/bindings'
 import { getCredential } from '../state/credentials'
 import { parseObjectId } from '../util/object-id'
 import { asyncHandler } from './async-handler'
-
-/** Counter for confidential events that were silently dropped */
-let confidentialSkippedCount = 0
-
-/** Counter for confidential MR Hook events dropped */
-let mrSkippedCount = 0
-
-/** Counter for pipeline events dropped because they are not tied to an MR */
-let unboundPipelineCount = 0
+import * as metrics from '../metrics'
+import { METRIC_NAMES } from '../metrics'
 
 export function getConfidentialSkippedCount (): number {
-  return confidentialSkippedCount
+  return metrics.get(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
 }
 
 export function getMrSkippedCount (): number {
-  return mrSkippedCount
+  return metrics.get(METRIC_NAMES.WEBHOOK_MR_SKIPPED)
 }
 
 export function getUnboundPipelineCount (): number {
-  return unboundPipelineCount
+  return metrics.get(METRIC_NAMES.WEBHOOK_UNBOUND_PIPELINE)
 }
 
 const CONFIDENTIAL_HOOKS = new Set([
@@ -88,7 +81,7 @@ export function createWebhookRouter (
     // Reject rogue confidential hook variants without ever touching secrets
     if (eventHeader !== undefined && CONFIDENTIAL_HOOKS.has(eventHeader)) {
       logger.info('webhook: confidential hook received — dropping', { bindingId, event: eventHeader })
-      confidentialSkippedCount++
+      metrics.increment(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
       res.status(204).end()
       return
     }
@@ -104,6 +97,15 @@ export function createWebhookRouter (
 
     if (binding === null) {
       res.status(404).json({ error: 'Binding not found' })
+      return
+    }
+
+    // B7: honour operator-pause contract (Q3). A disabled binding must not
+    // dispatch events to the engine. Return 200 so GitLab does not retry,
+    // explicitly signaling acceptance=false with the reason.
+    if (binding.disabled) {
+      logger.info('webhook: binding disabled — not enqueueing', { bindingId, event: eventHeader })
+      res.status(200).json({ accepted: false, reason: 'binding disabled' })
       return
     }
 
@@ -146,7 +148,7 @@ export function createWebhookRouter (
       // Skip confidential issues (Q5 defense-in-depth)
       if (payload.object_attributes?.confidential === true) {
         logger.info('webhook: confidential issue — dropping', { bindingId, eventUuid })
-        confidentialSkippedCount++
+        metrics.increment(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
         res.status(204).end()
         return
       }
@@ -161,8 +163,8 @@ export function createWebhookRouter (
       // Drop confidential MRs — GitLab MR Hook DOES carry object_attributes.confidential
       if (payload.object_attributes?.confidential === true) {
         logger.info('webhook: confidential MR — dropping', { bindingId, eventUuid })
-        confidentialSkippedCount++
-        mrSkippedCount++
+        metrics.increment(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
+        metrics.increment(METRIC_NAMES.WEBHOOK_MR_SKIPPED)
         res.status(204).end()
         return
       }
@@ -179,7 +181,7 @@ export function createWebhookRouter (
       // Drop pipelines not tied to an MR (standalone branch/tag pipelines)
       if (mergeRequestIid === undefined || mergeRequestIid === null) {
         logger.info('webhook: pipeline without MR — dropping', { bindingId, eventUuid })
-        unboundPipelineCount++
+        metrics.increment(METRIC_NAMES.WEBHOOK_UNBOUND_PIPELINE)
         res.status(204).end()
         return
       }
@@ -197,7 +199,7 @@ export function createWebhookRouter (
         // Existing Issue-note path: skip notes on confidential issues
         if (payload.issue?.confidential === true) {
           logger.info('webhook: note on confidential issue — dropping', { bindingId, eventUuid })
-          confidentialSkippedCount++
+          metrics.increment(METRIC_NAMES.WEBHOOK_CONFIDENTIAL_SKIPPED)
           res.status(204).end()
           return
         }
