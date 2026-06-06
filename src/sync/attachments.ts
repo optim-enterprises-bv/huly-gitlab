@@ -30,8 +30,9 @@ import type { Collection } from 'mongodb'
 import type { Logger } from '../logging'
 import type { AttachmentMirrorDoc } from '../state/attachment-mirror'
 import { findMirroredAttachment, insertMirroredAttachment } from '../state/attachment-mirror'
+import { MAX_ATTACHMENT_BYTES } from './attachment-links'
+
 export { MAX_ATTACHMENT_BYTES } from './attachment-links'
-import { MAX_ATTACHMENT_BYTES } from './attachment-links' // eslint-disable-line import/no-duplicates
 
 // ---------------------------------------------------------------------------
 // Huly attachment store interface (integration point)

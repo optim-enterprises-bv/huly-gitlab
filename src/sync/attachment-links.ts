@@ -120,11 +120,11 @@ export function rewriteAttachmentLinks (
   if (urlMap.size === 0) return body
 
   // Replace URLs inside markdown link/image syntax only.
-  return body.replace(MARKDOWN_LINK_RE, (fullMatch, bang, alt, url) => {
+  return body.replace(MARKDOWN_LINK_RE, (fullMatch: string, bang: string, alt: string, url: string) => {
     const trimmedUrl = url.trim()
     const replacement = urlMap.get(trimmedUrl)
     if (replacement === undefined) return fullMatch
-    return `${bang as string}[${alt as string}](${replacement})`
+    return `${bang}[${alt}](${replacement})`
   })
 }
 
