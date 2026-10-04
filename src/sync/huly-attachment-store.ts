@@ -107,7 +107,7 @@ export function createHulyAttachmentStore (deps: HulyAttachmentStoreDeps): HulyA
       })
 
       const docRef = await client.createDoc<AttachmentBlobDoc>(
-        ATTACHMENT_BLOB_CLASS as Ref<never>,
+        ATTACHMENT_BLOB_CLASS,
         spaceRef,
         {
           filename,
@@ -134,7 +134,7 @@ export function createHulyAttachmentStore (deps: HulyAttachmentStoreDeps): HulyA
       logger.debug('huly-attachment-store: downloading', { ref, workspaceUuid })
 
       const doc = await client.findOne<AttachmentBlobDoc>(
-        ATTACHMENT_BLOB_CLASS as Ref<never>,
+        ATTACHMENT_BLOB_CLASS,
         { _id: ref as Ref<AttachmentBlobDoc> }
       )
 
