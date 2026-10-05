@@ -54,7 +54,7 @@
     "helmet": "^7.2.0",
     "markdown-it": "^14.0.0",
     "mongodb": "^7.7.0",
-    "ws": "^8.21.1"
+    "ws": "^8.22.0"
   },
   "overrides": {
     "uuid": "^11.0.3",
@@ -68,9 +68,9 @@
     "@types/cors": "^2.8.12",
     "@types/express": "^4.17.13",
     "@types/jest": "^29.5.5",
-    "@types/node": "^26.6.3",
-    "@types/supertest": "^6.0.2",
-    "@types/ws": "^8.5.12",
+    "@types/node": "^26.6.4",
+    "@types/supertest": "^7.2.1",
+    "@types/ws": "^8.18.2",
     "@typescript-eslint/eslint-plugin": "^8.71.0",
     "@typescript-eslint/parser": "^6.21.0",
     "cross-env": "^7.0.3",
@@ -83,9 +83,9 @@
     "mongodb-memory-server": "^10.1.4",
     "nock": "^14.0.17",
     "nodemon": "^3.1.4",
-    "prettier": "^3.9.6",
-    "supertest": "^7.0.0",
-    "ts-jest": "^29.4.12",
+    "prettier": "^3.9.9",
+    "supertest": "^7.3.0",
+    "ts-jest": "^29.4.14",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
