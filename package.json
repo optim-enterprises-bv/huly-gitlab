@@ -52,7 +52,7 @@
     "graphql": "^16.8.0",
     "graphql-request": "^7.1.0",
     "helmet": "^7.2.0",
-    "markdown-it": "^14.0.0",
+    "markdown-it": "^15.0.2",
     "mongodb": "^7.7.0",
     "ws": "^8.22.0"
   },
